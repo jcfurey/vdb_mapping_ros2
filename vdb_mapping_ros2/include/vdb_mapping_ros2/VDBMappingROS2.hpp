@@ -176,7 +176,7 @@ public:
    * \param cloud_msg PointCloud message
    * \param sensor_source Sensor source corresponding to the Pointcloud
    */
-  void cloudCallback(const std::shared_ptr<sensor_msgs::msg::PointCloud2>& cloud_msg,
+  void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg,
                      const SensorSource& sensor_source)
   {
     typename VDBMappingT::PointCloudT::Ptr cloud(new typename VDBMappingT::PointCloudT);
@@ -339,7 +339,7 @@ public:
     }
   }
 
-  void mapSectionCallback(const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid>& update_msg,
+  void mapSectionCallback(const vdb_mapping_interfaces::msg::UpdateGrid::SharedPtr update_msg,
                           const std::shared_ptr<RemoteSource>& remote_source)
   {
     if (remote_source->active)
@@ -381,7 +381,7 @@ public:
   }
 
   void
-  mapFullSectionCallback(const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid>& update_msg,
+  mapFullSectionCallback(const vdb_mapping_interfaces::msg::UpdateGrid::SharedPtr update_msg,
                          const std::shared_ptr<RemoteSource>& remote_source)
   {
     if (remote_source->active)
@@ -993,7 +993,7 @@ private:
         m_cloud_subs.push_back(this->create_subscription<sensor_msgs::msg::PointCloud2>(
           sensor_source.topic,
           qos_profile,
-          [this, sensor_source](const std::shared_ptr<sensor_msgs::msg::PointCloud2>& cloud_msg) {
+          [this, sensor_source](const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg) {
             cloudCallback(cloud_msg, sensor_source);
           },
           opt));
@@ -1040,7 +1040,7 @@ private:
             remote_namespace + "/vdb_map_sections",
             rclcpp::QoS(10).durability_volatile().best_effort(),
             [this, remote_source](
-              const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid>& msg) {
+              const vdb_mapping_interfaces::msg::UpdateGrid::SharedPtr msg) {
               mapSectionCallback(msg, remote_source);
             });
         RCLCPP_INFO_STREAM(this->get_logger(),
@@ -1053,7 +1053,7 @@ private:
             remote_namespace + "/vdb_map_full_sections",
             rclcpp::QoS(10).durability_volatile().best_effort(),
             [this, remote_source](
-              const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid>& msg) {
+              const vdb_mapping_interfaces::msg::UpdateGrid::SharedPtr msg) {
               mapFullSectionCallback(msg, remote_source);
             });
         RCLCPP_INFO_STREAM(this->get_logger(),
