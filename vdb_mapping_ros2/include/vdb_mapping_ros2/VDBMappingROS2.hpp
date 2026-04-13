@@ -179,7 +179,7 @@ public:
    * \param cloud_msg PointCloud message
    * \param sensor_source Sensor source corresponding to the Pointcloud
    */
-  void cloudCallback(const std::shared_ptr<sensor_msgs::msg::PointCloud2> cloud_msg,
+  void cloudCallback(const std::shared_ptr<sensor_msgs::msg::PointCloud2>& cloud_msg,
                      const SensorSource& sensor_source)
   {
     typename VDBMappingT::PointCloudT::Ptr cloud(new typename VDBMappingT::PointCloudT);
@@ -208,28 +208,38 @@ public:
                    ex.what());
       return;
     }
-    // If aligned map is not already in correct map frame, transform it
+    // If cloud is not already in correct map frame, transform it
     if (m_map_frame != cloud_msg->header.frame_id)
     {
-      geometry_msgs::msg::TransformStamped origin_to_map_tf;
-      try
+      // Reuse sensor origin TF when frames match, otherwise do a separate lookup
+      if (sensor_frame == cloud_msg->header.frame_id)
       {
-        origin_to_map_tf =
-          m_tf_buffer->lookupTransform(m_map_frame,
-                                       cloud_msg->header.frame_id,
-                                       cloud_msg->header.stamp,
-                                       rclcpp::Duration::from_seconds(m_tf_lookup_timeout));
+        pcl::transformPointCloud(
+          *cloud, *cloud, tf2::transformToEigen(cloud_origin_tf).matrix());
       }
-      catch (tf2::TransformException& ex)
+      else
       {
-        RCLCPP_ERROR(this->get_logger(),
-                     "MapToMessage: Could not transform %s to %s: %s",
-                     m_map_frame.c_str(),
-                     cloud_msg->header.frame_id.c_str(),
-                     ex.what());
-        return;
+        geometry_msgs::msg::TransformStamped origin_to_map_tf;
+        try
+        {
+          origin_to_map_tf =
+            m_tf_buffer->lookupTransform(m_map_frame,
+                                         cloud_msg->header.frame_id,
+                                         cloud_msg->header.stamp,
+                                         rclcpp::Duration::from_seconds(m_tf_lookup_timeout));
+        }
+        catch (tf2::TransformException& ex)
+        {
+          RCLCPP_ERROR(this->get_logger(),
+                       "MapToMessage: Could not transform %s to %s: %s",
+                       m_map_frame.c_str(),
+                       cloud_msg->header.frame_id.c_str(),
+                       ex.what());
+          return;
+        }
+        pcl::transformPointCloud(
+          *cloud, *cloud, tf2::transformToEigen(origin_to_map_tf).matrix());
       }
-      pcl::transformPointCloud(*cloud, *cloud, tf2::transformToEigen(origin_to_map_tf).matrix());
       cloud->header.frame_id = m_map_frame;
     }
     m_vdb_map->addDataToAccumulate(
@@ -332,8 +342,8 @@ public:
     }
   }
 
-  void mapSectionCallback(const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid> update_msg,
-                          const std::shared_ptr<RemoteSource> remote_source)
+  void mapSectionCallback(const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid>& update_msg,
+                          const std::shared_ptr<RemoteSource>& remote_source)
   {
     if (remote_source->active)
     {
@@ -374,8 +384,8 @@ public:
   }
 
   void
-  mapFullSectionCallback(const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid> update_msg,
-                         const std::shared_ptr<RemoteSource> remote_source)
+  mapFullSectionCallback(const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid>& update_msg,
+                         const std::shared_ptr<RemoteSource>& remote_source)
   {
     if (remote_source->active)
     {
@@ -768,9 +778,6 @@ public:
         artificial_areas.push_back(area);
       }
     }
-    double m_artificial_negative_height = -0.5;
-    double m_artificial_positive_height = 1.5;
-
     m_vdb_map->addArtificialAreas(
       artificial_areas, m_artificial_negative_height, m_artificial_positive_height);
     res->success = true;
@@ -803,14 +810,9 @@ public:
       return true;
     }
     remote_source->second->active = req->toggle;
-    if (remote_source->second->active)
-    {
-      std::cout << "Remote source " << req->remote_source << " set to active" << std::endl;
-    }
-    else
-    {
-      std::cout << "Remote source " << req->remote_source << " set to inactive" << std::endl;
-    }
+    RCLCPP_INFO_STREAM(this->get_logger(),
+                       "Remote source " << req->remote_source << " set to "
+                                        << (remote_source->second->active ? "active" : "inactive"));
     res->success = true;
     return true;
   }
@@ -909,6 +911,10 @@ private:
     this->declare_parameter<int>("remote_section_smoothing_iterations", 2);
     this->get_parameter("remote_section_smoothing_iterations",
                         m_remote_section_smoothing_iterations);
+    this->declare_parameter<double>("artificial_negative_height", -0.5);
+    this->get_parameter("artificial_negative_height", m_artificial_negative_height);
+    this->declare_parameter<double>("artificial_positive_height", 1.5);
+    this->get_parameter("artificial_positive_height", m_artificial_positive_height);
 
     // Configuring the VDB map
     m_vdb_map->setConfig(m_config);
@@ -990,7 +996,7 @@ private:
         m_cloud_subs.push_back(this->create_subscription<sensor_msgs::msg::PointCloud2>(
           sensor_source.topic,
           qos_profile,
-          [&, sensor_source](const std::shared_ptr<sensor_msgs::msg::PointCloud2> cloud_msg) {
+          [this, sensor_source](const std::shared_ptr<sensor_msgs::msg::PointCloud2>& cloud_msg) {
             cloudCallback(cloud_msg, sensor_source);
           },
           opt));
@@ -1036,9 +1042,9 @@ private:
           this->create_subscription<vdb_mapping_interfaces::msg::UpdateGrid>(
             remote_namespace + "/vdb_map_sections",
             rclcpp::QoS(10).durability_volatile().best_effort(),
-            [&, remote_source](
-              const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid> cloud_msg) {
-              mapSectionCallback(cloud_msg, remote_source);
+            [this, remote_source](
+              const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid>& msg) {
+              mapSectionCallback(msg, remote_source);
             });
         RCLCPP_INFO_STREAM(this->get_logger(),
                            "Subscribing to Section: " << remote_namespace + "/vdb_map_sections");
@@ -1049,9 +1055,9 @@ private:
           this->create_subscription<vdb_mapping_interfaces::msg::UpdateGrid>(
             remote_namespace + "/vdb_map_full_sections",
             rclcpp::QoS(10).durability_volatile().best_effort(),
-            [&, remote_source](
-              const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid> cloud_msg) {
-              mapFullSectionCallback(cloud_msg, remote_source);
+            [this, remote_source](
+              const std::shared_ptr<vdb_mapping_interfaces::msg::UpdateGrid>& msg) {
+              mapFullSectionCallback(msg, remote_source);
             });
         RCLCPP_INFO_STREAM(this->get_logger(),
                            "Subscribing to Full Section: " << remote_namespace +
@@ -1464,6 +1470,14 @@ private:
    * \brief Specifies the timeout for tf lookups when inserting a scan in seconds
    */
   double m_tf_lookup_timeout;
+  /*!
+   * \brief Height below the ground used for artificial area generation
+   */
+  double m_artificial_negative_height;
+  /*!
+   * \brief Height above the ground used for artificial area generation
+   */
+  double m_artificial_positive_height;
 
   /*!
    * \brief Compression level used for creating the byte array message.

@@ -91,9 +91,10 @@ public:
         occupancy_grid_msg.info.width * occupancy_grid_msg.info.height, 0);
 
       geometry_msgs::msg::Pose origin_pose;
-      origin_pose.position.x = bbox.min().x() * resolution;
-      origin_pose.position.y = bbox.min().y() * resolution;
-      origin_pose.position.z = 0.00;
+      origin_pose.position.x    = bbox.min().x() * resolution;
+      origin_pose.position.y    = bbox.min().y() * resolution;
+      origin_pose.position.z    = 0.00;
+      origin_pose.orientation.w = 1.0;
 
       occupancy_grid_msg.info.origin = origin_pose;
     }
