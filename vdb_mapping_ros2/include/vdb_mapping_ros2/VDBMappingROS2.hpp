@@ -38,7 +38,6 @@
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <vdb_mapping_interfaces/srv/add_artificial_areas.hpp>
 #include <vdb_mapping_interfaces/srv/add_points_to_grid.hpp>
@@ -90,8 +89,6 @@ public:
   explicit VDBMappingROS2(const rclcpp::NodeOptions& options)
     : Node("vdb_mapping_ros2", options)
   {
-    using namespace std::placeholders;
-
     m_tf_buffer   = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     m_tf_listener = std::make_shared<tf2_ros::TransformListener>(*m_tf_buffer);
 
@@ -1260,7 +1257,7 @@ private:
     this->get_parameter("map_server.set_background", set_background);
     this->declare_parameter<bool>("map_server.clear_map", false);
     this->get_parameter("map_server.clear_map", clear_map);
-    if (initial_map_file != "")
+    if (!initial_map_file.empty())
     {
       RCLCPP_INFO_STREAM(this->get_logger(), "Loading intial Map " << initial_map_file);
       m_vdb_map->loadMapFromPCD(initial_map_file, set_background, clear_map);
@@ -1270,14 +1267,6 @@ private:
 
 
   std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> m_cloud_subs;
-  /*!
-   * \brief Subscriber for raw pointclouds
-   */
-  // rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_sensor_cloud_sub;
-  /*!
-   * \brief Subscriber for scan aligned pointclouds
-   */
-  // rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_aligned_cloud_sub;
   /*!
    * \brief Publisher for the marker array
    */
