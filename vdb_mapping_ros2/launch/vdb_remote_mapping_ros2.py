@@ -3,7 +3,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
-from launch_ros.actions import SetParametersFromFile
+
 
 def generate_launch_description():
     ld = LaunchDescription()
@@ -13,8 +13,6 @@ def generate_launch_description():
             'config',
             'vdb_remote_params.yaml'
             )
-
-    print(config)
 
     container = ComposableNodeContainer(
         name='Container',

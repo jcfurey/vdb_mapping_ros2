@@ -264,19 +264,18 @@ public:
     {
       return;
     }
-    bool publish_vis_marker;
-    publish_vis_marker =
+    bool publish_vis_marker =
       (m_publish_vis_marker && this->count_subscribers("~/vdb_map_visualization") > 0);
-    bool publish_pointcloud;
-    publish_pointcloud =
+    bool publish_pointcloud =
       (m_publish_pointcloud && this->count_subscribers("~/vdb_map_pointcloud") > 0);
-    bool publish_occupancy_grid;
-    publish_occupancy_grid =
+    bool publish_occupancy_grid =
       (m_publish_occupancy_grid && this->count_subscribers("~/vdb_map_occupancy") > 0);
 
-    visualization_msgs::msg::Marker visualization_marker_msg;
-    sensor_msgs::msg::PointCloud2 cloud_msg;
-    nav_msgs::msg::OccupancyGrid occupancy_grid_msg;
+    // Skip TF lookup and grid iteration when no one is listening
+    if (!(publish_vis_marker || publish_pointcloud || publish_occupancy_grid))
+    {
+      return;
+    }
 
     geometry_msgs::msg::TransformStamped map_to_robot_tf;
     try
@@ -294,6 +293,9 @@ public:
       return;
     }
 
+    visualization_msgs::msg::Marker visualization_marker_msg;
+    sensor_msgs::msg::PointCloud2 cloud_msg;
+    nav_msgs::msg::OccupancyGrid occupancy_grid_msg;
 
     std::shared_lock map_lock(*m_vdb_map->getMapMutex());
     VDBMappingTools<VDBMappingT>::createMappingOutput(
@@ -302,9 +304,9 @@ public:
       visualization_marker_msg,
       cloud_msg,
       occupancy_grid_msg,
-      m_publish_vis_marker,
-      m_publish_pointcloud,
-      m_publish_occupancy_grid,
+      publish_vis_marker,
+      publish_pointcloud,
+      publish_occupancy_grid,
       map_to_robot_tf.transform.translation.z + m_lower_visualization_z_limit,
       map_to_robot_tf.transform.translation.z + m_upper_visualization_z_limit,
       m_resolution,
@@ -695,6 +697,10 @@ public:
     std::vector<double> max_ray_lengths;
     std::vector<openvdb::Vec3d> end_points;
 
+    ray_origins_world.reserve(req->rays.size());
+    ray_directions.reserve(req->rays.size());
+    max_ray_lengths.reserve(req->rays.size());
+
     for (size_t i = 0; i < req->rays.size(); i++)
     {
       Eigen::Matrix<double, 4, 1> origin, direction;
@@ -868,7 +874,7 @@ public:
     msg.header.frame_id = m_map_frame;
     msg.header.stamp    = map_to_robot_tf.header.stamp;
     msg.map             = m_vdb_map->template gridToByteArray<typename VDBMappingT::GridT>(section);
-    m_map_section_pub->publish(msg);
+    m_map_full_section_pub->publish(msg);
   }
 
 private:
@@ -1077,7 +1083,7 @@ private:
     };
 
     m_z_min_param_handle = m_param_sub->add_parameter_callback("z_limit_min", min_z_cb);
-    m_z_min_param_handle = m_param_sub->add_parameter_callback("z_limit_max", max_z_cb);
+    m_z_max_param_handle = m_param_sub->add_parameter_callback("z_limit_max", max_z_cb);
 
     double visualization_rate;
     this->declare_parameter<double>("visualization_rate", 1.0);
@@ -1208,7 +1214,7 @@ private:
     }
     if (m_publish_full_sections)
     {
-      m_map_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
+      m_map_full_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
         "~/vdb_map_full_sections", rclcpp::QoS(1).durability_volatile().best_effort());
 
       double section_update_rate;
