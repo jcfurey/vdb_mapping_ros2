@@ -80,6 +80,10 @@ public:
     }
 
     std::vector<int> occ_voxel_projection_grid;
+    // Track which (x,y) columns have been observed (hit or raytraced through).
+    // Columns with non-background voxels (active=occupied OR inactive=free) are
+    // "observed."  Columns never touched by any ray stay unknown.
+    std::vector<bool> occ_observed_grid;
     if (create_occupancy_grid)
     {
       occupancy_grid_msg.info.height     = bbox.dim().y();
@@ -89,6 +93,8 @@ public:
                                      -1);
       occ_voxel_projection_grid.resize(
         occupancy_grid_msg.info.width * occupancy_grid_msg.info.height, 0);
+      occ_observed_grid.resize(
+        occupancy_grid_msg.info.width * occupancy_grid_msg.info.height, false);
 
       geometry_msgs::msg::Pose origin_pose;
       origin_pose.position.x    = bbox.min().x() * resolution;
@@ -99,8 +105,20 @@ public:
       occupancy_grid_msg.info.origin = origin_pose;
     }
 
-    for (typename VDBMappingT::GridT::ValueOnCIter iter = grid->cbeginValueOn(); iter; ++iter)
+    // Use cbeginValueAll() to iterate ALL voxels with non-background values:
+    //   - Active voxels (value > logodds_thres_max): occupied — count toward 2D projection
+    //   - Inactive voxels (value != 0 background): observed free — mark column as "seen"
+    // Previously cbeginValueOn() only visited occupied voxels, so raytraced free
+    // space was indistinguishable from never-observed space in the 2D grid.
+    for (typename VDBMappingT::GridT::ValueAllCIter iter = grid->cbeginValueAll(); iter; ++iter)
     {
+      // Skip voxels that still hold the background value (0.0 = never observed).
+      // This filters out untouched tiles/voxels efficiently.
+      if (!iter.isValueOn() && iter.getValue() == 0)
+      {
+        continue;
+      }
+
       openvdb::Vec3d world_coord = grid->indexToWorld(iter.getCoord());
 
       if (world_coord.z() < min_z || world_coord.z() > max_z)
@@ -114,25 +132,33 @@ public:
         {
           int vdb_index_to_occ_index = (iter.getCoord().y() - bbox.min().y()) * bbox.dim().x() +
                                        (iter.getCoord().x() - bbox.min().x());
-          occ_voxel_projection_grid[vdb_index_to_occ_index] += 1;
+          occ_observed_grid[vdb_index_to_occ_index] = true;
+          if (iter.isValueOn())
+          {
+            // Active voxel = occupied — count toward lethal threshold
+            occ_voxel_projection_grid[vdb_index_to_occ_index] += 1;
+          }
         }
       }
 
-      if (create_marker)
+      // Marker and pointcloud only show occupied (active) voxels
+      if (iter.isValueOn())
       {
-        geometry_msgs::msg::Point cube_center;
-        cube_center.x = world_coord.x();
-        cube_center.y = world_coord.y();
-        cube_center.z = world_coord.z();
-        marker_msg.points.push_back(cube_center);
-        // Calculate the relative height of each voxel.
-        double h = (1.0 - ((world_coord.z() - min_z) / (max_z - min_z)));
-        marker_msg.colors.push_back(heightColorCoding(h));
-      }
-      if (create_pointcloud)
-      {
-        cloud->points.push_back(
-          typename VDBMappingT::PointT(world_coord.x(), world_coord.y(), world_coord.z()));
+        if (create_marker)
+        {
+          geometry_msgs::msg::Point cube_center;
+          cube_center.x = world_coord.x();
+          cube_center.y = world_coord.y();
+          cube_center.z = world_coord.z();
+          marker_msg.points.push_back(cube_center);
+          double h = (1.0 - ((world_coord.z() - min_z) / (max_z - min_z)));
+          marker_msg.colors.push_back(heightColorCoding(h));
+        }
+        if (create_pointcloud)
+        {
+          cloud->points.push_back(
+            typename VDBMappingT::PointT(world_coord.x(), world_coord.y(), world_coord.z()));
+        }
       }
     }
     if (create_marker)
@@ -172,15 +198,15 @@ public:
       {
         if (occ_voxel_projection_grid[i] > two_dim_proj_threshold)
         {
-          occ_voxel_projection_grid[i] = 100;
+          occ_voxel_projection_grid[i] = 100;   // lethal: enough occupied voxels
         }
-        else if (occ_voxel_projection_grid[i] == 0)
+        else if (occ_observed_grid[i])
         {
-          occ_voxel_projection_grid[i] = -1;
+          occ_voxel_projection_grid[i] = 0;     // free: observed but few/no occupied voxels
         }
         else
         {
-          occ_voxel_projection_grid[i] = 0;
+          occ_voxel_projection_grid[i] = -1;    // unknown: never observed
         }
       }
       smoothOccGrid(occupancy_grid_msg, occ_voxel_projection_grid);
