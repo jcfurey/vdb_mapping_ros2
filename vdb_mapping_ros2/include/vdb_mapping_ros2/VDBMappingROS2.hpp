@@ -285,6 +285,15 @@ public:
     }
 
     geometry_msgs::msg::TransformStamped map_to_robot_tf;
+    // Guard: skip visualization until TF tree is connected (avoids ERROR spam
+    // during startup before localization publishes odom→base_footprint).
+    if (!m_tf_buffer->canTransform(m_map_frame, m_robot_frame, tf2::TimePointZero))
+    {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                           "VisMapToRobot: Waiting for TF %s → %s (localization not yet active)",
+                           m_map_frame.c_str(), m_robot_frame.c_str());
+      return;
+    }
     try
     {
       map_to_robot_tf =
@@ -292,7 +301,7 @@ public:
     }
     catch (tf2::TransformException& ex)
     {
-      RCLCPP_ERROR(this->get_logger(),
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                    "VisMapToRobot: Could not transform %s to %s: %s",
                    m_map_frame.c_str(),
                    m_robot_frame.c_str(),
