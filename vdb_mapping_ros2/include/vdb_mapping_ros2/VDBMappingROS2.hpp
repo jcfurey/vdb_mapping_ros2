@@ -179,6 +179,10 @@ public:
   void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg,
                      const SensorSource& sensor_source)
   {
+    if (cloud_msg->width * cloud_msg->height == 0)
+    {
+      return;
+    }
     typename VDBMappingT::PointCloudT::Ptr cloud(new typename VDBMappingT::PointCloudT);
     pcl::fromROSMsg(*cloud_msg, *cloud);
     geometry_msgs::msg::TransformStamped cloud_origin_tf;
