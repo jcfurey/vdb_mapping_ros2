@@ -607,14 +607,20 @@ public:
       auto response = result.get();
       if (response->success)
       {
-        m_vdb_map->updateMap(m_vdb_map->template byteArrayToGrid<typename VDBMappingT::UpdateGridT>(
-          response->section.map));
+        // Full sections are serialized as GridT (see fullSectionTimerCallback and
+        // mapFullSectionCallback). Previously this path decoded as UpdateGridT and
+        // piped it through updateMap, which treated occupancy values as bool hits —
+        // so full-section replies silently dropped their actual values.
+        m_vdb_map->applyMapSectionGrid(
+          m_vdb_map->template byteArrayToGrid<typename VDBMappingT::GridT>(response->section.map),
+          m_smooth_remote_sections,
+          m_remote_section_smoothing_iterations);
       }
       res->success = response->success;
     }
     else
     {
-      RCLCPP_ERROR(this->get_logger(), "Failed to call servcie get_map_section");
+      RCLCPP_ERROR(this->get_logger(), "Failed to call service get_map_full_section");
       res->success = false;
     }
 
