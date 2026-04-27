@@ -102,22 +102,20 @@ public:
     int aligned_width  = aligned_max_x - aligned_min_x;
     int aligned_height = aligned_max_y - aligned_min_y;
 
-    std::vector<int> occ_voxel_projection_grid;
-    // Track which (x,y) columns have been observed (hit or raytraced through).
-    // Columns with non-background voxels (active=occupied OR inactive=free) are
-    // "observed."  Columns never touched by any ray stay unknown.
-    std::vector<bool> occ_observed_grid;
+    // Reuse scratch buffers across calls on the same visualization thread.
+    // assign() preserves capacity when the size is stable (the chunk-aligned
+    // bounds change rarely), avoiding the per-tick large allocations.
+    thread_local std::vector<int> occ_voxel_projection_grid;
+    thread_local std::vector<bool> occ_observed_grid;
     if (create_occupancy_grid)
     {
+      const size_t cells = static_cast<size_t>(aligned_width) * aligned_height;
       occupancy_grid_msg.info.height     = aligned_height;
       occupancy_grid_msg.info.width      = aligned_width;
       occupancy_grid_msg.info.resolution = resolution;
-      occupancy_grid_msg.data.resize(occupancy_grid_msg.info.width * occupancy_grid_msg.info.height,
-                                     -1);
-      occ_voxel_projection_grid.resize(
-        occupancy_grid_msg.info.width * occupancy_grid_msg.info.height, 0);
-      occ_observed_grid.resize(
-        occupancy_grid_msg.info.width * occupancy_grid_msg.info.height, false);
+      occupancy_grid_msg.data.assign(cells, -1);
+      occ_voxel_projection_grid.assign(cells, 0);
+      occ_observed_grid.assign(cells, false);
 
       geometry_msgs::msg::Pose origin_pose;
       origin_pose.position.x    = aligned_min_x * resolution;
@@ -127,6 +125,13 @@ public:
 
       occupancy_grid_msg.info.origin = origin_pose;
     }
+
+    // Pre-compute the z range in index space. The grid uses a uniform-scale
+    // linear transform, so world_z and idx_z differ only by resolution.
+    // Checking the int z first lets us skip the indexToWorld call entirely
+    // for voxels outside the visualization band.
+    int min_z_idx = static_cast<int>(std::floor(min_z / resolution));
+    int max_z_idx = static_cast<int>(std::ceil(max_z / resolution));
 
     // Use cbeginValueAll() to iterate ALL voxels with non-background values:
     //   - Active voxels (value > logodds_thres_max): occupied — count toward 2D projection
@@ -142,12 +147,12 @@ public:
         continue;
       }
 
-      openvdb::Vec3d world_coord = grid->indexToWorld(iter.getCoord());
-
-      if (world_coord.z() < min_z || world_coord.z() > max_z)
+      const openvdb::Coord coord = iter.getCoord();
+      if (coord.z() < min_z_idx || coord.z() > max_z_idx)
       {
         continue;
       }
+      openvdb::Vec3d world_coord = grid->indexToWorld(coord);
 
       if (create_occupancy_grid)
       {
