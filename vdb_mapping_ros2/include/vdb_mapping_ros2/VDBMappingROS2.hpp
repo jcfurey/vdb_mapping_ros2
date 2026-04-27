@@ -558,24 +558,30 @@ public:
 
     request->header       = req->header;
     request->bounding_box = req->bounding_box;
-    auto result = remote_source->second->get_map_section_client->async_send_request(request);
-    if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), result) ==
-        rclcpp::FutureReturnCode::SUCCESS)
-    {
-      auto response = result.get();
-      if (response->success)
-      {
-        m_vdb_map->updateMap(m_vdb_map->template byteArrayToGrid<typename VDBMappingT::UpdateGridT>(
-          response->section.map));
-      }
-      res->success = response->success;
-    }
-    else
-    {
-      RCLCPP_ERROR(this->get_logger(), "Failed to call servcie get_map_section");
-      res->success = false;
-    }
 
+    // Fire-and-forget: spin_until_future_complete inside a service callback
+    // re-enters the executor and deadlocks single-threaded executors. Apply
+    // the response from a completion callback instead. success here means the
+    // request was dispatched, not that it returned data.
+    auto vdb_map = m_vdb_map;
+    auto logger  = this->get_logger();
+    remote_source->second->get_map_section_client->async_send_request(
+      request,
+      [vdb_map, logger](
+        rclcpp::Client<vdb_mapping_interfaces::srv::GetMapSection>::SharedFuture future) {
+        auto response = future.get();
+        if (response->success)
+        {
+          vdb_map->updateMap(
+            vdb_map->template byteArrayToGrid<typename VDBMappingT::UpdateGridT>(
+              response->section.map));
+        }
+        else
+        {
+          RCLCPP_WARN(logger, "Remote get_map_section returned success=false");
+        }
+      });
+    res->success = true;
     return true;
   }
 
@@ -618,30 +624,32 @@ public:
 
     request->header       = req->header;
     request->bounding_box = req->bounding_box;
-    auto result = remote_source->second->get_map_full_section_client->async_send_request(request);
-    if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), result) ==
-        rclcpp::FutureReturnCode::SUCCESS)
-    {
-      auto response = result.get();
-      if (response->success)
-      {
-        // Full sections are serialized as GridT (see fullSectionTimerCallback and
-        // mapFullSectionCallback). Previously this path decoded as UpdateGridT and
-        // piped it through updateMap, which treated occupancy values as bool hits —
-        // so full-section replies silently dropped their actual values.
-        m_vdb_map->applyMapSectionGrid(
-          m_vdb_map->template byteArrayToGrid<typename VDBMappingT::GridT>(response->section.map),
-          m_smooth_remote_sections,
-          m_remote_section_smoothing_iterations);
-      }
-      res->success = response->success;
-    }
-    else
-    {
-      RCLCPP_ERROR(this->get_logger(), "Failed to call service get_map_full_section");
-      res->success = false;
-    }
 
+    auto vdb_map = m_vdb_map;
+    auto logger  = this->get_logger();
+    bool smooth  = m_smooth_remote_sections;
+    int iters    = m_remote_section_smoothing_iterations;
+    remote_source->second->get_map_full_section_client->async_send_request(
+      request,
+      [vdb_map, logger, smooth, iters](
+        rclcpp::Client<vdb_mapping_interfaces::srv::GetMapSection>::SharedFuture future) {
+        auto response = future.get();
+        if (response->success)
+        {
+          // Full sections are serialised as GridT (see fullSectionTimerCallback
+          // and mapFullSectionCallback).
+          vdb_map->applyMapSectionGrid(
+            vdb_map->template byteArrayToGrid<typename VDBMappingT::GridT>(
+              response->section.map),
+            smooth,
+            iters);
+        }
+        else
+        {
+          RCLCPP_WARN(logger, "Remote get_map_full_section returned success=false");
+        }
+      });
+    res->success = true;
     return true;
   }
 
