@@ -22,7 +22,7 @@ def generate_launch_description():
         composable_node_descriptions=[
             ComposableNode(
                 package='vdb_mapping_ros2',
-                plugin='vdb_mapping_ros2::vdb_mapping_ros2_component',
+                plugin='vdb_mapping_ros2::VDBMappingROS2',
                 name='vdb_mapping',
                 parameters=[
                     config,

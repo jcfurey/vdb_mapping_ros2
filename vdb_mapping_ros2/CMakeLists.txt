@@ -46,7 +46,7 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
 )
 
 add_library(${PROJECT_NAME} SHARED
-  src/vdb_mapping_ros2_component.cpp
+  src/VDBMappingROS2.cpp
 )
 target_include_directories(${PROJECT_NAME}
   PUBLIC
@@ -62,7 +62,7 @@ ament_target_dependencies(${PROJECT_NAME}
   ${THIS_PACKAGE_INCLUDE_DEPENDS}
 )
 rclcpp_components_register_nodes(${PROJECT_NAME}
-  "vdb_mapping_ros2::vdb_mapping_ros2_component"
+  "vdb_mapping_ros2::VDBMappingROS2"
 )
 
 install(TARGETS ${PROJECT_NAME}

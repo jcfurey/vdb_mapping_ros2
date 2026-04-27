@@ -17,10 +17,10 @@ vdb_mapping_ros2/                     # Repository root
 │   ├── CMakeLists.txt
 │   ├── package.xml
 │   ├── include/vdb_mapping_ros2/
-│   │   ├── VDBMappingROS2.hpp        # Main node class (header-only template)
+│   │   ├── VDBMappingROS2.hpp        # Main node class declarations
 │   │   └── VDBMappingTools.hpp       # Static helpers for visualization output
 │   ├── src/
-│   │   ├── vdb_mapping_ros2_component.cpp  # Composable node registration
+│   │   ├── VDBMappingROS2.cpp              # Main node implementation + composable registration
 │   │   └── vdb_mapping_ros_node.cpp        # Standalone node entry point
 │   ├── launch/
 │   │   ├── vdb_mapping_ros2.py             # Main mapping (multi-threaded)
@@ -57,7 +57,7 @@ vdb_mapping_ros2/                     # Repository root
 
 ### Key Classes
 
-- **`VDBMappingROS2<VDBMappingT>`** (`VDBMappingROS2.hpp`) - Main node class template. Extends `rclcpp::Node`. Handles all ROS integration: subscriptions, publishers, services, TF2 transforms, timers. Currently instantiated with `vdb_mapping::OccupancyVDBMapping` as the template parameter.
+- **`VDBMappingROS2`** (`VDBMappingROS2.hpp` / `.cpp`) - Main node class. Extends `rclcpp::Node`. Handles all ROS integration: subscriptions, publishers, services, TF2 transforms, timers. The mapping backend is fixed to `vdb_mapping::OccupancyVDBMapping` via the `VDBMapT` type alias.
 
 - **`VDBMappingTools<VDBMappingT>`** (`VDBMappingTools.hpp`) - Static utility class for converting VDB grids into ROS visualization formats (Marker, PointCloud2, OccupancyGrid). Includes height-based color coding and occupancy grid smoothing.
 
@@ -95,8 +95,7 @@ rosdep install --from-paths src --ignore-src -r -y
 - **Build type**: Defaults to Release if not specified
 - **Compiler flags**: `-Wall -Wextra -Wpedantic` (GCC/Clang)
 - **Build system**: ament_cmake for both packages
-- `vdb_mapping_ros2` is an INTERFACE (header-only) library target
-- `vdb_mapping_ros2_component` is the SHARED library (composable node)
+- `vdb_mapping_ros2` is the single SHARED library target. The composable node is registered from inside its sources.
 
 ### Running
 
@@ -128,7 +127,7 @@ Pipeline is inherited from an external `continuous_integration/ci_scripts` proje
 
 ### File Naming
 - Headers: PascalCase `.hpp` files (`VDBMappingROS2.hpp`)
-- Sources: snake_case `.cpp` files (`vdb_mapping_ros2_component.cpp`)
+- Sources: PascalCase `.cpp` for the main implementation (`VDBMappingROS2.cpp`); snake_case for entry points (`vdb_mapping_ros_node.cpp`)
 - Launch files: snake_case Python files (`vdb_mapping_ros2.py`)
 - Config files: snake_case YAML files (`vdb_params.yaml`)
 
@@ -141,8 +140,8 @@ Pipeline is inherited from an external `continuous_integration/ci_scripts` proje
 - Clang Format is enforced in CI (version 18 on Jazzy/Rolling)
 - Indentation: 2 spaces (no tabs)
 
-### Template Pattern
-The main class is a template parameterized on the mapping backend type. All logic lives in the header file. The `.cpp` files only instantiate the template and register the component. When adding new functionality, add it to `VDBMappingROS2.hpp`.
+### File Layout
+The main class is split into `VDBMappingROS2.hpp` (declarations) and `VDBMappingROS2.cpp` (definitions + composable-node registration). When adding a new method, declare it in the header and implement it in the .cpp.
 
 ### Parameter Declaration Pattern
 Parameters follow a consistent `declare_parameter` / `get_parameter` two-step pattern:
@@ -157,7 +156,7 @@ this->get_parameter("param_name", m_member_variable);
 1. Define the `.srv` file in `vdb_mapping_interfaces/srv/`
 2. Add it to `rosidl_generate_interfaces()` in `vdb_mapping_interfaces/CMakeLists.txt`
 3. Add the include in `VDBMappingROS2.hpp`
-4. Implement the callback method in the `VDBMappingROS2` class
+4. Declare the callback in `VDBMappingROS2.hpp` and implement it in `VDBMappingROS2.cpp`
 5. Register the service in `setUpServices()`
 
 ### Adding a new ROS message
@@ -167,7 +166,7 @@ this->get_parameter("param_name", m_member_variable);
 
 ### Adding a new parameter
 1. Add the parameter to the relevant config YAML file(s)
-2. Declare and read it in the appropriate `setUp*()` method in `VDBMappingROS2.hpp`
+2. Declare and read it in the appropriate `setUp*()` method in `VDBMappingROS2.cpp`
 3. Add a member variable with `m_` prefix
 4. Document it in `README.md`
 
