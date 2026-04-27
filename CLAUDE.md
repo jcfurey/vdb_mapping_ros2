@@ -40,7 +40,7 @@ vdb_mapping_ros2/                     # Repository root
     └── srv/                          # 10 custom services
         ├── LoadMap.srv, LoadMapFromPCD.srv
         ├── Raytrace.srv, BatchRaytrace.srv
-        ├── GetMapSection.srv, GetOccGrid.srv
+        ├── GetMapSection.srv
         ├── AddPointsToGrid.srv, RemovePointsFromGrid.srv
         ├── AddArtificialAreas.srv
         ├── TriggerMapSectionUpdate.srv

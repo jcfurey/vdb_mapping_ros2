@@ -43,7 +43,6 @@
 #include <vdb_mapping_interfaces/srv/add_points_to_grid.hpp>
 #include <vdb_mapping_interfaces/srv/batch_raytrace.hpp>
 #include <vdb_mapping_interfaces/srv/get_map_section.hpp>
-#include <vdb_mapping_interfaces/srv/get_occ_grid.hpp>
 #include <vdb_mapping_interfaces/srv/load_map.hpp>
 #include <vdb_mapping_interfaces/srv/load_map_from_pcd.hpp>
 #include <vdb_mapping_interfaces/srv/raytrace.hpp>

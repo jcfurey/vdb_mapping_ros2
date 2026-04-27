@@ -21,7 +21,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/AddPointsToGrid.srv"
   "srv/BatchRaytrace.srv"
   "srv/GetMapSection.srv"
-  "srv/GetOccGrid.srv"
   "srv/LoadMap.srv"
   "srv/LoadMapFromPCD.srv"
   "srv/Raytrace.srv"
