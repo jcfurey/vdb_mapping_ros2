@@ -1206,19 +1206,14 @@ private:
         this->create_publisher<nav_msgs::msg::OccupancyGrid>("~/vdb_map_occupancy", 1);
     }
 
-    if (m_publish_sections)
+    // section_update.* parameters are shared between the sparse and full
+    // section timers. Declare them once so enabling both publish_sections and
+    // publish_full_sections does not crash on duplicate declare_parameter.
+    double section_update_rate = 1.0;
+    if (m_publish_sections || m_publish_full_sections)
     {
-      m_map_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
-        "~/vdb_map_sections", rclcpp::QoS(1).durability_volatile().best_effort());
-
-      double section_update_rate;
-      this->declare_parameter<double>("section_update.rate", 1);
+      this->declare_parameter<double>("section_update.rate", 1.0);
       this->get_parameter("section_update.rate", section_update_rate);
-      m_section_timer =
-        this->create_wall_timer(std::chrono::milliseconds((int)(1000.0 / section_update_rate)),
-                                std::bind(&VDBMappingROS2::sectionTimerCallback, this),
-                                m_remote_cb_group);
-
       this->declare_parameter<double>("section_update.min_coord.x", -10);
       this->get_parameter("section_update.min_coord.x", m_section_min_coord.x());
       this->declare_parameter<double>("section_update.min_coord.y", -10);
@@ -1234,33 +1229,24 @@ private:
       this->declare_parameter<std::string>("section_update.frame", m_robot_frame);
       this->get_parameter("section_update.frame", m_section_update_frame);
     }
+
+    if (m_publish_sections)
+    {
+      m_map_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
+        "~/vdb_map_sections", rclcpp::QoS(1).durability_volatile().best_effort());
+      m_section_timer =
+        this->create_wall_timer(std::chrono::milliseconds((int)(1000.0 / section_update_rate)),
+                                std::bind(&VDBMappingROS2::sectionTimerCallback, this),
+                                m_remote_cb_group);
+    }
     if (m_publish_full_sections)
     {
       m_map_full_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
         "~/vdb_map_full_sections", rclcpp::QoS(1).durability_volatile().best_effort());
-
-      double section_update_rate;
-      this->declare_parameter<double>("section_update.rate", 1);
-      this->get_parameter("section_update.rate", section_update_rate);
       m_full_section_timer =
         this->create_wall_timer(std::chrono::milliseconds((int)(1000.0 / section_update_rate)),
                                 std::bind(&VDBMappingROS2::fullSectionTimerCallback, this),
                                 m_remote_cb_group);
-
-      this->declare_parameter<double>("section_update.min_coord.x", -10);
-      this->get_parameter("section_update.min_coord.x", m_section_min_coord.x());
-      this->declare_parameter<double>("section_update.min_coord.y", -10);
-      this->get_parameter("section_update.min_coord.y", m_section_min_coord.y());
-      this->declare_parameter<double>("section_update.min_coord.z", -10);
-      this->get_parameter("section_update.min_coord.z", m_section_min_coord.z());
-      this->declare_parameter<double>("section_update.max_coord.x", 10);
-      this->get_parameter("section_update.max_coord.x", m_section_max_coord.x());
-      this->declare_parameter<double>("section_update.max_coord.y", 10);
-      this->get_parameter("section_update.max_coord.y", m_section_max_coord.y());
-      this->declare_parameter<double>("section_update.max_coord.z", 10);
-      this->get_parameter("section_update.max_coord.z", m_section_max_coord.z());
-      this->declare_parameter<std::string>("section_update.frame", m_robot_frame);
-      this->get_parameter("section_update.frame", m_section_update_frame);
     }
   }
 
