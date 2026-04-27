@@ -63,7 +63,8 @@ public:
                                   double lower_z_limit             = 0.0,
                                   double upper_z_limit             = 0.0,
                                   const float resolution           = 0.05,
-                                  const int two_dim_proj_threshold = 5)
+                                  const int two_dim_proj_threshold = 5,
+                                  const int occupancy_chunk        = 32)
   {
     typename VDBMappingT::PointCloudT::Ptr cloud(new typename VDBMappingT::PointCloudT);
     openvdb::CoordBBox bbox = grid->evalActiveVoxelBoundingBox();
@@ -79,6 +80,28 @@ public:
       max_z = max_z > upper_z_limit ? upper_z_limit : max_z;
     }
 
+    // Snap the 2D occupancy grid bounds to a fixed multiple of chunk voxels so
+    // info.origin only jumps in chunk-sized steps as the active bbox grows.
+    // Without this, downstream consumers (nav2 static_layer, AMCL) would see
+    // the origin shift every visualization tick and rebuild their costmaps.
+    auto floor_chunk = [occupancy_chunk](int v) {
+      int r = v % occupancy_chunk;
+      return v - (r < 0 ? r + occupancy_chunk : r);
+    };
+    auto ceil_chunk = [occupancy_chunk](int v) {
+      int r = v % occupancy_chunk;
+      if (r > 0) return v + occupancy_chunk - r;
+      if (r < 0) return v - r;
+      return v;
+    };
+
+    int aligned_min_x = floor_chunk(bbox.min().x());
+    int aligned_min_y = floor_chunk(bbox.min().y());
+    int aligned_max_x = ceil_chunk(bbox.max().x() + 1);
+    int aligned_max_y = ceil_chunk(bbox.max().y() + 1);
+    int aligned_width  = aligned_max_x - aligned_min_x;
+    int aligned_height = aligned_max_y - aligned_min_y;
+
     std::vector<int> occ_voxel_projection_grid;
     // Track which (x,y) columns have been observed (hit or raytraced through).
     // Columns with non-background voxels (active=occupied OR inactive=free) are
@@ -86,8 +109,8 @@ public:
     std::vector<bool> occ_observed_grid;
     if (create_occupancy_grid)
     {
-      occupancy_grid_msg.info.height     = bbox.dim().y();
-      occupancy_grid_msg.info.width      = bbox.dim().x();
+      occupancy_grid_msg.info.height     = aligned_height;
+      occupancy_grid_msg.info.width      = aligned_width;
       occupancy_grid_msg.info.resolution = resolution;
       occupancy_grid_msg.data.resize(occupancy_grid_msg.info.width * occupancy_grid_msg.info.height,
                                      -1);
@@ -97,8 +120,8 @@ public:
         occupancy_grid_msg.info.width * occupancy_grid_msg.info.height, false);
 
       geometry_msgs::msg::Pose origin_pose;
-      origin_pose.position.x    = bbox.min().x() * resolution;
-      origin_pose.position.y    = bbox.min().y() * resolution;
+      origin_pose.position.x    = aligned_min_x * resolution;
+      origin_pose.position.y    = aligned_min_y * resolution;
       origin_pose.position.z    = 0.00;
       origin_pose.orientation.w = 1.0;
 
@@ -130,8 +153,8 @@ public:
       {
         if (bbox.isInside(iter.getCoord()))
         {
-          int vdb_index_to_occ_index = (iter.getCoord().y() - bbox.min().y()) * bbox.dim().x() +
-                                       (iter.getCoord().x() - bbox.min().x());
+          int vdb_index_to_occ_index = (iter.getCoord().y() - aligned_min_y) * aligned_width +
+                                       (iter.getCoord().x() - aligned_min_x);
           occ_observed_grid[vdb_index_to_occ_index] = true;
           if (iter.isValueOn())
           {
