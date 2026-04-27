@@ -45,41 +45,24 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
   backward_ros
 )
 
-add_library(${PROJECT_NAME} INTERFACE)
+add_library(${PROJECT_NAME} SHARED
+  src/vdb_mapping_ros2_component.cpp
+)
 target_include_directories(${PROJECT_NAME}
-  INTERFACE
+  PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(${PROJECT_NAME} INTERFACE
+target_link_libraries(${PROJECT_NAME}
   vdb_mapping::vdb_mapping
 )
+target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 
-target_compile_features(${PROJECT_NAME} INTERFACE cxx_std_17)
-
-ament_target_dependencies(${PROJECT_NAME} INTERFACE
+ament_target_dependencies(${PROJECT_NAME}
   ${THIS_PACKAGE_INCLUDE_DEPENDS}
 )
-
-add_library(vdb_mapping_ros2_component SHARED
-  src/vdb_mapping_ros2_component.cpp
-)
-target_link_libraries(vdb_mapping_ros2_component
-  ${PROJECT_NAME}
-)
-
-target_compile_features(vdb_mapping_ros2_component PUBLIC cxx_std_17)
-
-ament_target_dependencies(vdb_mapping_ros2_component
-  ${THIS_PACKAGE_INCLUDE_DEPENDS}
-)
-rclcpp_components_register_nodes(vdb_mapping_ros2_component
+rclcpp_components_register_nodes(${PROJECT_NAME}
   "vdb_mapping_ros2::vdb_mapping_ros2_component"
-)
-
-install(TARGETS
-  vdb_mapping_ros2_component
-  DESTINATION lib
 )
 
 install(TARGETS ${PROJECT_NAME}
@@ -104,12 +87,6 @@ install(DIRECTORY
 
 
 if(BUILD_TESTING)
-  # the following line skips the linter which checks for copyrights
-  # uncomment the line when a copyright and license is not present in all source files
-  #set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # uncomment the line when this package is not in a git repo
-  #set(ament_cmake_cpplint_FOUND TRUE)
 endif()
 
 ament_export_dependencies(
