@@ -989,6 +989,9 @@ private:
       this->declare_parameter<std::vector<std::string>>("sources", std::vector<std::string>());
       this->get_parameter("sources", source_ids);
 
+      // Reserve so push_back never reallocates and invalidates lambda captures.
+      m_sensor_sources.reserve(source_ids.size());
+
       for (auto& source_id : source_ids)
       {
         SensorSource sensor_source;
@@ -1035,15 +1038,17 @@ private:
           qos_profile = qos_profile.durability_volatile().best_effort();
         }
 
+        m_sensor_sources.push_back(std::move(sensor_source));
+        const SensorSource& stored = m_sensor_sources.back();
+
         m_cloud_subs.push_back(this->create_subscription<sensor_msgs::msg::PointCloud2>(
-          sensor_source.topic,
+          stored.topic,
           qos_profile,
-          [this, sensor_source](const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg) {
-            cloudCallback(cloud_msg, sensor_source);
+          [this, &stored](const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg) {
+            cloudCallback(cloud_msg, stored);
           },
           opt));
-        m_vdb_map->addInputSource(
-          sensor_source.source_id, sensor_source.max_range, sensor_source.max_rate);
+        m_vdb_map->addInputSource(stored.source_id, stored.max_range, stored.max_rate);
       }
       this->declare_parameter<bool>("accumulate_updates", false);
       this->get_parameter("accumulate_updates", m_accumulate_updates);
@@ -1303,6 +1308,9 @@ private:
   }
 
 
+  // Sensor source configs are owned here so subscription lambdas can capture
+  // a stable reference instead of a per-callback copy.
+  std::vector<SensorSource> m_sensor_sources;
   std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> m_cloud_subs;
   /*!
    * \brief Publisher for the marker array
