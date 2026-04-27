@@ -7,9 +7,9 @@
     resolution: 0.05
     prob_hit: 0.8
     prob_miss: 0.1
-    thres_min: 0.12
-    thres_max: 0.8
-    map_save_dir: ""
+    prob_thres_min: 0.12
+    prob_thres_max: 0.8
+    map_directory_path: ""
 
     # Visualizations
     publish_pointcloud: true

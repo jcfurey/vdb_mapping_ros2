@@ -3,7 +3,7 @@
     # Basic setup
     map_frame: map
     robot_frame: base_link
-    map_save_dir: ""
+    map_directory_path: ""
 
     # Visualizations
     publish_pointcloud: true
