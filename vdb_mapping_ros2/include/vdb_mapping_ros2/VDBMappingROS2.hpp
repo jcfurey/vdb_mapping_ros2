@@ -545,6 +545,15 @@ public:
       return true;
     }
 
+    if (!remote_source->second->get_map_section_client)
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "Remote source %s has apply_remote_sections=false; cannot trigger update",
+                  req->remote_source.c_str());
+      res->success = false;
+      return true;
+    }
+
     auto request = std::make_shared<vdb_mapping_interfaces::srv::GetMapSection::Request>();
 
     request->header       = req->header;
@@ -592,6 +601,15 @@ public:
         ss << source.first << ", ";
       }
       RCLCPP_WARN(this->get_logger(), ss.str().c_str());
+      res->success = false;
+      return true;
+    }
+
+    if (!remote_source->second->get_map_full_section_client)
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "Remote source %s has apply_remote_full_sections=false; cannot trigger update",
+                  req->remote_source.c_str());
       res->success = false;
       return true;
     }
@@ -1079,12 +1097,18 @@ private:
                            "Subscribing to Full Section: " << remote_namespace +
                                                                 "/vdb_map_full_sections");
       }
-      remote_source->get_map_section_client =
-        this->create_client<vdb_mapping_interfaces::srv::GetMapSection>(remote_namespace +
-                                                                        "/get_map_section");
-      remote_source->get_map_full_section_client =
-        this->create_client<vdb_mapping_interfaces::srv::GetMapSection>(remote_namespace +
-                                                                        "/get_map_full_section");
+      if (remote_source->apply_remote_sections)
+      {
+        remote_source->get_map_section_client =
+          this->create_client<vdb_mapping_interfaces::srv::GetMapSection>(remote_namespace +
+                                                                          "/get_map_section");
+      }
+      if (remote_source->apply_remote_full_sections)
+      {
+        remote_source->get_map_full_section_client =
+          this->create_client<vdb_mapping_interfaces::srv::GetMapSection>(remote_namespace +
+                                                                          "/get_map_full_section");
+      }
       m_remote_sources.insert(std::make_pair(source_id, remote_source));
     }
   }
