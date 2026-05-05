@@ -37,12 +37,18 @@ VDBMappingROS2::VDBMappingROS2(const rclcpp::NodeOptions& options)
   m_remote_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
   setUpVDBMap();
-  setUpLocalSources();
   setUpRemoteSources();
   setUpVisualization();
   setUpServices();
   setUpPublishers();
   setUpMapServer();
+  // Local cloud subscriptions go live last: cloudCallback runs on
+  // m_accumulation_cb_group on a separate executor thread the moment the
+  // subscription is created, so every member it reads (m_vdb_map config,
+  // m_accumulate_updates, m_publish_*, sensor_source entries) must already
+  // be populated. Anything earlier in the ctor and a cloud arriving mid-init
+  // races against partially-constructed state and SIGSEGVs the container.
+  setUpLocalSources();
 }
 
 void VDBMappingROS2::resetMap()
@@ -791,6 +797,12 @@ void VDBMappingROS2::setUpLocalSources()
     return;
   }
 
+  // Read accumulate_updates BEFORE any subscription goes live: cloudCallback
+  // dereferences this on every message and a stray uninitialised bool here
+  // is undefined behaviour the moment the first cloud arrives.
+  this->declare_parameter<bool>("accumulate_updates", false);
+  this->get_parameter("accumulate_updates", m_accumulate_updates);
+
   std::vector<std::string> source_ids;
   this->declare_parameter<std::vector<std::string>>("sources", std::vector<std::string>());
   this->get_parameter("sources", source_ids);
@@ -798,6 +810,9 @@ void VDBMappingROS2::setUpLocalSources()
   // Reserve so push_back never reallocates and invalidates lambda captures.
   m_sensor_sources.reserve(source_ids.size());
 
+  // Pass 1 — declare params, populate m_sensor_sources, register input sources
+  // with the VDB map. No subscriptions yet: we want addInputSource() to be in
+  // place for every source before any cloudCallback can fire for that source.
   for (auto& source_id : source_ids)
   {
     SensorSource sensor_source;
@@ -831,11 +846,19 @@ void VDBMappingROS2::setUpLocalSources()
                          "Using " << sensor_source.sensor_origin_frame << " as raycast origin");
     }
 
-    rclcpp::SubscriptionOptions opt;
-    opt.callback_group = m_accumulation_cb_group;
+    m_sensor_sources.push_back(std::move(sensor_source));
+    const SensorSource& stored = m_sensor_sources.back();
+    m_vdb_map->addInputSource(stored.source_id, stored.max_range, stored.max_rate);
+  }
 
+  // Pass 2 — create the cloud subscriptions. After this, cloudCallback can
+  // fire on m_accumulation_cb_group from a different executor thread.
+  rclcpp::SubscriptionOptions opt;
+  opt.callback_group = m_accumulation_cb_group;
+  for (const SensorSource& stored : m_sensor_sources)
+  {
     rclcpp::QoS qos_profile(1);
-    if (sensor_source.reliable)
+    if (stored.reliable)
     {
       qos_profile = qos_profile.durability_volatile().reliable();
     }
@@ -843,10 +866,6 @@ void VDBMappingROS2::setUpLocalSources()
     {
       qos_profile = qos_profile.durability_volatile().best_effort();
     }
-
-    m_sensor_sources.push_back(std::move(sensor_source));
-    const SensorSource& stored = m_sensor_sources.back();
-
     m_cloud_subs.push_back(this->create_subscription<sensor_msgs::msg::PointCloud2>(
       stored.topic,
       qos_profile,
@@ -854,10 +873,7 @@ void VDBMappingROS2::setUpLocalSources()
         cloudCallback(cloud_msg, stored);
       },
       opt));
-    m_vdb_map->addInputSource(stored.source_id, stored.max_range, stored.max_rate);
   }
-  this->declare_parameter<bool>("accumulate_updates", false);
-  this->get_parameter("accumulate_updates", m_accumulate_updates);
 }
 
 void VDBMappingROS2::setUpRemoteSources()
