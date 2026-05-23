@@ -13,7 +13,11 @@
 #include <sstream>
 #include <utility>
 
+#if __has_include(<tf2/exceptions.hpp>)
+#include <tf2/exceptions.hpp>
+#else
 #include <tf2/exceptions.h>
+#endif
 #include <tf2_eigen/tf2_eigen.hpp>
 
 #define BOOST_BIND_NO_PLACEHOLDERS
