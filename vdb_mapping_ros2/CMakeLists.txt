@@ -11,41 +11,13 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 # find dependencies
-find_package(ament_cmake REQUIRED)
-find_package(backward_ros REQUIRED)
-find_package(rclcpp REQUIRED)
-find_package(sensor_msgs REQUIRED)
-find_package(std_msgs REQUIRED)
-find_package(std_srvs REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_eigen REQUIRED)
-find_package(tf2_ros REQUIRED)
+find_package(ament_cmake_auto REQUIRED)
+ament_auto_find_build_dependencies()
+
+# vdb_mapping is an exported imported target rather than a plain ament dep
 find_package(vdb_mapping REQUIRED)
-find_package(vdb_mapping_interfaces REQUIRED)
-find_package(visualization_msgs REQUIRED)
-find_package(pcl_conversions REQUIRED)
-find_package(rclcpp_components REQUIRED)
 
-# uncomment the following section in order to fill in
-# further dependencies manually.
-# find_package(<dependency> REQUIRED)
-
-set(THIS_PACKAGE_INCLUDE_DEPENDS
-  rclcpp
-  rclcpp_components
-  sensor_msgs
-  std_msgs
-  std_srvs
-  tf2
-  tf2_eigen
-  tf2_ros
-  vdb_mapping_interfaces
-  visualization_msgs
-  pcl_conversions
-  backward_ros
-)
-
-add_library(${PROJECT_NAME} SHARED
+ament_auto_add_library(${PROJECT_NAME} SHARED
   src/VDBMappingROS2.cpp
 )
 target_include_directories(${PROJECT_NAME}
@@ -58,23 +30,8 @@ target_link_libraries(${PROJECT_NAME}
 )
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 
-ament_target_dependencies(${PROJECT_NAME}
-  ${THIS_PACKAGE_INCLUDE_DEPENDS}
-)
 rclcpp_components_register_nodes(${PROJECT_NAME}
   "vdb_mapping_ros2::VDBMappingROS2"
-)
-
-install(TARGETS ${PROJECT_NAME}
-  EXPORT "export_${PROJECT_NAME}"
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION lib
-  INCLUDES DESTINATION include
-)
-
-install(DIRECTORY include/
-  DESTINATION include
 )
 
 install(DIRECTORY
@@ -89,8 +46,4 @@ install(DIRECTORY
 if(BUILD_TESTING)
 endif()
 
-ament_export_dependencies(
-  ${THIS_PACKAGE_INCLUDE_DEPENDS}
-)
-ament_export_targets("export_${PROJECT_NAME}")
-ament_package()
+ament_auto_package()
