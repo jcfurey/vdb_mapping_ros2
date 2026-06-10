@@ -10,6 +10,8 @@
 #ifndef VDB_MAPPING_ROS2_VDBMAPPINGROS2_HPP_INCLUDED
 #define VDB_MAPPING_ROS2_VDBMAPPINGROS2_HPP_INCLUDED
 
+#include <atomic>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -51,7 +53,9 @@ struct RemoteSource
     get_map_full_section_client;
   bool apply_remote_sections;
   bool apply_remote_full_sections;
-  bool active;
+  // Written by the toggle service, read by subscription callbacks that may
+  // run on a different executor thread.
+  std::atomic<bool> active{true};
 };
 
 struct SensorSource
@@ -188,7 +192,9 @@ private:
   bool m_publish_full_sections;
   bool m_apply_raw_sensor_data;
   bool m_smooth_remote_sections;
-  bool m_accumulate_updates;
+  // Only declared/read when apply_raw_sensor_data is true; keep a defined
+  // value on the pure-remote path.
+  bool m_accumulate_updates = false;
   int m_remote_section_smoothing_iterations;
 
   std::map<std::string, std::shared_ptr<RemoteSource>> m_remote_sources;
@@ -208,8 +214,10 @@ private:
   std::shared_ptr<rclcpp::ParameterEventHandler> m_param_sub;
   std::shared_ptr<rclcpp::ParameterCallbackHandle> m_z_min_param_handle;
   std::shared_ptr<rclcpp::ParameterCallbackHandle> m_z_max_param_handle;
-  double m_lower_visualization_z_limit;
-  double m_upper_visualization_z_limit;
+  // Written by parameter callbacks (default callback group), read by
+  // publishMap on the visualization callback group.
+  std::atomic<double> m_lower_visualization_z_limit{0.0};
+  std::atomic<double> m_upper_visualization_z_limit{0.0};
 
   rclcpp::CallbackGroup::SharedPtr m_accumulation_cb_group;
   rclcpp::CallbackGroup::SharedPtr m_visualization_cb_group;

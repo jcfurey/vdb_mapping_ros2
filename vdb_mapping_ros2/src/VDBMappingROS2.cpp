@@ -10,6 +10,10 @@
 
 #include <vdb_mapping_ros2/VDBMappingROS2.hpp>
 
+#include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <utility>
 
@@ -413,6 +417,14 @@ bool VDBMappingROS2::triggerMapSectionUpdateCallback(
     res->success = false;
     return true;
   }
+  if (!remote_source->second->active)
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "Remote source %s is currently deactivated; cannot trigger update",
+                req->remote_source.c_str());
+    res->success = false;
+    return true;
+  }
 
   auto request = std::make_shared<vdb_mapping_interfaces::srv::GetMapSection::Request>();
   request->header       = req->header;
@@ -461,6 +473,14 @@ bool VDBMappingROS2::triggerMapFullSectionUpdateCallback(
   {
     RCLCPP_WARN(this->get_logger(),
                 "Remote source %s has apply_remote_full_sections=false; cannot trigger update",
+                req->remote_source.c_str());
+    res->success = false;
+    return true;
+  }
+  if (!remote_source->second->active)
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "Remote source %s is currently deactivated; cannot trigger update",
                 req->remote_source.c_str());
     res->success = false;
     return true;
@@ -811,7 +831,8 @@ void VDBMappingROS2::setUpLocalSources()
   this->declare_parameter<std::vector<std::string>>("sources", std::vector<std::string>());
   this->get_parameter("sources", source_ids);
 
-  // Reserve so push_back never reallocates and invalidates lambda captures.
+  // The subscriptions created in pass 2 capture references to elements of
+  // m_sensor_sources, so the vector must not be modified after that point.
   m_sensor_sources.reserve(source_ids.size());
 
   // Pass 1 — declare params, populate m_sensor_sources, register input sources
@@ -901,8 +922,10 @@ void VDBMappingROS2::setUpRemoteSources()
     this->declare_parameter<bool>(source_id + ".apply_remote_full_sections", false);
     this->get_parameter(source_id + ".apply_remote_full_sections",
                         remote_source->apply_remote_full_sections);
+    bool autostart = true;
     this->declare_parameter<bool>(source_id + ".autostart", true);
-    this->get_parameter(source_id + ".autostart", remote_source->active);
+    this->get_parameter(source_id + ".autostart", autostart);
+    remote_source->active = autostart;
 
     if (remote_source->apply_remote_sections)
     {
@@ -949,10 +972,14 @@ void VDBMappingROS2::setUpRemoteSources()
 
 void VDBMappingROS2::setUpVisualization()
 {
+  double z_limit_min = 0.0;
+  double z_limit_max = 0.0;
   this->declare_parameter<double>("z_limit_min", 0);
-  this->get_parameter("z_limit_min", m_lower_visualization_z_limit);
+  this->get_parameter("z_limit_min", z_limit_min);
   this->declare_parameter<double>("z_limit_max", 0);
-  this->get_parameter("z_limit_max", m_upper_visualization_z_limit);
+  this->get_parameter("z_limit_max", z_limit_max);
+  m_lower_visualization_z_limit = z_limit_min;
+  m_upper_visualization_z_limit = z_limit_max;
 
   m_param_sub = std::make_shared<rclcpp::ParameterEventHandler>(this);
 
@@ -971,10 +998,10 @@ void VDBMappingROS2::setUpVisualization()
   this->get_parameter("visualization_rate", visualization_rate);
   if (visualization_rate > 0.0)
   {
-    m_visualization_timer =
-      this->create_wall_timer(std::chrono::milliseconds((int)(1000.0 / visualization_rate)),
-                              std::bind(&VDBMappingROS2::visualizationTimerCallback, this),
-                              m_visualization_cb_group);
+    m_visualization_timer = this->create_wall_timer(
+      std::chrono::milliseconds(std::max(1, (int)(1000.0 / visualization_rate))),
+      std::bind(&VDBMappingROS2::visualizationTimerCallback, this),
+      m_visualization_cb_group);
   }
 }
 
@@ -1076,12 +1103,22 @@ void VDBMappingROS2::setUpPublishers()
     this->get_parameter("section_update.frame", m_section_update_frame);
   }
 
+  if ((m_publish_sections || m_publish_full_sections) && section_update_rate <= 0.0)
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "section_update.rate must be positive; section publishing disabled");
+    m_publish_sections      = false;
+    m_publish_full_sections = false;
+  }
+  auto section_update_period = std::chrono::milliseconds(
+    section_update_rate > 0.0 ? std::max(1, (int)(1000.0 / section_update_rate)) : 1);
+
   if (m_publish_sections)
   {
     m_map_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
       "~/vdb_map_sections", rclcpp::QoS(1).durability_volatile().best_effort());
     m_section_timer =
-      this->create_wall_timer(std::chrono::milliseconds((int)(1000.0 / section_update_rate)),
+      this->create_wall_timer(section_update_period,
                               std::bind(&VDBMappingROS2::sectionTimerCallback, this),
                               m_remote_cb_group);
   }
@@ -1090,7 +1127,7 @@ void VDBMappingROS2::setUpPublishers()
     m_map_full_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
       "~/vdb_map_full_sections", rclcpp::QoS(1).durability_volatile().best_effort());
     m_full_section_timer =
-      this->create_wall_timer(std::chrono::milliseconds((int)(1000.0 / section_update_rate)),
+      this->create_wall_timer(section_update_period,
                               std::bind(&VDBMappingROS2::fullSectionTimerCallback, this),
                               m_remote_cb_group);
   }
@@ -1109,7 +1146,7 @@ void VDBMappingROS2::setUpMapServer()
   this->get_parameter("map_server.clear_map", clear_map);
   if (!initial_map_file.empty())
   {
-    RCLCPP_INFO_STREAM(this->get_logger(), "Loading intial Map " << initial_map_file);
+    RCLCPP_INFO_STREAM(this->get_logger(), "Loading initial Map " << initial_map_file);
     m_vdb_map->loadMapFromPCD(initial_map_file, set_background, clear_map);
     publishMap();
   }
