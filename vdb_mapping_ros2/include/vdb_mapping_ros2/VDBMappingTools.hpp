@@ -24,6 +24,11 @@
 //----------------------------------------------------------------------
 #ifndef VDB_MAPPING_ROS2_VDBMAPPINGTOOLS_H_INCLUDED
 #define VDB_MAPPING_ROS2_VDBMAPPINGTOOLS_H_INCLUDED
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <vector>
+
 #include <geometry_msgs/msg/point.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <openvdb/openvdb.h>
@@ -68,9 +73,35 @@ public:
   {
     typename VDBMappingT::PointCloudT::Ptr cloud(new typename VDBMappingT::PointCloudT);
     openvdb::CoordBBox bbox = grid->evalActiveVoxelBoundingBox();
+    if (bbox.empty())
+    {
+      // An empty map yields an inverted bbox (min = Coord::max(), max =
+      // Coord::min()). The aligned-bounds arithmetic below overflows on those
+      // values, so emit empty/delete outputs instead of garbage.
+      if (create_marker)
+      {
+        marker_msg.header.frame_id = frame_id;
+        marker_msg.id              = 0;
+        marker_msg.type            = visualization_msgs::msg::Marker::CUBE_LIST;
+        marker_msg.action          = visualization_msgs::msg::Marker::DELETE;
+      }
+      if (create_pointcloud)
+      {
+        cloud->width  = 0;
+        cloud->height = 1;
+        pcl::toROSMsg(*cloud, cloud_msg);
+        cloud_msg.header.frame_id = frame_id;
+      }
+      if (create_occupancy_grid)
+      {
+        occupancy_grid_msg.info.resolution           = resolution;
+        occupancy_grid_msg.info.origin.orientation.w = 1.0;
+      }
+      return;
+    }
     double min_z, max_z;
-    openvdb::Vec3d min_world_coord = grid->indexToWorld(bbox.getStart());
-    openvdb::Vec3d max_world_coord = grid->indexToWorld(bbox.getEnd());
+    openvdb::Vec3d min_world_coord = grid->indexToWorld(bbox.min());
+    openvdb::Vec3d max_world_coord = grid->indexToWorld(bbox.max());
     min_z                          = min_world_coord.z();
     max_z                          = max_world_coord.z();
 
@@ -118,8 +149,10 @@ public:
       occ_observed_grid.assign(cells, false);
 
       geometry_msgs::msg::Pose origin_pose;
-      origin_pose.position.x    = aligned_min_x * resolution;
-      origin_pose.position.y    = aligned_min_y * resolution;
+      // indexToWorld(i) is the voxel *center*; the OccupancyGrid origin is the
+      // outer corner of cell (0,0), hence the half-voxel shift.
+      origin_pose.position.x    = (aligned_min_x - 0.5) * resolution;
+      origin_pose.position.y    = (aligned_min_y - 0.5) * resolution;
       origin_pose.position.z    = 0.00;
       origin_pose.orientation.w = 1.0;
 
@@ -179,7 +212,12 @@ public:
           cube_center.y = world_coord.y();
           cube_center.z = world_coord.z();
           marker_msg.points.push_back(cube_center);
-          double h = (1.0 - ((world_coord.z() - min_z) / (max_z - min_z)));
+          // Guard against a single-layer map (max_z == min_z) and clamp:
+          // the index-space z filter can admit voxels slightly outside the
+          // clamped [min_z, max_z] band.
+          double z_span = max_z - min_z;
+          double h      = z_span > 0.0 ? 1.0 - ((world_coord.z() - min_z) / z_span) : 0.0;
+          h             = std::clamp(h, 0.0, 1.0);
           marker_msg.colors.push_back(heightColorCoding(h));
         }
         if (create_pointcloud)
@@ -244,7 +282,7 @@ public:
   static void smoothOccGrid(nav_msgs::msg::OccupancyGrid& occupancy_grid_msg,
                             std::vector<int>& occ_voxel_projection_grid)
   {
-    auto get_index = [&](int i, int j) -> float {
+    auto get_index = [&](int i, int j) -> int {
       // Clamp
       i = std::max(0, std::min((int)occupancy_grid_msg.info.height - 1, i));
       j = std::max(0, std::min((int)occupancy_grid_msg.info.width - 1, j));

@@ -400,7 +400,7 @@ bool VDBMappingROS2::triggerMapSectionUpdateCallback(
     {
       ss << source.first << ", ";
     }
-    RCLCPP_WARN(this->get_logger(), ss.str().c_str());
+    RCLCPP_WARN(this->get_logger(), "%s", ss.str().c_str());
     res->success = false;
     return true;
   }
@@ -452,7 +452,7 @@ bool VDBMappingROS2::triggerMapFullSectionUpdateCallback(
     {
       ss << source.first << ", ";
     }
-    RCLCPP_WARN(this->get_logger(), ss.str().c_str());
+    RCLCPP_WARN(this->get_logger(), "%s", ss.str().c_str());
     res->success = false;
     return true;
   }
@@ -663,7 +663,7 @@ bool VDBMappingROS2::toggleRemoteSource(
     {
       ss << source.first << ", ";
     }
-    RCLCPP_WARN(this->get_logger(), ss.str().c_str());
+    RCLCPP_WARN(this->get_logger(), "%s", ss.str().c_str());
     res->success = false;
     return true;
   }
