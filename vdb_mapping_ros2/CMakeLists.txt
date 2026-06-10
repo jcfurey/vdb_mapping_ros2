@@ -34,6 +34,13 @@ rclcpp_components_register_nodes(${PROJECT_NAME}
   "vdb_mapping_ros2::VDBMappingROS2"
 )
 
+ament_auto_add_executable(vdb_mapping_ros_node
+  src/vdb_mapping_ros_node.cpp
+)
+target_link_libraries(vdb_mapping_ros_node
+  ${PROJECT_NAME}
+)
+
 install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME})

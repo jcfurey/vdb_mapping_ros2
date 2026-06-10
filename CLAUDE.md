@@ -95,7 +95,8 @@ rosdep install --from-paths src --ignore-src -r -y
 - **Build type**: Defaults to Release if not specified
 - **Compiler flags**: `-Wall -Wextra -Wpedantic` (GCC/Clang)
 - **Build system**: ament_cmake for both packages
-- `vdb_mapping_ros2` is the single SHARED library target. The composable node is registered from inside its sources.
+- `vdb_mapping_ros2` is the SHARED library target; the composable node is registered from inside its sources. `vdb_mapping_ros_node` is a standalone single-threaded executable linked against it.
+- The `vdb_mapping` core library must be a version providing the transformable-section API (`transformAndApplyMapSection*`), currently its `devel` branch.
 
 ### Running
 
