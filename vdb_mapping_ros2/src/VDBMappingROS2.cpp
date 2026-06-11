@@ -1,3 +1,4 @@
+// this is for emacs file handling -*- mode: c++; indent-tabs-mode: nil -*-
 // -- BEGIN LICENSE BLOCK ----------------------------------------------
 // Copyright 2022 FZI Forschungszentrum Informatik
 //
@@ -6,10 +7,20 @@
 // You may obtain a copy of the License at
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 // -- END LICENSE BLOCK ------------------------------------------------
 
 #include <vdb_mapping_ros2/VDBMappingROS2.hpp>
 
+#include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <utility>
 
@@ -24,9 +35,42 @@
 #include <pcl/common/transforms.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+#include <openvdb/math/DDA.h>
+#include <openvdb/math/Ray.h>
+
 #include <vdb_mapping_ros2/VDBMappingTools.hpp>
 
 namespace vdb_mapping_ros2 {
+
+namespace {
+// Newer vdb_mapping versions (e.g. forks past FZI devel) expose
+// setLogCallback to route library log output into a host logging framework.
+// Detect it at compile time so the wrapper keeps building against cores
+// without it; with it, library messages reach the ROS log instead of stderr.
+template <typename MapT>
+auto trySetLogCallback(MapT& map, const rclcpp::Logger& logger, int)
+  -> decltype(map.setLogCallback(nullptr), void())
+{
+  map.setLogCallback([logger](typename MapT::LogLevel level, const std::string& msg) {
+    switch (level)
+    {
+      case MapT::LogLevel::Info:
+        RCLCPP_INFO(logger, "%s", msg.c_str());
+        break;
+      case MapT::LogLevel::Warning:
+        RCLCPP_WARN(logger, "%s", msg.c_str());
+        break;
+      default:
+        RCLCPP_ERROR(logger, "%s", msg.c_str());
+        break;
+    }
+  });
+}
+template <typename MapT>
+void trySetLogCallback(MapT&, const rclcpp::Logger&, long)
+{
+}
+}  // namespace
 
 VDBMappingROS2::VDBMappingROS2(const rclcpp::NodeOptions& options)
   : Node("vdb_mapping_ros2", options)
@@ -356,10 +400,11 @@ bool VDBMappingROS2::getMapSectionCallback(
   geometry_msgs::msg::TransformStamped source_to_map_tf;
   try
   {
+    // A zero stamp is interpreted by tf2 as "latest available transform".
     source_to_map_tf =
       m_tf_buffer->lookupTransform(m_map_frame,
                                    req->header.frame_id,
-                                   rclcpp::Time(0),
+                                   rclcpp::Time(req->header.stamp),
                                    rclcpp::Duration::from_seconds(m_tf_lookup_timeout));
   }
   catch (tf2::TransformException& ex)
@@ -400,7 +445,7 @@ bool VDBMappingROS2::triggerMapSectionUpdateCallback(
     {
       ss << source.first << ", ";
     }
-    RCLCPP_WARN(this->get_logger(), ss.str().c_str());
+    RCLCPP_WARN(this->get_logger(), "%s", ss.str().c_str());
     res->success = false;
     return true;
   }
@@ -413,26 +458,49 @@ bool VDBMappingROS2::triggerMapSectionUpdateCallback(
     res->success = false;
     return true;
   }
+  if (!remote_source->second->active)
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "Remote source %s is currently deactivated; cannot trigger update",
+                req->remote_source.c_str());
+    res->success = false;
+    return true;
+  }
 
   auto request = std::make_shared<vdb_mapping_interfaces::srv::GetMapSection::Request>();
   request->header       = req->header;
   request->bounding_box = req->bounding_box;
 
-  auto vdb_map = m_vdb_map;
-  auto logger  = this->get_logger();
+  if (!remote_source->second->get_map_section_client->service_is_ready())
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "get_map_section service of remote source %s is not available",
+                req->remote_source.c_str());
+    res->success = false;
+    return true;
+  }
+
+  // The response is a binary occupancy section snapshot (see
+  // getMapSectionUpdateGrid in vdb_mapping). It must be applied with
+  // replace-section semantics and honoring the remote map frame, exactly like
+  // the passively subscribed sections, so reuse mapSectionCallback. Feeding it
+  // to updateMap would treat every voxel as a single probabilistic hit, which
+  // never crosses the occupancy threshold and bypasses the map mutex.
+  auto remote = remote_source->second;
   remote_source->second->get_map_section_client->async_send_request(
     request,
-    [vdb_map, logger](
+    [this, remote](
       rclcpp::Client<vdb_mapping_interfaces::srv::GetMapSection>::SharedFuture future) {
       auto response = future.get();
       if (response->success)
       {
-        vdb_map->updateMap(
-          vdb_map->byteArrayToGrid<VDBMapT::UpdateGridT>(response->section.map));
+        auto update =
+          std::make_shared<vdb_mapping_interfaces::msg::UpdateGrid>(response->section);
+        mapSectionCallback(update, remote);
       }
       else
       {
-        RCLCPP_WARN(logger, "Remote get_map_section returned success=false");
+        RCLCPP_WARN(this->get_logger(), "Remote get_map_section returned success=false");
       }
     });
   res->success = true;
@@ -452,7 +520,7 @@ bool VDBMappingROS2::triggerMapFullSectionUpdateCallback(
     {
       ss << source.first << ", ";
     }
-    RCLCPP_WARN(this->get_logger(), ss.str().c_str());
+    RCLCPP_WARN(this->get_logger(), "%s", ss.str().c_str());
     res->success = false;
     return true;
   }
@@ -465,28 +533,45 @@ bool VDBMappingROS2::triggerMapFullSectionUpdateCallback(
     res->success = false;
     return true;
   }
+  if (!remote_source->second->active)
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "Remote source %s is currently deactivated; cannot trigger update",
+                req->remote_source.c_str());
+    res->success = false;
+    return true;
+  }
 
   auto request = std::make_shared<vdb_mapping_interfaces::srv::GetMapSection::Request>();
   request->header       = req->header;
   request->bounding_box = req->bounding_box;
 
-  auto vdb_map = m_vdb_map;
-  auto logger  = this->get_logger();
-  bool smooth  = m_smooth_remote_sections;
-  int iters    = m_remote_section_smoothing_iterations;
+  if (!remote_source->second->get_map_full_section_client->service_is_ready())
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "get_map_full_section service of remote source %s is not available",
+                req->remote_source.c_str());
+    res->success = false;
+    return true;
+  }
+
+  // Reuse mapFullSectionCallback so the response honors the remote map frame
+  // (transformAndApply* when frames differ) instead of being applied blindly.
+  auto remote = remote_source->second;
   remote_source->second->get_map_full_section_client->async_send_request(
     request,
-    [vdb_map, logger, smooth, iters](
+    [this, remote](
       rclcpp::Client<vdb_mapping_interfaces::srv::GetMapSection>::SharedFuture future) {
       auto response = future.get();
       if (response->success)
       {
-        vdb_map->applyMapSectionGrid(
-          vdb_map->byteArrayToGrid<VDBMapT::GridT>(response->section.map), smooth, iters);
+        auto update =
+          std::make_shared<vdb_mapping_interfaces::msg::UpdateGrid>(response->section);
+        mapFullSectionCallback(update, remote);
       }
       else
       {
-        RCLCPP_WARN(logger, "Remote get_map_full_section returned success=false");
+        RCLCPP_WARN(this->get_logger(), "Remote get_map_full_section returned success=false");
       }
     });
   res->success = true;
@@ -560,15 +645,20 @@ bool VDBMappingROS2::batchRaytraceCallback(
 
   Eigen::Matrix<double, 4, 4> m = tf2::transformToEigen(reference_tf).matrix();
 
-  std::vector<openvdb::Vec3d> ray_origins_world;
-  std::vector<openvdb::Vec3d> ray_directions;
-  std::vector<double> max_ray_lengths;
-  std::vector<openvdb::Vec3d> end_points;
+  // This intentionally does not use vdb_mapping::raytrace, which depends on
+  // the volume ray intersector and therefore requires fast_mode plus a prior
+  // integration. FZI devel additionally null-derefs without one (node crash),
+  // skips the first voxel of each marched segment (missing one-voxel-thick
+  // obstacles) and reports success with the segment end on a miss; newer
+  // forks fix those but keep the fast_mode requirement. Walking the grid with
+  // a plain DDA is exact, works in every mode and is entirely sufficient at
+  // service rates.
+  using RayT = openvdb::math::Ray<double>;
+  using DDAT = openvdb::math::DDA<RayT, 0>;
 
-  ray_origins_world.reserve(req->rays.size());
-  ray_directions.reserve(req->rays.size());
-  max_ray_lengths.reserve(req->rays.size());
-
+  auto grid = m_vdb_map->getGrid();
+  std::shared_lock map_lock(*m_vdb_map->getMapMutex());
+  auto acc = grid->getConstAccessor();
   for (size_t i = 0; i < req->rays.size(); i++)
   {
     Eigen::Matrix<double, 4, 1> origin, direction;
@@ -578,20 +668,52 @@ bool VDBMappingROS2::batchRaytraceCallback(
     origin    = m * origin;
     direction = m * direction;
 
-    ray_origins_world.push_back(openvdb::Vec3d(origin.x(), origin.y(), origin.z()));
-    ray_directions.push_back(openvdb::Vec3d(direction.x(), direction.y(), direction.z()));
-    max_ray_lengths.push_back(req->rays[i].max_ray_length);
-  }
-  m_vdb_map->raytrace(
-    ray_origins_world, ray_directions, max_ray_lengths, res->successes, end_points);
+    Eigen::Matrix<double, 3, 1> dir = direction.head<3>();
+    const double max_ray_length     = req->rays[i].max_ray_length;
+    bool success                    = false;
+    geometry_msgs::msg::Point end_point;
 
-  for (size_t i = 0; i < end_points.size(); i++)
-  {
-    geometry_msgs::msg::Point p;
-    p.x                = end_points[i].x();
-    p.y                = end_points[i].y();
-    p.z                = end_points[i].z();
-    res->end_points[i] = p;
+    if (dir.norm() > 0.0 && max_ray_length > 0.0)
+    {
+      dir = dir.normalized() * max_ray_length;
+      const openvdb::Vec3d origin_world(origin.x(), origin.y(), origin.z());
+      const openvdb::Vec3d dir_world(dir.x(), dir.y(), dir.z());
+      // Voxels are cell-centered (vdb_mapping's worldToIndex rounds), while
+      // the DDA cell convention is [i, i+1) — shift by half a voxel so
+      // dda.voxel() yields proper cell-centered indices.
+      const openvdb::Vec3d origin_index =
+        grid->worldToIndex(origin_world) + openvdb::Vec3d(0.5);
+      const openvdb::Vec3d dir_index = grid->worldToIndex(dir_world);
+
+      RayT ray(origin_index, dir_index, 0.0, 1.0);
+      DDAT dda(ray);
+      do
+      {
+        const openvdb::Coord voxel = dda.voxel();
+        if (acc.isValueOn(voxel))
+        {
+          const openvdb::Vec3d world = grid->indexToWorld(voxel);
+          end_point.x                = world.x();
+          end_point.y                = world.y();
+          end_point.z                = world.z();
+          success                    = true;
+          break;
+        }
+      } while (dda.step());
+    }
+    else
+    {
+      dir.setZero();
+    }
+
+    if (!success)
+    {
+      end_point.x = origin.x() + dir.x();
+      end_point.y = origin.y() + dir.y();
+      end_point.z = origin.z() + dir.z();
+    }
+    res->successes[i]  = success;
+    res->end_points[i] = end_point;
   }
   return true;
 }
@@ -606,10 +728,11 @@ bool VDBMappingROS2::addArtificialAreasCallback(
     geometry_msgs::msg::TransformStamped source_to_map_tf;
     try
     {
+      // A zero stamp is interpreted by tf2 as "latest available transform".
       source_to_map_tf =
         m_tf_buffer->lookupTransform(m_map_frame,
                                      req->artificial_areas[0].header.frame_id,
-                                     rclcpp::Time(0),
+                                     rclcpp::Time(req->artificial_areas[0].header.stamp),
                                      rclcpp::Duration::from_seconds(m_tf_lookup_timeout));
     }
     catch (tf2::TransformException& ex)
@@ -663,7 +786,7 @@ bool VDBMappingROS2::toggleRemoteSource(
     {
       ss << source.first << ", ";
     }
-    RCLCPP_WARN(this->get_logger(), ss.str().c_str());
+    RCLCPP_WARN(this->get_logger(), "%s", ss.str().c_str());
     res->success = false;
     return true;
   }
@@ -745,6 +868,7 @@ void VDBMappingROS2::setUpVDBMap()
   this->declare_parameter<double>("resolution", 0.05);
   this->get_parameter("resolution", m_resolution);
   m_vdb_map = std::make_shared<VDBMapT>(m_resolution);
+  trySetLogCallback(*m_vdb_map, this->get_logger(), 0);
 
   this->declare_parameter<double>("max_range", 10.0);
   this->get_parameter("max_range", m_config.max_range);
@@ -811,7 +935,8 @@ void VDBMappingROS2::setUpLocalSources()
   this->declare_parameter<std::vector<std::string>>("sources", std::vector<std::string>());
   this->get_parameter("sources", source_ids);
 
-  // Reserve so push_back never reallocates and invalidates lambda captures.
+  // The subscriptions created in pass 2 capture references to elements of
+  // m_sensor_sources, so the vector must not be modified after that point.
   m_sensor_sources.reserve(source_ids.size());
 
   // Pass 1 — declare params, populate m_sensor_sources, register input sources
@@ -901,8 +1026,10 @@ void VDBMappingROS2::setUpRemoteSources()
     this->declare_parameter<bool>(source_id + ".apply_remote_full_sections", false);
     this->get_parameter(source_id + ".apply_remote_full_sections",
                         remote_source->apply_remote_full_sections);
+    bool autostart = true;
     this->declare_parameter<bool>(source_id + ".autostart", true);
-    this->get_parameter(source_id + ".autostart", remote_source->active);
+    this->get_parameter(source_id + ".autostart", autostart);
+    remote_source->active = autostart;
 
     if (remote_source->apply_remote_sections)
     {
@@ -949,10 +1076,14 @@ void VDBMappingROS2::setUpRemoteSources()
 
 void VDBMappingROS2::setUpVisualization()
 {
+  double z_limit_min = 0.0;
+  double z_limit_max = 0.0;
   this->declare_parameter<double>("z_limit_min", 0);
-  this->get_parameter("z_limit_min", m_lower_visualization_z_limit);
+  this->get_parameter("z_limit_min", z_limit_min);
   this->declare_parameter<double>("z_limit_max", 0);
-  this->get_parameter("z_limit_max", m_upper_visualization_z_limit);
+  this->get_parameter("z_limit_max", z_limit_max);
+  m_lower_visualization_z_limit = z_limit_min;
+  m_upper_visualization_z_limit = z_limit_max;
 
   m_param_sub = std::make_shared<rclcpp::ParameterEventHandler>(this);
 
@@ -971,10 +1102,10 @@ void VDBMappingROS2::setUpVisualization()
   this->get_parameter("visualization_rate", visualization_rate);
   if (visualization_rate > 0.0)
   {
-    m_visualization_timer =
-      this->create_wall_timer(std::chrono::milliseconds((int)(1000.0 / visualization_rate)),
-                              std::bind(&VDBMappingROS2::visualizationTimerCallback, this),
-                              m_visualization_cb_group);
+    m_visualization_timer = this->create_wall_timer(
+      std::chrono::milliseconds(std::max(1, (int)(1000.0 / visualization_rate))),
+      std::bind(&VDBMappingROS2::visualizationTimerCallback, this),
+      m_visualization_cb_group);
   }
 }
 
@@ -1076,12 +1207,22 @@ void VDBMappingROS2::setUpPublishers()
     this->get_parameter("section_update.frame", m_section_update_frame);
   }
 
+  if ((m_publish_sections || m_publish_full_sections) && section_update_rate <= 0.0)
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "section_update.rate must be positive; section publishing disabled");
+    m_publish_sections      = false;
+    m_publish_full_sections = false;
+  }
+  auto section_update_period = std::chrono::milliseconds(
+    section_update_rate > 0.0 ? std::max(1, (int)(1000.0 / section_update_rate)) : 1);
+
   if (m_publish_sections)
   {
     m_map_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
       "~/vdb_map_sections", rclcpp::QoS(1).durability_volatile().best_effort());
     m_section_timer =
-      this->create_wall_timer(std::chrono::milliseconds((int)(1000.0 / section_update_rate)),
+      this->create_wall_timer(section_update_period,
                               std::bind(&VDBMappingROS2::sectionTimerCallback, this),
                               m_remote_cb_group);
   }
@@ -1090,7 +1231,7 @@ void VDBMappingROS2::setUpPublishers()
     m_map_full_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
       "~/vdb_map_full_sections", rclcpp::QoS(1).durability_volatile().best_effort());
     m_full_section_timer =
-      this->create_wall_timer(std::chrono::milliseconds((int)(1000.0 / section_update_rate)),
+      this->create_wall_timer(section_update_period,
                               std::bind(&VDBMappingROS2::fullSectionTimerCallback, this),
                               m_remote_cb_group);
   }
@@ -1109,7 +1250,7 @@ void VDBMappingROS2::setUpMapServer()
   this->get_parameter("map_server.clear_map", clear_map);
   if (!initial_map_file.empty())
   {
-    RCLCPP_INFO_STREAM(this->get_logger(), "Loading intial Map " << initial_map_file);
+    RCLCPP_INFO_STREAM(this->get_logger(), "Loading initial Map " << initial_map_file);
     m_vdb_map->loadMapFromPCD(initial_map_file, set_background, clear_map);
     publishMap();
   }

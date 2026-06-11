@@ -24,10 +24,7 @@ def generate_launch_description():
                 package='vdb_mapping_ros2',
                 plugin='vdb_mapping_ros2::VDBMappingROS2',
                 name='vdb_mapping',
-                parameters=[
-                    config,
-                    {"use_dedicated_executors": True}
-                ],
+                parameters=[config],
             )
         ],
         output='screen',

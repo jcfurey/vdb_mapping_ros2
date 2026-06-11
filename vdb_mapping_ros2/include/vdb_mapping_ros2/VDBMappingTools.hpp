@@ -24,6 +24,11 @@
 //----------------------------------------------------------------------
 #ifndef VDB_MAPPING_ROS2_VDBMAPPINGTOOLS_H_INCLUDED
 #define VDB_MAPPING_ROS2_VDBMAPPINGTOOLS_H_INCLUDED
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <vector>
+
 #include <geometry_msgs/msg/point.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <openvdb/openvdb.h>
@@ -67,10 +72,63 @@ public:
                                   const int occupancy_chunk        = 32)
   {
     typename VDBMappingT::PointCloudT::Ptr cloud(new typename VDBMappingT::PointCloudT);
+    // The active bbox only spans *occupied* voxels. Observed-free voxels
+    // (inactive, non-background) regularly lie outside it — e.g. raytraced
+    // space in front of the outermost obstacle — and must still be covered by
+    // the occupancy grid. Their extent is bounded by the allocated leaf nodes
+    // (8^3 granularity; evalLeafBoundingBox cannot be used since it only
+    // evaluates *active* per-leaf bounds) plus any non-background tiles
+    // (pruned constant regions).
     openvdb::CoordBBox bbox = grid->evalActiveVoxelBoundingBox();
+    for (auto leaf_iter = grid->tree().cbeginLeaf(); leaf_iter; ++leaf_iter)
+    {
+      const openvdb::CoordBBox leaf_bbox = leaf_iter->getNodeBoundingBox();
+      bbox.expand(leaf_bbox.min());
+      bbox.expand(leaf_bbox.max());
+    }
+    {
+      auto tile_iter = grid->tree().cbeginValueAll();
+      tile_iter.setMaxDepth(VDBMappingT::GridT::TreeType::DEPTH - 2);
+      for (; tile_iter; ++tile_iter)
+      {
+        if (tile_iter.getValue() != 0)
+        {
+          openvdb::CoordBBox tile_bbox;
+          tile_iter.getBoundingBox(tile_bbox);
+          bbox.expand(tile_bbox.min());
+          bbox.expand(tile_bbox.max());
+        }
+      }
+    }
+    if (bbox.empty())
+    {
+      // An empty map yields an inverted bbox (min = Coord::max(), max =
+      // Coord::min()). The aligned-bounds arithmetic below overflows on those
+      // values, so emit empty/delete outputs instead of garbage.
+      if (create_marker)
+      {
+        marker_msg.header.frame_id = frame_id;
+        marker_msg.id              = 0;
+        marker_msg.type            = visualization_msgs::msg::Marker::CUBE_LIST;
+        marker_msg.action          = visualization_msgs::msg::Marker::DELETE;
+      }
+      if (create_pointcloud)
+      {
+        cloud->width  = 0;
+        cloud->height = 1;
+        pcl::toROSMsg(*cloud, cloud_msg);
+        cloud_msg.header.frame_id = frame_id;
+      }
+      if (create_occupancy_grid)
+      {
+        occupancy_grid_msg.info.resolution           = resolution;
+        occupancy_grid_msg.info.origin.orientation.w = 1.0;
+      }
+      return;
+    }
     double min_z, max_z;
-    openvdb::Vec3d min_world_coord = grid->indexToWorld(bbox.getStart());
-    openvdb::Vec3d max_world_coord = grid->indexToWorld(bbox.getEnd());
+    openvdb::Vec3d min_world_coord = grid->indexToWorld(bbox.min());
+    openvdb::Vec3d max_world_coord = grid->indexToWorld(bbox.max());
     min_z                          = min_world_coord.z();
     max_z                          = max_world_coord.z();
 
@@ -118,8 +176,12 @@ public:
       occ_observed_grid.assign(cells, false);
 
       geometry_msgs::msg::Pose origin_pose;
-      origin_pose.position.x    = aligned_min_x * resolution;
-      origin_pose.position.y    = aligned_min_y * resolution;
+      // vdb_mapping discretizes sensor data cell-centered (its worldToIndex
+      // rounds to the nearest lattice point), so indexToWorld(i) is the voxel
+      // *center*. nav_msgs/MapMetaData defines origin as the bottom-left
+      // *corner* of cell (0,0), hence the half-voxel shift.
+      origin_pose.position.x    = (aligned_min_x - 0.5) * resolution;
+      origin_pose.position.y    = (aligned_min_y - 0.5) * resolution;
       origin_pose.position.z    = 0.00;
       origin_pose.orientation.w = 1.0;
 
@@ -132,6 +194,51 @@ public:
     // for voxels outside the visualization band.
     int min_z_idx = static_cast<int>(std::floor(min_z / resolution));
     int max_z_idx = static_cast<int>(std::ceil(max_z / resolution));
+
+    auto process_voxel = [&](const openvdb::Coord& coord, const bool is_on) {
+      if (coord.z() < min_z_idx || coord.z() > max_z_idx)
+      {
+        return;
+      }
+
+      if (create_occupancy_grid && bbox.isInside(coord))
+      {
+        int vdb_index_to_occ_index =
+          (coord.y() - aligned_min_y) * aligned_width + (coord.x() - aligned_min_x);
+        occ_observed_grid[vdb_index_to_occ_index] = true;
+        if (is_on)
+        {
+          // Active voxel = occupied — count toward lethal threshold
+          occ_voxel_projection_grid[vdb_index_to_occ_index] += 1;
+        }
+      }
+
+      // Marker and pointcloud only show occupied (active) voxels
+      if (is_on)
+      {
+        openvdb::Vec3d world_coord = grid->indexToWorld(coord);
+        if (create_marker)
+        {
+          geometry_msgs::msg::Point cube_center;
+          cube_center.x = world_coord.x();
+          cube_center.y = world_coord.y();
+          cube_center.z = world_coord.z();
+          marker_msg.points.push_back(cube_center);
+          // Guard against a single-layer map (max_z == min_z) and clamp:
+          // the index-space z filter can admit voxels slightly outside the
+          // clamped [min_z, max_z] band.
+          double z_span = max_z - min_z;
+          double h      = z_span > 0.0 ? 1.0 - ((world_coord.z() - min_z) / z_span) : 0.0;
+          h             = std::clamp(h, 0.0, 1.0);
+          marker_msg.colors.push_back(heightColorCoding(h));
+        }
+        if (create_pointcloud)
+        {
+          cloud->points.push_back(
+            typename VDBMappingT::PointT(world_coord.x(), world_coord.y(), world_coord.z()));
+        }
+      }
+    };
 
     // Use cbeginValueAll() to iterate ALL voxels with non-background values:
     //   - Active voxels (value > logodds_thres_max): occupied — count toward 2D projection
@@ -147,45 +254,32 @@ public:
         continue;
       }
 
-      const openvdb::Coord coord = iter.getCoord();
-      if (coord.z() < min_z_idx || coord.z() > max_z_idx)
+      if (iter.isVoxelValue())
       {
-        continue;
+        process_voxel(iter.getCoord(), iter.isValueOn());
       }
-      openvdb::Vec3d world_coord = grid->indexToWorld(coord);
-
-      if (create_occupancy_grid)
+      else
       {
-        if (bbox.isInside(iter.getCoord()))
+        // Tile value: pruned constant regions (e.g. uniform free space after a
+        // PCD load, since vdb_mapping calls pruneGrid()) are visited as a
+        // single iterator item covering their whole extent. Expand the
+        // footprint, clamped to the active bbox and the visualization z band,
+        // so free-space tiles are not projected as a single cell.
+        openvdb::CoordBBox tile_bbox;
+        iter.getBoundingBox(tile_bbox);
+        tile_bbox.intersect(bbox);
+        const bool is_on = iter.isValueOn();
+        const int z0     = std::max(tile_bbox.min().z(), min_z_idx);
+        const int z1     = std::min(tile_bbox.max().z(), max_z_idx);
+        for (int z = z0; z <= z1; ++z)
         {
-          int vdb_index_to_occ_index = (iter.getCoord().y() - aligned_min_y) * aligned_width +
-                                       (iter.getCoord().x() - aligned_min_x);
-          occ_observed_grid[vdb_index_to_occ_index] = true;
-          if (iter.isValueOn())
+          for (int y = tile_bbox.min().y(); y <= tile_bbox.max().y(); ++y)
           {
-            // Active voxel = occupied — count toward lethal threshold
-            occ_voxel_projection_grid[vdb_index_to_occ_index] += 1;
+            for (int x = tile_bbox.min().x(); x <= tile_bbox.max().x(); ++x)
+            {
+              process_voxel(openvdb::Coord(x, y, z), is_on);
+            }
           }
-        }
-      }
-
-      // Marker and pointcloud only show occupied (active) voxels
-      if (iter.isValueOn())
-      {
-        if (create_marker)
-        {
-          geometry_msgs::msg::Point cube_center;
-          cube_center.x = world_coord.x();
-          cube_center.y = world_coord.y();
-          cube_center.z = world_coord.z();
-          marker_msg.points.push_back(cube_center);
-          double h = (1.0 - ((world_coord.z() - min_z) / (max_z - min_z)));
-          marker_msg.colors.push_back(heightColorCoding(h));
-        }
-        if (create_pointcloud)
-        {
-          cloud->points.push_back(
-            typename VDBMappingT::PointT(world_coord.x(), world_coord.y(), world_coord.z()));
         }
       }
     }
@@ -244,7 +338,7 @@ public:
   static void smoothOccGrid(nav_msgs::msg::OccupancyGrid& occupancy_grid_msg,
                             std::vector<int>& occ_voxel_projection_grid)
   {
-    auto get_index = [&](int i, int j) -> float {
+    auto get_index = [&](int i, int j) -> int {
       // Clamp
       i = std::max(0, std::min((int)occupancy_grid_msg.info.height - 1, i));
       j = std::max(0, std::min((int)occupancy_grid_msg.info.width - 1, j));
@@ -314,13 +408,19 @@ public:
               }
             }
           }
-          if (count > 2)
+          // Only demote truly isolated lethal cells (no lethal neighbor at
+          // all): one-cell-wide walls have exactly 2 lethal neighbors and
+          // line endpoints just 1, so any stricter rule erases real thin
+          // obstacles. Demote to unknown rather than free — the column did
+          // exceed the occupancy threshold, so claiming it is traversable
+          // would hide poles or trunks from planners.
+          if (count > 0)
           {
             occupancy_grid_msg.data[current_index] = occ_voxel_projection_grid[current_index];
           }
           else
           {
-            occupancy_grid_msg.data[current_index] = 0;
+            occupancy_grid_msg.data[current_index] = -1;
           }
         }
         else

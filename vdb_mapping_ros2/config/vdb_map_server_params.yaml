@@ -11,12 +11,12 @@
     visualization_rate: 5.0
 
     # Sensor input
-    accumulate_updates: true
-    accumulation_period: 0.2
-
+    # The map server applies no raw sensor data; accumulation parameters are
+    # therefore not declared in this configuration.
     apply_raw_sensor_data: false
 
-    map_server: 
-      initial_map_file: "/home/ubuntu/bags/neuheim.pcd"
+    map_server:
+      # Absolute path to a PCD file loaded into the map at startup.
+      initial_map_file: ""
       set_background: false
       clear_map: true
