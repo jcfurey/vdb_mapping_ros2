@@ -42,6 +42,36 @@
 
 namespace vdb_mapping_ros2 {
 
+namespace {
+// Newer vdb_mapping versions (e.g. forks past FZI devel) expose
+// setLogCallback to route library log output into a host logging framework.
+// Detect it at compile time so the wrapper keeps building against cores
+// without it; with it, library messages reach the ROS log instead of stderr.
+template <typename MapT>
+auto trySetLogCallback(MapT& map, const rclcpp::Logger& logger, int)
+  -> decltype(map.setLogCallback(nullptr), void())
+{
+  map.setLogCallback([logger](typename MapT::LogLevel level, const std::string& msg) {
+    switch (level)
+    {
+      case MapT::LogLevel::Info:
+        RCLCPP_INFO(logger, "%s", msg.c_str());
+        break;
+      case MapT::LogLevel::Warning:
+        RCLCPP_WARN(logger, "%s", msg.c_str());
+        break;
+      default:
+        RCLCPP_ERROR(logger, "%s", msg.c_str());
+        break;
+    }
+  });
+}
+template <typename MapT>
+void trySetLogCallback(MapT&, const rclcpp::Logger&, long)
+{
+}
+}  // namespace
+
 VDBMappingROS2::VDBMappingROS2(const rclcpp::NodeOptions& options)
   : Node("vdb_mapping_ros2", options)
 {
@@ -615,13 +645,14 @@ bool VDBMappingROS2::batchRaytraceCallback(
 
   Eigen::Matrix<double, 4, 4> m = tf2::transformToEigen(reference_tf).matrix();
 
-  // This intentionally does not use vdb_mapping::raytrace. As of the current
-  // devel revision it dereferences the volume ray intersector, which only
-  // exists in fast mode after an integration on a non-empty grid (null-deref
-  // and node crash otherwise), it skips the first voxel of the marched
-  // segment (missing one-voxel-thick obstacles) and it reports success with
-  // the segment end when no active voxel was hit. Walking the grid with a
-  // plain DDA is exact and entirely sufficient at service rates.
+  // This intentionally does not use vdb_mapping::raytrace, which depends on
+  // the volume ray intersector and therefore requires fast_mode plus a prior
+  // integration. FZI devel additionally null-derefs without one (node crash),
+  // skips the first voxel of each marched segment (missing one-voxel-thick
+  // obstacles) and reports success with the segment end on a miss; newer
+  // forks fix those but keep the fast_mode requirement. Walking the grid with
+  // a plain DDA is exact, works in every mode and is entirely sufficient at
+  // service rates.
   using RayT = openvdb::math::Ray<double>;
   using DDAT = openvdb::math::DDA<RayT, 0>;
 
@@ -837,6 +868,7 @@ void VDBMappingROS2::setUpVDBMap()
   this->declare_parameter<double>("resolution", 0.05);
   this->get_parameter("resolution", m_resolution);
   m_vdb_map = std::make_shared<VDBMapT>(m_resolution);
+  trySetLogCallback(*m_vdb_map, this->get_logger(), 0);
 
   this->declare_parameter<double>("max_range", 10.0);
   this->get_parameter("max_range", m_config.max_range);

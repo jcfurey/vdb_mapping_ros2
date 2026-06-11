@@ -16,7 +16,7 @@ The VDB Mapping ROS2 Package is a ROS2 wrapper around [VDB Mapping](https://gith
 This library requires [OpenVDB](https://www.openvdb.org/) as it is built around it. This library was initially developed using Version 5.0 and should work with all versions above.
 Either use the apt package which will be automatically installed via rosdep or compile the package from source using the provided [build instructions](https://github.com/AcademySoftwareFoundation/openvdb)
 
-The wrapper requires a version of the `vdb_mapping` core library that provides the transformable-section API (`transformAndApplyMapSection*`). At the time of writing this is the `devel` branch.
+The wrapper requires a version of the `vdb_mapping` core library that provides the transformable-section API (`transformAndApplyMapSection*`). At the time of writing this is the `devel` branch. Cores that additionally provide `setLogCallback` (newer forks) are detected at compile time and their library log output is routed into the ROS logger automatically.
 
 ### Build instructions
 
