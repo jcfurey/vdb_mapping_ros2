@@ -35,6 +35,9 @@
 #include <pcl/common/transforms.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+#include <openvdb/math/DDA.h>
+#include <openvdb/math/Ray.h>
+
 #include <vdb_mapping_ros2/VDBMappingTools.hpp>
 
 namespace vdb_mapping_ros2 {
@@ -612,15 +615,19 @@ bool VDBMappingROS2::batchRaytraceCallback(
 
   Eigen::Matrix<double, 4, 4> m = tf2::transformToEigen(reference_tf).matrix();
 
-  std::vector<openvdb::Vec3d> ray_origins_world;
-  std::vector<openvdb::Vec3d> ray_directions;
-  std::vector<double> max_ray_lengths;
-  std::vector<openvdb::Vec3d> end_points;
+  // This intentionally does not use vdb_mapping::raytrace. As of the current
+  // devel revision it dereferences the volume ray intersector, which only
+  // exists in fast mode after an integration on a non-empty grid (null-deref
+  // and node crash otherwise), it skips the first voxel of the marched
+  // segment (missing one-voxel-thick obstacles) and it reports success with
+  // the segment end when no active voxel was hit. Walking the grid with a
+  // plain DDA is exact and entirely sufficient at service rates.
+  using RayT = openvdb::math::Ray<double>;
+  using DDAT = openvdb::math::DDA<RayT, 0>;
 
-  ray_origins_world.reserve(req->rays.size());
-  ray_directions.reserve(req->rays.size());
-  max_ray_lengths.reserve(req->rays.size());
-
+  auto grid = m_vdb_map->getGrid();
+  std::shared_lock map_lock(*m_vdb_map->getMapMutex());
+  auto acc = grid->getConstAccessor();
   for (size_t i = 0; i < req->rays.size(); i++)
   {
     Eigen::Matrix<double, 4, 1> origin, direction;
@@ -630,20 +637,52 @@ bool VDBMappingROS2::batchRaytraceCallback(
     origin    = m * origin;
     direction = m * direction;
 
-    ray_origins_world.push_back(openvdb::Vec3d(origin.x(), origin.y(), origin.z()));
-    ray_directions.push_back(openvdb::Vec3d(direction.x(), direction.y(), direction.z()));
-    max_ray_lengths.push_back(req->rays[i].max_ray_length);
-  }
-  m_vdb_map->raytrace(
-    ray_origins_world, ray_directions, max_ray_lengths, res->successes, end_points);
+    Eigen::Matrix<double, 3, 1> dir = direction.head<3>();
+    const double max_ray_length     = req->rays[i].max_ray_length;
+    bool success                    = false;
+    geometry_msgs::msg::Point end_point;
 
-  for (size_t i = 0; i < end_points.size(); i++)
-  {
-    geometry_msgs::msg::Point p;
-    p.x                = end_points[i].x();
-    p.y                = end_points[i].y();
-    p.z                = end_points[i].z();
-    res->end_points[i] = p;
+    if (dir.norm() > 0.0 && max_ray_length > 0.0)
+    {
+      dir = dir.normalized() * max_ray_length;
+      const openvdb::Vec3d origin_world(origin.x(), origin.y(), origin.z());
+      const openvdb::Vec3d dir_world(dir.x(), dir.y(), dir.z());
+      // Voxels are cell-centered (vdb_mapping's worldToIndex rounds), while
+      // the DDA cell convention is [i, i+1) — shift by half a voxel so
+      // dda.voxel() yields proper cell-centered indices.
+      const openvdb::Vec3d origin_index =
+        grid->worldToIndex(origin_world) + openvdb::Vec3d(0.5);
+      const openvdb::Vec3d dir_index = grid->worldToIndex(dir_world);
+
+      RayT ray(origin_index, dir_index, 0.0, 1.0);
+      DDAT dda(ray);
+      do
+      {
+        const openvdb::Coord voxel = dda.voxel();
+        if (acc.isValueOn(voxel))
+        {
+          const openvdb::Vec3d world = grid->indexToWorld(voxel);
+          end_point.x                = world.x();
+          end_point.y                = world.y();
+          end_point.z                = world.z();
+          success                    = true;
+          break;
+        }
+      } while (dda.step());
+    }
+    else
+    {
+      dir.setZero();
+    }
+
+    if (!success)
+    {
+      end_point.x = origin.x() + dir.x();
+      end_point.y = origin.y() + dir.y();
+      end_point.z = origin.z() + dir.z();
+    }
+    res->successes[i]  = success;
+    res->end_points[i] = end_point;
   }
   return true;
 }
