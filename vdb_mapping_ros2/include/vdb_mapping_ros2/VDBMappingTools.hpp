@@ -149,8 +149,10 @@ public:
       occ_observed_grid.assign(cells, false);
 
       geometry_msgs::msg::Pose origin_pose;
-      // indexToWorld(i) is the voxel *center*; the OccupancyGrid origin is the
-      // outer corner of cell (0,0), hence the half-voxel shift.
+      // vdb_mapping discretizes sensor data cell-centered (its worldToIndex
+      // rounds to the nearest lattice point), so indexToWorld(i) is the voxel
+      // *center*. nav_msgs/MapMetaData defines origin as the bottom-left
+      // *corner* of cell (0,0), hence the half-voxel shift.
       origin_pose.position.x    = (aligned_min_x - 0.5) * resolution;
       origin_pose.position.y    = (aligned_min_y - 0.5) * resolution;
       origin_pose.position.z    = 0.00;
@@ -166,45 +168,28 @@ public:
     int min_z_idx = static_cast<int>(std::floor(min_z / resolution));
     int max_z_idx = static_cast<int>(std::ceil(max_z / resolution));
 
-    // Use cbeginValueAll() to iterate ALL voxels with non-background values:
-    //   - Active voxels (value > logodds_thres_max): occupied — count toward 2D projection
-    //   - Inactive voxels (value != 0 background): observed free — mark column as "seen"
-    // Previously cbeginValueOn() only visited occupied voxels, so raytraced free
-    // space was indistinguishable from never-observed space in the 2D grid.
-    for (typename VDBMappingT::GridT::ValueAllCIter iter = grid->cbeginValueAll(); iter; ++iter)
-    {
-      // Skip voxels that still hold the background value (0.0 = never observed).
-      // This filters out untouched tiles/voxels efficiently.
-      if (!iter.isValueOn() && iter.getValue() == 0)
-      {
-        continue;
-      }
-
-      const openvdb::Coord coord = iter.getCoord();
+    auto process_voxel = [&](const openvdb::Coord& coord, const bool is_on) {
       if (coord.z() < min_z_idx || coord.z() > max_z_idx)
       {
-        continue;
+        return;
       }
-      openvdb::Vec3d world_coord = grid->indexToWorld(coord);
 
-      if (create_occupancy_grid)
+      if (create_occupancy_grid && bbox.isInside(coord))
       {
-        if (bbox.isInside(iter.getCoord()))
+        int vdb_index_to_occ_index =
+          (coord.y() - aligned_min_y) * aligned_width + (coord.x() - aligned_min_x);
+        occ_observed_grid[vdb_index_to_occ_index] = true;
+        if (is_on)
         {
-          int vdb_index_to_occ_index = (iter.getCoord().y() - aligned_min_y) * aligned_width +
-                                       (iter.getCoord().x() - aligned_min_x);
-          occ_observed_grid[vdb_index_to_occ_index] = true;
-          if (iter.isValueOn())
-          {
-            // Active voxel = occupied — count toward lethal threshold
-            occ_voxel_projection_grid[vdb_index_to_occ_index] += 1;
-          }
+          // Active voxel = occupied — count toward lethal threshold
+          occ_voxel_projection_grid[vdb_index_to_occ_index] += 1;
         }
       }
 
       // Marker and pointcloud only show occupied (active) voxels
-      if (iter.isValueOn())
+      if (is_on)
       {
+        openvdb::Vec3d world_coord = grid->indexToWorld(coord);
         if (create_marker)
         {
           geometry_msgs::msg::Point cube_center;
@@ -224,6 +209,50 @@ public:
         {
           cloud->points.push_back(
             typename VDBMappingT::PointT(world_coord.x(), world_coord.y(), world_coord.z()));
+        }
+      }
+    };
+
+    // Use cbeginValueAll() to iterate ALL voxels with non-background values:
+    //   - Active voxels (value > logodds_thres_max): occupied — count toward 2D projection
+    //   - Inactive voxels (value != 0 background): observed free — mark column as "seen"
+    // Previously cbeginValueOn() only visited occupied voxels, so raytraced free
+    // space was indistinguishable from never-observed space in the 2D grid.
+    for (typename VDBMappingT::GridT::ValueAllCIter iter = grid->cbeginValueAll(); iter; ++iter)
+    {
+      // Skip voxels that still hold the background value (0.0 = never observed).
+      // This filters out untouched tiles/voxels efficiently.
+      if (!iter.isValueOn() && iter.getValue() == 0)
+      {
+        continue;
+      }
+
+      if (iter.isVoxelValue())
+      {
+        process_voxel(iter.getCoord(), iter.isValueOn());
+      }
+      else
+      {
+        // Tile value: pruned constant regions (e.g. uniform free space after a
+        // PCD load, since vdb_mapping calls pruneGrid()) are visited as a
+        // single iterator item covering their whole extent. Expand the
+        // footprint, clamped to the active bbox and the visualization z band,
+        // so free-space tiles are not projected as a single cell.
+        openvdb::CoordBBox tile_bbox;
+        iter.getBoundingBox(tile_bbox);
+        tile_bbox.intersect(bbox);
+        const bool is_on = iter.isValueOn();
+        const int z0     = std::max(tile_bbox.min().z(), min_z_idx);
+        const int z1     = std::min(tile_bbox.max().z(), max_z_idx);
+        for (int z = z0; z <= z1; ++z)
+        {
+          for (int y = tile_bbox.min().y(); y <= tile_bbox.max().y(); ++y)
+          {
+            for (int x = tile_bbox.min().x(); x <= tile_bbox.max().x(); ++x)
+            {
+              process_voxel(openvdb::Coord(x, y, z), is_on);
+            }
+          }
         }
       }
     }
@@ -358,7 +387,10 @@ public:
           }
           else
           {
-            occupancy_grid_msg.data[current_index] = 0;
+            // Speckle: demote to unknown rather than free. The column did
+            // exceed the occupancy threshold, so claiming it is traversable
+            // would erase real thin obstacles (poles, trunks) for planners.
+            occupancy_grid_msg.data[current_index] = -1;
           }
         }
         else

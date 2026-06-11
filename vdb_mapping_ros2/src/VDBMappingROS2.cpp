@@ -367,10 +367,11 @@ bool VDBMappingROS2::getMapSectionCallback(
   geometry_msgs::msg::TransformStamped source_to_map_tf;
   try
   {
+    // A zero stamp is interpreted by tf2 as "latest available transform".
     source_to_map_tf =
       m_tf_buffer->lookupTransform(m_map_frame,
                                    req->header.frame_id,
-                                   rclcpp::Time(0),
+                                   rclcpp::Time(req->header.stamp),
                                    rclcpp::Duration::from_seconds(m_tf_lookup_timeout));
   }
   catch (tf2::TransformException& ex)
@@ -437,21 +438,36 @@ bool VDBMappingROS2::triggerMapSectionUpdateCallback(
   request->header       = req->header;
   request->bounding_box = req->bounding_box;
 
-  auto vdb_map = m_vdb_map;
-  auto logger  = this->get_logger();
+  if (!remote_source->second->get_map_section_client->service_is_ready())
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "get_map_section service of remote source %s is not available",
+                req->remote_source.c_str());
+    res->success = false;
+    return true;
+  }
+
+  // The response is a binary occupancy section snapshot (see
+  // getMapSectionUpdateGrid in vdb_mapping). It must be applied with
+  // replace-section semantics and honoring the remote map frame, exactly like
+  // the passively subscribed sections, so reuse mapSectionCallback. Feeding it
+  // to updateMap would treat every voxel as a single probabilistic hit, which
+  // never crosses the occupancy threshold and bypasses the map mutex.
+  auto remote = remote_source->second;
   remote_source->second->get_map_section_client->async_send_request(
     request,
-    [vdb_map, logger](
+    [this, remote](
       rclcpp::Client<vdb_mapping_interfaces::srv::GetMapSection>::SharedFuture future) {
       auto response = future.get();
       if (response->success)
       {
-        vdb_map->updateMap(
-          vdb_map->byteArrayToGrid<VDBMapT::UpdateGridT>(response->section.map));
+        auto update =
+          std::make_shared<vdb_mapping_interfaces::msg::UpdateGrid>(response->section);
+        mapSectionCallback(update, remote);
       }
       else
       {
-        RCLCPP_WARN(logger, "Remote get_map_section returned success=false");
+        RCLCPP_WARN(this->get_logger(), "Remote get_map_section returned success=false");
       }
     });
   res->success = true;
@@ -497,23 +513,32 @@ bool VDBMappingROS2::triggerMapFullSectionUpdateCallback(
   request->header       = req->header;
   request->bounding_box = req->bounding_box;
 
-  auto vdb_map = m_vdb_map;
-  auto logger  = this->get_logger();
-  bool smooth  = m_smooth_remote_sections;
-  int iters    = m_remote_section_smoothing_iterations;
+  if (!remote_source->second->get_map_full_section_client->service_is_ready())
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "get_map_full_section service of remote source %s is not available",
+                req->remote_source.c_str());
+    res->success = false;
+    return true;
+  }
+
+  // Reuse mapFullSectionCallback so the response honors the remote map frame
+  // (transformAndApply* when frames differ) instead of being applied blindly.
+  auto remote = remote_source->second;
   remote_source->second->get_map_full_section_client->async_send_request(
     request,
-    [vdb_map, logger, smooth, iters](
+    [this, remote](
       rclcpp::Client<vdb_mapping_interfaces::srv::GetMapSection>::SharedFuture future) {
       auto response = future.get();
       if (response->success)
       {
-        vdb_map->applyMapSectionGrid(
-          vdb_map->byteArrayToGrid<VDBMapT::GridT>(response->section.map), smooth, iters);
+        auto update =
+          std::make_shared<vdb_mapping_interfaces::msg::UpdateGrid>(response->section);
+        mapFullSectionCallback(update, remote);
       }
       else
       {
-        RCLCPP_WARN(logger, "Remote get_map_full_section returned success=false");
+        RCLCPP_WARN(this->get_logger(), "Remote get_map_full_section returned success=false");
       }
     });
   res->success = true;
@@ -633,10 +658,11 @@ bool VDBMappingROS2::addArtificialAreasCallback(
     geometry_msgs::msg::TransformStamped source_to_map_tf;
     try
     {
+      // A zero stamp is interpreted by tf2 as "latest available transform".
       source_to_map_tf =
         m_tf_buffer->lookupTransform(m_map_frame,
                                      req->artificial_areas[0].header.frame_id,
-                                     rclcpp::Time(0),
+                                     rclcpp::Time(req->artificial_areas[0].header.stamp),
                                      rclcpp::Duration::from_seconds(m_tf_lookup_timeout));
     }
     catch (tf2::TransformException& ex)

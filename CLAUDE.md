@@ -74,6 +74,11 @@ The node runs as a **composable ROS 2 component** (`rclcpp_components`). Launch 
 
 The `vdb_mapping` library (not in this repo) provides the actual mapping algorithms. This package is purely the ROS 2 wrapper. OpenVDB 5.0+ is required.
 
+Conventions inherited from the core library that this wrapper must respect:
+- **Cell-centered coordinates**: the sensor-data path discretizes points by rounding to the nearest lattice point, so `indexToWorld(coord)` yields voxel *centers*. The 2D occupancy grid origin therefore carries a -0.5 voxel offset (`VDBMappingTools.hpp`), and markers/pointclouds use `indexToWorld` directly as cube/point centers.
+- **Tile values**: the core prunes grids (e.g. after PCD loads), so constant regions appear as OpenVDB tiles. Iteration code must expand tile bounding boxes instead of treating each iterator item as one voxel.
+- **Section semantics**: `get_map_section` responses are binary occupancy snapshots and must be applied with `applyMapSectionUpdateGrid`/`transformAndApply...` (replace-section, internally locked) — never with `updateMap`, which is the probabilistic hit/miss integrator and takes no lock itself.
+
 ## Build & Development
 
 ### Build Commands

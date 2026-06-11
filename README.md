@@ -85,7 +85,7 @@ VDB Mapping is highly configurable using ROS parameters. Below is a complete lis
 | prob_thres_min                      | double  | 0.12    | Lower occupancy threshold of a voxel |
 | prob_thres_max                      | double  | 0.97    | Upper occupancy threshold of a voxel |
 | fast_mode                           | bool    | false   | Enables faster raycasting at the cost of modeling free and unknown space individually |
-| map_directory_path                  | string  | ''      | Storage location for saved maps |
+| map_directory_path                  | string  | ''      | Storage location for saved maps. Must end with a trailing slash; the timestamped file name is appended directly |
 | tf_lookup_timeout                   | double  | 0.1     | How long TF lookups wait for available transforms (seconds) |
 | two_dim_projection_threshold        | int     | 5       | Number of occupied voxels in a column above which the projected 2D occupancy grid cell becomes lethal |
 | smooth_remote_sections              | bool    | false   | Smooth incoming remote sections before applying them |
@@ -93,8 +93,8 @@ VDB Mapping is highly configurable using ROS parameters. Below is a complete lis
 | artificial_negative_height          | double  | -0.5    | Downward extent of artificial areas (meters) |
 | artificial_positive_height          | double  | 1.5     | Upward extent of artificial areas (meters) |
 | apply_raw_sensor_data               | bool    | true    | Integrate raw sensor data (point clouds) into the map. Set to false for pure remote/map-server instances |
-| accumulate_updates                  | bool    | false   | Accumulate the data of multiple sensor measurements before integrating it into the map (only used when apply_raw_sensor_data is true) |
-| accumulation_period                 | double  | 1.0     | How long updates are accumulated before integration (seconds) |
+| accumulate_updates                  | bool    | false   | The core library integrates accumulated sensor updates periodically on an internal thread. If this is false, an integration is additionally requested after every incoming cloud (only used when apply_raw_sensor_data is true) |
+| accumulation_period                 | double  | 1.0     | Period of the internal integration thread that folds accumulated sensor updates into the map (seconds) |
 | sources                             | string[]| []      | List of sensor sources |
 | remote_sources                      | string[]| []      | List of remote sources |
 
@@ -117,7 +117,7 @@ Each entry of `sources` opens a namespace with the following parameters:
 | topic               | string | ''      | Topic name of the PointCloud2 sensor msg (required) |
 | sensor_origin_frame | string | ''      | Frame used as raycast origin. Optional; by default the frame id of the msg is used. Useful for pre-aligned point clouds whose frame id is no longer the sensor origin |
 | max_range           | double | 0       | Per-sensor max raycasting range. Optional; 0 uses the global max_range |
-| max_rate            | double | 0       | Maximum integration rate for this source. Optional; 0 means unlimited |
+| max_rate            | double | 0       | Maximum accumulation rate for this source. Optional; 0 means unlimited. The core library holds a single pending cloud per source, so a newer cloud replaces a not-yet-processed one |
 | reliable            | bool   | false   | Use a reliable QoS subscription instead of best-effort |
 
 #### Section Publishing (local side)
