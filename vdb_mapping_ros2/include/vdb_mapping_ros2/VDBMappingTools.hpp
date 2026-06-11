@@ -72,7 +72,34 @@ public:
                                   const int occupancy_chunk        = 32)
   {
     typename VDBMappingT::PointCloudT::Ptr cloud(new typename VDBMappingT::PointCloudT);
+    // The active bbox only spans *occupied* voxels. Observed-free voxels
+    // (inactive, non-background) regularly lie outside it — e.g. raytraced
+    // space in front of the outermost obstacle — and must still be covered by
+    // the occupancy grid. Their extent is bounded by the allocated leaf nodes
+    // (8^3 granularity; evalLeafBoundingBox cannot be used since it only
+    // evaluates *active* per-leaf bounds) plus any non-background tiles
+    // (pruned constant regions).
     openvdb::CoordBBox bbox = grid->evalActiveVoxelBoundingBox();
+    for (auto leaf_iter = grid->tree().cbeginLeaf(); leaf_iter; ++leaf_iter)
+    {
+      const openvdb::CoordBBox leaf_bbox = leaf_iter->getNodeBoundingBox();
+      bbox.expand(leaf_bbox.min());
+      bbox.expand(leaf_bbox.max());
+    }
+    {
+      auto tile_iter = grid->tree().cbeginValueAll();
+      tile_iter.setMaxDepth(VDBMappingT::GridT::TreeType::DEPTH - 2);
+      for (; tile_iter; ++tile_iter)
+      {
+        if (tile_iter.getValue() != 0)
+        {
+          openvdb::CoordBBox tile_bbox;
+          tile_iter.getBoundingBox(tile_bbox);
+          bbox.expand(tile_bbox.min());
+          bbox.expand(tile_bbox.max());
+        }
+      }
+    }
     if (bbox.empty())
     {
       // An empty map yields an inverted bbox (min = Coord::max(), max =
@@ -381,15 +408,18 @@ public:
               }
             }
           }
-          if (count > 2)
+          // Only demote truly isolated lethal cells (no lethal neighbor at
+          // all): one-cell-wide walls have exactly 2 lethal neighbors and
+          // line endpoints just 1, so any stricter rule erases real thin
+          // obstacles. Demote to unknown rather than free — the column did
+          // exceed the occupancy threshold, so claiming it is traversable
+          // would hide poles or trunks from planners.
+          if (count > 0)
           {
             occupancy_grid_msg.data[current_index] = occ_voxel_projection_grid[current_index];
           }
           else
           {
-            // Speckle: demote to unknown rather than free. The column did
-            // exceed the occupancy threshold, so claiming it is traversable
-            // would erase real thin obstacles (poles, trunks) for planners.
             occupancy_grid_msg.data[current_index] = -1;
           }
         }
