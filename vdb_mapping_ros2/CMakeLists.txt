@@ -51,6 +51,17 @@ install(DIRECTORY
 
 
 if(BUILD_TESTING)
+  # End-to-end launch tests: start a vdb_mapping_ros_node, feed it a synthetic
+  # wall cloud and validate the published occupancy grid / marker and the
+  # raytrace + get_map_section services against the known geometry.
+  find_package(launch_testing_ament_cmake REQUIRED)
+  add_launch_test(test/smoke.test.py TIMEOUT 150)
+  add_launch_test(test/raytrace.test.py TIMEOUT 150)
+
+  install(PROGRAMS
+    test/smoke_test.py
+    test/raytrace_test.py
+    DESTINATION lib/${PROJECT_NAME})
 endif()
 
 ament_auto_package()
