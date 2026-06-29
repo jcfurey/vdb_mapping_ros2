@@ -51,9 +51,9 @@ vdb_mapping_ros2/                     # Repository root
 
 ### Two ROS 2 Packages
 
-1. **vdb_mapping_interfaces** - Message and service definitions only. Built with `rosidl_default_generators`. No C++ logic. Dependencies: `geometry_msgs`, `nav_msgs`, `sensor_msgs`, `std_msgs`.
+1. **vdb_mapping_interfaces** - Message and service definitions only. Built with `rosidl_default_generators`. No C++ logic. Dependencies: `geometry_msgs`, `sensor_msgs`, `std_msgs`.
 
-2. **vdb_mapping_ros2** - The actual mapping node. Header-only template library + composable node component. Depends on `vdb_mapping` (core library), `vdb_mapping_interfaces`, and standard ROS 2 packages.
+2. **vdb_mapping_ros2** - The actual mapping node. Compiled shared library + composable node component (registered from its own sources). Depends on `vdb_mapping` (core library), `vdb_mapping_interfaces`, and standard ROS 2 packages.
 
 ### Key Classes
 

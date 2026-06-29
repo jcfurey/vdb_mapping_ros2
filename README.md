@@ -188,7 +188,8 @@ Each entry of `remote_sources` opens a namespace with the following parameters:
 | ~/save_map_to_pcd                | std_srvs/Trigger                                  | Saves the current map as a PCD file |
 | ~/load_map                       | vdb_mapping_interfaces/LoadMap                    | Loads the map specified in the request |
 | ~/load_map_from_pcd              | vdb_mapping_interfaces/LoadMapFromPCD             | Loads a map from a PCD file |
-| ~/get_map_section                | vdb_mapping_interfaces/GetMapSection              | Returns a serialized section of the map |
+| ~/get_map_section                | vdb_mapping_interfaces/GetMapSection              | Returns a serialized section of the map (binary update grid) |
+| ~/get_map_full_section           | vdb_mapping_interfaces/GetMapSection              | Returns a serialized full (probabilistic) section of the map |
 | ~/trigger_map_section_update     | vdb_mapping_interfaces/TriggerMapSectionUpdate    | Pulls a section from a remote instance and applies it |
 | ~/trigger_map_full_section_update| vdb_mapping_interfaces/TriggerMapSectionUpdate    | Pulls a full section from a remote instance and applies it |
 | ~/raytrace                       | vdb_mapping_interfaces/Raytrace                   | Raytraces a single ray and returns where it first intersects the map |
