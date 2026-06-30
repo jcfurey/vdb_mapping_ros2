@@ -234,28 +234,39 @@ void VDBMappingROS2::publishMap() const
     return;
   }
 
-  geometry_msgs::msg::TransformStamped map_to_robot_tf;
-  // Skip the visualization until the TF tree is connected so we don't spam
-  // ERROR-level logs during startup before localization comes up.
-  if (!m_tf_buffer->canTransform(m_map_frame, m_robot_frame, tf2::TimePointZero))
+  // The z-limits are interpreted relative to the robot frame, so the robot
+  // height is only needed when z-clipping is actually enabled (the limits
+  // differ). When it is disabled the robot TF would not influence the output
+  // at all, so we must not gate the whole visualization on it — otherwise a
+  // pure map-server or a not-yet-localized instance would publish nothing.
+  const double lower_z_limit = m_lower_visualization_z_limit;
+  const double upper_z_limit = m_upper_visualization_z_limit;
+  double robot_z             = 0.0;
+  if (lower_z_limit < upper_z_limit)
   {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
-                         "VisMapToRobot: Waiting for TF %s -> %s (localization not yet active)",
-                         m_map_frame.c_str(), m_robot_frame.c_str());
-    return;
-  }
-  try
-  {
-    map_to_robot_tf = m_tf_buffer->lookupTransform(m_map_frame, m_robot_frame, tf2::TimePointZero);
-  }
-  catch (tf2::TransformException& ex)
-  {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "VisMapToRobot: Could not transform %s to %s: %s",
-                         m_map_frame.c_str(),
-                         m_robot_frame.c_str(),
-                         ex.what());
-    return;
+    // Skip until the TF tree is connected so we don't spam ERROR-level logs
+    // during startup before localization comes up.
+    if (!m_tf_buffer->canTransform(m_map_frame, m_robot_frame, tf2::TimePointZero))
+    {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                           "VisMapToRobot: Waiting for TF %s -> %s (localization not yet active)",
+                           m_map_frame.c_str(), m_robot_frame.c_str());
+      return;
+    }
+    try
+    {
+      robot_z = m_tf_buffer->lookupTransform(m_map_frame, m_robot_frame, tf2::TimePointZero)
+                  .transform.translation.z;
+    }
+    catch (tf2::TransformException& ex)
+    {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "VisMapToRobot: Could not transform %s to %s: %s",
+                           m_map_frame.c_str(),
+                           m_robot_frame.c_str(),
+                           ex.what());
+      return;
+    }
   }
 
   visualization_msgs::msg::Marker visualization_marker_msg;
@@ -272,8 +283,8 @@ void VDBMappingROS2::publishMap() const
     publish_vis_marker,
     publish_pointcloud,
     publish_occupancy_grid,
-    map_to_robot_tf.transform.translation.z + m_lower_visualization_z_limit,
-    map_to_robot_tf.transform.translation.z + m_upper_visualization_z_limit,
+    robot_z + lower_z_limit,
+    robot_z + upper_z_limit,
     m_resolution,
     m_two_dim_projection_threshold);
   map_lock.unlock();
@@ -400,7 +411,9 @@ bool VDBMappingROS2::getMapSectionCallback(
   geometry_msgs::msg::TransformStamped source_to_map_tf;
   try
   {
-    // A zero stamp is interpreted by tf2 as "latest available transform".
+    // The request's own stamp is used for the lookup; callers that want the
+    // latest transform send a zero stamp, which tf2 treats as "latest
+    // available".
     source_to_map_tf =
       m_tf_buffer->lookupTransform(m_map_frame,
                                    req->header.frame_id,
@@ -419,6 +432,47 @@ bool VDBMappingROS2::getMapSectionCallback(
   }
   res->section.map = m_vdb_map->gridToByteArray<VDBMapT::UpdateGridT>(
     m_vdb_map->getMapSectionUpdateGrid(
+      Eigen::Matrix<double, 3, 1>(req->bounding_box.min_corner.x,
+                                  req->bounding_box.min_corner.y,
+                                  req->bounding_box.min_corner.z),
+      Eigen::Matrix<double, 3, 1>(req->bounding_box.max_corner.x,
+                                  req->bounding_box.max_corner.y,
+                                  req->bounding_box.max_corner.z),
+      tf2::transformToEigen(source_to_map_tf).matrix()));
+  res->section.header.frame_id = m_map_frame;
+  res->section.header.stamp    = this->now();
+  res->success                 = true;
+  return true;
+}
+
+bool VDBMappingROS2::getMapFullSectionCallback(
+  const std::shared_ptr<vdb_mapping_interfaces::srv::GetMapSection::Request> req,
+  const std::shared_ptr<vdb_mapping_interfaces::srv::GetMapSection::Response> res)
+{
+  geometry_msgs::msg::TransformStamped source_to_map_tf;
+  try
+  {
+    source_to_map_tf =
+      m_tf_buffer->lookupTransform(m_map_frame,
+                                   req->header.frame_id,
+                                   rclcpp::Time(req->header.stamp),
+                                   rclcpp::Duration::from_seconds(m_tf_lookup_timeout));
+  }
+  catch (tf2::TransformException& ex)
+  {
+    RCLCPP_ERROR(this->get_logger(),
+                 "GetMapFullSection: Could not transform %s to %s: %s",
+                 m_map_frame.c_str(),
+                 req->header.frame_id.c_str(),
+                 ex.what());
+    res->success = false;
+    return true;
+  }
+  // Full sections carry the probabilistic GridT (not the binary UpdateGridT
+  // returned by get_map_section), matching what mapFullSectionCallback /
+  // applyMapSectionGrid expect on the receiving side.
+  res->section.map = m_vdb_map->gridToByteArray<VDBMapT::GridT>(
+    m_vdb_map->getMapSectionGrid(
       Eigen::Matrix<double, 3, 1>(req->bounding_box.min_corner.x,
                                   req->bounding_box.min_corner.y,
                                   req->bounding_box.min_corner.z),
@@ -656,9 +710,9 @@ bool VDBMappingROS2::batchRaytraceCallback(
   using RayT = openvdb::math::Ray<double>;
   using DDAT = openvdb::math::DDA<RayT, 0>;
 
-  auto grid = m_vdb_map->getGrid();
   std::shared_lock map_lock(*m_vdb_map->getMapMutex());
-  auto acc = grid->getConstAccessor();
+  auto grid = m_vdb_map->getGrid();
+  auto acc  = grid->getConstAccessor();
   for (size_t i = 0; i < req->rays.size(); i++)
   {
     Eigen::Matrix<double, 4, 1> origin, direction;
@@ -728,7 +782,9 @@ bool VDBMappingROS2::addArtificialAreasCallback(
     geometry_msgs::msg::TransformStamped source_to_map_tf;
     try
     {
-      // A zero stamp is interpreted by tf2 as "latest available transform".
+      // The request's own stamp is used for the lookup; callers that want the
+      // latest transform send a zero stamp, which tf2 treats as "latest
+      // available".
       source_to_map_tf =
         m_tf_buffer->lookupTransform(m_map_frame,
                                      req->artificial_areas[0].header.frame_id,
@@ -1124,6 +1180,8 @@ void VDBMappingROS2::setUpServices()
     "~/load_map_from_pcd", std::bind(&VDBMappingROS2::loadMapFromPCD, this, _1, _2));
   m_get_map_section_service = this->create_service<vdb_mapping_interfaces::srv::GetMapSection>(
     "~/get_map_section", std::bind(&VDBMappingROS2::getMapSectionCallback, this, _1, _2));
+  m_get_map_full_section_service = this->create_service<vdb_mapping_interfaces::srv::GetMapSection>(
+    "~/get_map_full_section", std::bind(&VDBMappingROS2::getMapFullSectionCallback, this, _1, _2));
   m_trigger_map_section_update_service =
     this->create_service<vdb_mapping_interfaces::srv::TriggerMapSectionUpdate>(
       "~/trigger_map_section_update",

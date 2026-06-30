@@ -112,6 +112,9 @@ public:
   bool getMapSectionCallback(
     const std::shared_ptr<vdb_mapping_interfaces::srv::GetMapSection::Request> req,
     const std::shared_ptr<vdb_mapping_interfaces::srv::GetMapSection::Response> res);
+  bool getMapFullSectionCallback(
+    const std::shared_ptr<vdb_mapping_interfaces::srv::GetMapSection::Request> req,
+    const std::shared_ptr<vdb_mapping_interfaces::srv::GetMapSection::Response> res);
   bool triggerMapSectionUpdateCallback(
     const std::shared_ptr<vdb_mapping_interfaces::srv::TriggerMapSectionUpdate::Request> req,
     const std::shared_ptr<vdb_mapping_interfaces::srv::TriggerMapSectionUpdate::Response> res);
@@ -169,6 +172,8 @@ private:
   rclcpp::Service<vdb_mapping_interfaces::srv::Raytrace>::SharedPtr m_raytrace_service;
   rclcpp::Service<vdb_mapping_interfaces::srv::BatchRaytrace>::SharedPtr m_batch_raytrace_service;
   rclcpp::Service<vdb_mapping_interfaces::srv::GetMapSection>::SharedPtr m_get_map_section_service;
+  rclcpp::Service<vdb_mapping_interfaces::srv::GetMapSection>::SharedPtr
+    m_get_map_full_section_service;
   rclcpp::Service<vdb_mapping_interfaces::srv::TriggerMapSectionUpdate>::SharedPtr
     m_trigger_map_section_update_service;
   rclcpp::Service<vdb_mapping_interfaces::srv::TriggerMapSectionUpdate>::SharedPtr
