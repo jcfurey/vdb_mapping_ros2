@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <shared_mutex>
 #include <sstream>
@@ -69,6 +70,47 @@ auto trySetLogCallback(MapT& map, const rclcpp::Logger& logger, int)
 template <typename MapT>
 void trySetLogCallback(MapT&, const rclcpp::Logger&, long)
 {
+}
+
+// pcl::fromROSMsg indexes the data buffer via row_step/point_step without any
+// bounds checking, and silently leaves coordinates uninitialized when x/y/z
+// fields are absent — so a lying or incompatible publisher could crash the
+// node or inject garbage points. Returns nullptr if the message is usable,
+// otherwise a description of the defect.
+const char* cloudMsgError(const sensor_msgs::msg::PointCloud2& msg)
+{
+  bool has_x = false;
+  bool has_y = false;
+  bool has_z = false;
+  for (const auto& field : msg.fields)
+  {
+    if (field.name != "x" && field.name != "y" && field.name != "z")
+    {
+      continue;
+    }
+    if (field.datatype != sensor_msgs::msg::PointField::FLOAT32 ||
+        field.offset + sizeof(float) > msg.point_step)
+    {
+      return "x/y/z field is not a FLOAT32 lying within point_step";
+    }
+    has_x |= field.name == "x";
+    has_y |= field.name == "y";
+    has_z |= field.name == "z";
+  }
+  if (!(has_x && has_y && has_z))
+  {
+    return "missing x/y/z FLOAT32 fields";
+  }
+  if (msg.width != 0 && msg.height != 0)
+  {
+    const size_t required = static_cast<size_t>(msg.height - 1) * msg.row_step +
+                            static_cast<size_t>(msg.width) * msg.point_step;
+    if (msg.data.size() < required)
+    {
+      return "data buffer smaller than the declared width/height/point_step extent";
+    }
+  }
+  return nullptr;
 }
 }  // namespace
 
@@ -153,6 +195,14 @@ void VDBMappingROS2::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPt
   {
     return;
   }
+  if (const char* error = cloudMsgError(*cloud_msg))
+  {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                          "Dropping cloud from source %s: %s",
+                          sensor_source.source_id.c_str(),
+                          error);
+    return;
+  }
   VDBMapT::PointCloudT::Ptr cloud(new VDBMapT::PointCloudT);
   pcl::fromROSMsg(*cloud_msg, *cloud);
   geometry_msgs::msg::TransformStamped cloud_origin_tf;
@@ -222,12 +272,15 @@ void VDBMappingROS2::publishMap() const
   {
     return;
   }
+  // Ask the publisher handles rather than count_subscribers(name): the latter
+  // expands the node-relative name but does NOT apply remap rules, so it would
+  // report 0 forever if the topic is remapped at launch.
   bool publish_vis_marker =
-    (m_publish_vis_marker && this->count_subscribers("~/vdb_map_visualization") > 0);
+    (m_publish_vis_marker && m_visualization_marker_pub->get_subscription_count() > 0);
   bool publish_pointcloud =
-    (m_publish_pointcloud && this->count_subscribers("~/vdb_map_pointcloud") > 0);
+    (m_publish_pointcloud && m_pointcloud_pub->get_subscription_count() > 0);
   bool publish_occupancy_grid =
-    (m_publish_occupancy_grid && this->count_subscribers("~/vdb_map_occupancy") > 0);
+    (m_publish_occupancy_grid && m_occupancy_grid_pub->get_subscription_count() > 0);
 
   if (!(publish_vis_marker || publish_pointcloud || publish_occupancy_grid))
   {
@@ -315,12 +368,31 @@ void VDBMappingROS2::mapSectionCallback(
   {
     return;
   }
+  // Deserialization throws on corrupt/truncated payloads and yields null on a
+  // grid-type mismatch (e.g. a full section wired to a section subscription).
+  // An uncaught throw in a subscription callback would take down the whole
+  // component container, so drop bad sections instead.
+  VDBMapT::UpdateGridT::Ptr section;
+  try
+  {
+    section = m_vdb_map->byteArrayToGrid<VDBMapT::UpdateGridT>(update_msg->map);
+  }
+  catch (const std::exception& ex)
+  {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                          "MapSection: dropping undeserializable section: %s", ex.what());
+    return;
+  }
+  if (!section)
+  {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                          "MapSection: dropping section: payload is not an update grid");
+    return;
+  }
   if (m_map_frame == update_msg->header.frame_id)
   {
     m_vdb_map->applyMapSectionUpdateGrid(
-      m_vdb_map->byteArrayToGrid<VDBMapT::UpdateGridT>(update_msg->map),
-      m_smooth_remote_sections,
-      m_remote_section_smoothing_iterations);
+      section, m_smooth_remote_sections, m_remote_section_smoothing_iterations);
   }
   else
   {
@@ -343,7 +415,7 @@ void VDBMappingROS2::mapSectionCallback(
       return;
     }
     m_vdb_map->transformAndApplyMapSectionUpdateGrid(
-      m_vdb_map->byteArrayToGrid<VDBMapT::UpdateGridT>(update_msg->map),
+      section,
       tf2::transformToEigen(transform).matrix(),
       m_smooth_remote_sections,
       m_remote_section_smoothing_iterations);
@@ -358,12 +430,29 @@ void VDBMappingROS2::mapFullSectionCallback(
   {
     return;
   }
+  // See mapSectionCallback: drop corrupt or type-mismatched payloads instead
+  // of letting a deserialization throw terminate the container.
+  VDBMapT::GridT::Ptr section;
+  try
+  {
+    section = m_vdb_map->byteArrayToGrid<VDBMapT::GridT>(update_msg->map);
+  }
+  catch (const std::exception& ex)
+  {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                          "MapFullSection: dropping undeserializable section: %s", ex.what());
+    return;
+  }
+  if (!section)
+  {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                          "MapFullSection: dropping section: payload is not a map grid");
+    return;
+  }
   if (m_map_frame == update_msg->header.frame_id)
   {
     m_vdb_map->applyMapSectionGrid(
-      m_vdb_map->byteArrayToGrid<VDBMapT::GridT>(update_msg->map),
-      m_smooth_remote_sections,
-      m_remote_section_smoothing_iterations);
+      section, m_smooth_remote_sections, m_remote_section_smoothing_iterations);
   }
   else
   {
@@ -386,7 +475,7 @@ void VDBMappingROS2::mapFullSectionCallback(
       return;
     }
     m_vdb_map->transformAndApplyMapSectionGrid(
-      m_vdb_map->byteArrayToGrid<VDBMapT::GridT>(update_msg->map),
+      section,
       tf2::transformToEigen(transform).matrix(),
       m_smooth_remote_sections,
       m_remote_section_smoothing_iterations);
@@ -636,6 +725,12 @@ bool VDBMappingROS2::addPointsToGridCallback(
   const std::shared_ptr<vdb_mapping_interfaces::srv::AddPointsToGrid::Request> req,
   const std::shared_ptr<vdb_mapping_interfaces::srv::AddPointsToGrid::Response> res)
 {
+  if (const char* error = cloudMsgError(req->points))
+  {
+    RCLCPP_ERROR(this->get_logger(), "AddPointsToGrid: rejecting request: %s", error);
+    res->success = false;
+    return true;
+  }
   VDBMapT::PointCloudT::Ptr cloud(new VDBMapT::PointCloudT);
   pcl::fromROSMsg(req->points, *cloud);
   res->success = m_vdb_map->addPointsToGrid(cloud);
@@ -646,6 +741,12 @@ bool VDBMappingROS2::removePointsFromGridCallback(
   const std::shared_ptr<vdb_mapping_interfaces::srv::RemovePointsFromGrid::Request> req,
   const std::shared_ptr<vdb_mapping_interfaces::srv::RemovePointsFromGrid::Response> res)
 {
+  if (const char* error = cloudMsgError(req->points))
+  {
+    RCLCPP_ERROR(this->get_logger(), "RemovePointsFromGrid: rejecting request: %s", error);
+    res->success = false;
+    return true;
+  }
   VDBMapT::PointCloudT::Ptr cloud(new VDBMapT::PointCloudT);
   pcl::fromROSMsg(req->points, *cloud);
   res->success = m_vdb_map->removePointsFromGrid(cloud);
@@ -727,9 +828,22 @@ bool VDBMappingROS2::batchRaytraceCallback(
     bool success                    = false;
     geometry_msgs::msg::Point end_point;
 
+    // Non-finite inputs would put NaN/inf coordinates into the DDA, and an
+    // unbounded length walks the grid one voxel per step while the shared map
+    // lock is held — a huge value would starve out map integration. Hence the
+    // finite check and the max_raytrace_length clamp.
+    if (!origin.allFinite() || !dir.allFinite() || !std::isfinite(max_ray_length))
+    {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "BatchRaytrace: dropping ray with non-finite origin/direction/length");
+      res->successes[i]  = false;
+      res->end_points[i] = end_point;
+      continue;
+    }
+
     if (dir.norm() > 0.0 && max_ray_length > 0.0)
     {
-      dir = dir.normalized() * max_ray_length;
+      dir = dir.normalized() * std::min(max_ray_length, m_max_raytrace_length);
       const openvdb::Vec3d origin_world(origin.x(), origin.y(), origin.z());
       const openvdb::Vec3d dir_world(dir.x(), dir.y(), dir.z());
       // Voxels are cell-centered (vdb_mapping's worldToIndex rounds), while
@@ -942,6 +1056,14 @@ void VDBMappingROS2::setUpVDBMap()
   this->get_parameter("two_dim_projection_threshold", m_two_dim_projection_threshold);
   this->declare_parameter<double>("tf_lookup_timeout", 0.1);
   this->get_parameter("tf_lookup_timeout", m_tf_lookup_timeout);
+  this->declare_parameter<double>("max_raytrace_length", 1000.0);
+  this->get_parameter("max_raytrace_length", m_max_raytrace_length);
+  if (m_max_raytrace_length <= 0.0)
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "max_raytrace_length must be positive; falling back to 1000 m");
+    m_max_raytrace_length = 1000.0;
+  }
   this->declare_parameter<bool>("smooth_remote_sections", false);
   this->get_parameter("smooth_remote_sections", m_smooth_remote_sections);
   this->declare_parameter<int>("remote_section_smoothing_iterations", 2);
@@ -1074,6 +1196,13 @@ void VDBMappingROS2::setUpRemoteSources()
     std::string remote_namespace;
     this->declare_parameter<std::string>(source_id + ".namespace", "");
     this->get_parameter(source_id + ".namespace", remote_namespace);
+    if (remote_namespace.empty())
+    {
+      RCLCPP_WARN_STREAM(this->get_logger(),
+                         "Remote source " << source_id
+                           << " has no namespace configured; its topics and services will "
+                              "resolve at the root namespace");
+    }
 
     auto remote_source = std::make_shared<RemoteSource>();
     this->declare_parameter<bool>(source_id + ".apply_remote_sections", false);

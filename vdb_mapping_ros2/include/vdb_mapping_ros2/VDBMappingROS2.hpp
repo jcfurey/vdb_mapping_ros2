@@ -220,6 +220,7 @@ private:
   std::string m_section_update_frame;
   int m_two_dim_projection_threshold;
   double m_tf_lookup_timeout;
+  double m_max_raytrace_length;
   double m_artificial_negative_height;
   double m_artificial_positive_height;
 
