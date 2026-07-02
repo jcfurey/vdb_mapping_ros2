@@ -99,6 +99,7 @@ VDB Mapping is highly configurable using ROS parameters. Below is a complete lis
 | fast_mode                           | bool    | false   | Enables faster raycasting at the cost of modeling free and unknown space individually |
 | map_directory_path                  | string  | ''      | Storage location for saved maps. Must end with a trailing slash; the timestamped file name is appended directly |
 | tf_lookup_timeout                   | double  | 0.1     | How long TF lookups wait for available transforms (seconds) |
+| max_raytrace_length                 | double  | 1000.0  | Upper bound on the per-ray max_ray_length accepted by the raytrace services (meters) |
 | two_dim_projection_threshold        | int     | 5       | Number of occupied voxels in a column above which the projected 2D occupancy grid cell becomes lethal |
 | smooth_remote_sections              | bool    | false   | Smooth incoming remote sections before applying them |
 | remote_section_smoothing_iterations | int     | 2       | Number of smoothing iterations for remote sections |
