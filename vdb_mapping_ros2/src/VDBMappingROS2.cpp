@@ -326,9 +326,13 @@ void VDBMappingROS2::publishMap() const
   sensor_msgs::msg::PointCloud2 cloud_msg;
   nav_msgs::msg::OccupancyGrid occupancy_grid_msg;
 
+  // fetch the handle BEFORE locking — getGrid() locks internally, and a
+  // recursive shared acquisition from the same thread is UB (deadlocks
+  // outright when a writer is queued between the two acquisitions)
+  auto grid = m_vdb_map->getGrid();
   std::shared_lock map_lock(*m_vdb_map->getMapMutex());
   VDBMappingTools<VDBMapT>::createMappingOutput(
-    m_vdb_map->getGrid(),
+    grid,
     m_map_frame,
     visualization_marker_msg,
     cloud_msg,
@@ -811,8 +815,9 @@ bool VDBMappingROS2::batchRaytraceCallback(
   using RayT = openvdb::math::Ray<double>;
   using DDAT = openvdb::math::DDA<RayT, 0>;
 
-  std::shared_lock map_lock(*m_vdb_map->getMapMutex());
+  // handle first, then lock — see the note in setUpVDBMap()/publishMap()
   auto grid = m_vdb_map->getGrid();
+  std::shared_lock map_lock(*m_vdb_map->getMapMutex());
   auto acc  = grid->getConstAccessor();
   for (size_t i = 0; i < req->rays.size(); i++)
   {
@@ -1082,9 +1087,14 @@ void VDBMappingROS2::setUpVDBMap()
   {
     RCLCPP_WARN(this->get_logger(), "No map frame specified");
   }
-  std::unique_lock map_lock(*m_vdb_map->getMapMutex());
-  m_vdb_map->getGrid()->insertMeta("ros/map_frame", openvdb::StringMetadata(m_map_frame));
-  map_lock.unlock();
+  // getGrid() takes the map mutex internally — fetch the handle BEFORE
+  // locking (locking first recursively acquires the non-recursive
+  // shared_mutex from this thread: EDEADLK, constructor throws)
+  {
+    auto grid = m_vdb_map->getGrid();
+    std::unique_lock map_lock(*m_vdb_map->getMapMutex());
+    grid->insertMeta("ros/map_frame", openvdb::StringMetadata(m_map_frame));
+  }
   this->declare_parameter<std::string>("robot_frame", "");
   this->get_parameter("robot_frame", m_robot_frame);
   if (m_robot_frame.empty())
