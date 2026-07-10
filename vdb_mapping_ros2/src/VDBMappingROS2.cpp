@@ -1144,6 +1144,14 @@ void VDBMappingROS2::setUpLocalSources()
     this->get_parameter(source_id + ".max_rate", sensor_source.max_rate);
     this->declare_parameter<bool>(source_id + ".reliable", false);
     this->get_parameter(source_id + ".reliable", sensor_source.reliable);
+    this->declare_parameter<bool>(source_id + ".ray_clearing", true);
+    this->get_parameter(source_id + ".ray_clearing", sensor_source.ray_clearing);
+    this->declare_parameter<bool>(source_id + ".endpoint_hits", true);
+    this->get_parameter(source_id + ".endpoint_hits", sensor_source.endpoint_hits);
+    this->declare_parameter<double>(source_id + ".prob_hit", -1.0);
+    this->get_parameter(source_id + ".prob_hit", sensor_source.prob_hit);
+    this->declare_parameter<double>(source_id + ".prob_miss", -1.0);
+    this->get_parameter(source_id + ".prob_miss", sensor_source.prob_miss);
     RCLCPP_INFO_STREAM(this->get_logger(), "Setting up source: " << source_id);
 
     if (sensor_source.topic.empty())
@@ -1165,7 +1173,19 @@ void VDBMappingROS2::setUpLocalSources()
 
     m_sensor_sources.push_back(std::move(sensor_source));
     const SensorSource& stored = m_sensor_sources.back();
-    m_vdb_map->addInputSource(stored.source_id, stored.max_range, stored.max_rate);
+    RCLCPP_INFO(this->get_logger(),
+                "Source behavior: ray_clearing=%s endpoint_hits=%s prob_hit=%.2f prob_miss=%.2f",
+                stored.ray_clearing ? "true" : "false",
+                stored.endpoint_hits ? "true" : "false",
+                stored.prob_hit,
+                stored.prob_miss);
+    m_vdb_map->addInputSource(stored.source_id,
+                              stored.max_range,
+                              stored.max_rate,
+                              stored.ray_clearing,
+                              stored.endpoint_hits,
+                              stored.prob_hit,
+                              stored.prob_miss);
   }
 
   // Pass 2 — create the cloud subscriptions. After this, cloudCallback can

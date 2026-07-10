@@ -73,6 +73,12 @@ struct SensorSource
   double max_range;
   double max_rate;
   bool reliable;
+  // per-source behavior (see vdb_mapping InputSource): decouple ray
+  // clearing from endpoint hits, and override hit/miss probabilities
+  bool ray_clearing  = true;
+  bool endpoint_hits = true;
+  double prob_hit  = -1.0;
+  double prob_miss = -1.0;
 };
 
 class VDBMappingROS2 : public rclcpp::Node
