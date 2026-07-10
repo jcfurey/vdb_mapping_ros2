@@ -41,6 +41,15 @@ target_link_libraries(vdb_mapping_ros_node
   ${PROJECT_NAME}
 )
 
+# Graph-anchored map assembler: renders the map from per-keyframe evidence
+# at SLAM-optimized poses (see src/vdb_map_assembler_node.cpp)
+ament_auto_add_executable(vdb_map_assembler_node
+  src/vdb_map_assembler_node.cpp
+)
+target_link_libraries(vdb_map_assembler_node
+  ${PROJECT_NAME}
+)
+
 install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME})
