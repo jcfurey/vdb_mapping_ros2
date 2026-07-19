@@ -224,7 +224,8 @@ private:
     // dense 6-field survey aggregate (ALL inter-keyframe map_points clouds,
     // odom-delta transformed into THIS keyframe's robot frame)
     SurveyCloudPtrT survey;
-    Eigen::Vector3d sensor_origin = Eigen::Vector3d::Zero();
+    Eigen::Vector3d hits_origin  = Eigen::Vector3d::Zero();
+    Eigen::Vector3d clear_origin = Eigen::Vector3d::Zero();
     bool integrated = false;
     bool has_evidence = false;
   };
@@ -354,20 +355,21 @@ private:
 
   void onTrajectory(const sensor_msgs::msg::PointCloud2& msg)
   {
-    // require the stamp field (added alongside this node)
-    bool has_t = false;
-    for (const auto& f : msg.fields)
-    {
-      if (f.name == "t")
-      {
-        has_t = true;
-      }
-    }
-    if (!has_t)
+    // require all consumed fields: a PointCloud2ConstIterator throws
+    // std::runtime_error on a missing field, which would escape this
+    // subscription callback and terminate the node.
+    auto has_field = [&msg](const char* name) {
+      for (const auto& f : msg.fields)
+        if (f.name == name) return true;
+      return false;
+    };
+    if (!has_field("t") || !has_field("x") || !has_field("y") ||
+        !has_field("z") || !has_field("roll") || !has_field("pitch") ||
+        !has_field("yaw") || !has_field("i"))
     {
       RCLCPP_ERROR_ONCE(get_logger(),
-                        "trajectory cloud has no 't' field — slam node too old; "
-                        "assembler disabled");
+                        "trajectory cloud missing an x/y/z/roll/pitch/yaw/i/t "
+                        "field — slam node too old; assembler disabled");
       return;
     }
 
@@ -409,13 +411,13 @@ private:
       if (hits != nullptr)
       {
         kf.hits          = hits->cloud;
-        kf.sensor_origin = hits->sensor_origin;
+        kf.hits_origin   = hits->sensor_origin;
         kf.has_evidence  = true;
       }
       if (clear != nullptr)
       {
-        kf.clear        = clear->cloud;
-        kf.sensor_origin = clear->sensor_origin;
+        kf.clear         = clear->cloud;
+        kf.clear_origin  = clear->sensor_origin;
         kf.has_evidence  = true;
       }
       if (!kf.has_evidence)
@@ -492,15 +494,19 @@ private:
 
   void integrateKeyframe(KeyframeEvidence& kf)
   {
-    const Eigen::Vector3d origin = kf.pose * kf.sensor_origin;
+    // Use each cloud's own sensor origin: raycastPointCloud does max-range
+    // clipping relative to the origin, so hit endpoints must be judged against
+    // the hits cloud's origin, not the clear cloud's (which used to overwrite it).
     if (kf.hits && !kf.hits->empty())
     {
+      const Eigen::Vector3d origin = kf.pose * kf.hits_origin;
       CloudPtrT in_map(new CloudT);
       pcl::transformPointCloud(*kf.hits, *in_map, kf.pose.cast<float>());
       m_map->insertPointCloud(in_map, origin, "hits");
     }
     if (kf.clear && !kf.clear->empty())
     {
+      const Eigen::Vector3d origin = kf.pose * kf.clear_origin;
       CloudPtrT in_map(new CloudT);
       pcl::transformPointCloud(*kf.clear, *in_map, kf.pose.cast<float>());
       m_map->insertPointCloud(in_map, origin, "clear");
