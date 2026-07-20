@@ -22,7 +22,9 @@ int main(int argc, char* argv[])
 {
   rclcpp::init(argc, argv);
   auto vdb_mapping = std::make_shared<vdb_mapping_ros2::VDBMappingROS2>(rclcpp::NodeOptions());
-  rclcpp::spin(vdb_mapping);
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(vdb_mapping);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

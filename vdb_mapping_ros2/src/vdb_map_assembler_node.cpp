@@ -199,8 +199,8 @@ public:
         create_publisher<sensor_msgs::msg::PointCloud2>("~/survey_pointcloud", 1);
     }
 
-    m_render_timer = create_wall_timer(std::chrono::milliseconds(500),
-                                       [this] { renderIfNeeded(); });
+    m_render_timer = create_timer(std::chrono::milliseconds(500),
+                                  [this] { renderIfNeeded(); });
 
     RCLCPP_INFO(get_logger(),
                 "Map assembler up: hits=%s clear=%s traj=%s res=%.2f",

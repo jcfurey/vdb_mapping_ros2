@@ -1317,7 +1317,7 @@ void VDBMappingROS2::setUpVisualization()
   this->get_parameter("visualization_rate", visualization_rate);
   if (visualization_rate > 0.0)
   {
-    m_visualization_timer = this->create_wall_timer(
+    m_visualization_timer = this->create_timer(
       std::chrono::milliseconds(std::max(1, (int)(1000.0 / visualization_rate))),
       std::bind(&VDBMappingROS2::visualizationTimerCallback, this),
       m_visualization_cb_group);
@@ -1439,18 +1439,18 @@ void VDBMappingROS2::setUpPublishers()
     m_map_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
       "~/vdb_map_sections", rclcpp::QoS(1).durability_volatile().best_effort());
     m_section_timer =
-      this->create_wall_timer(section_update_period,
-                              std::bind(&VDBMappingROS2::sectionTimerCallback, this),
-                              m_remote_cb_group);
+      this->create_timer(section_update_period,
+                         std::bind(&VDBMappingROS2::sectionTimerCallback, this),
+                         m_remote_cb_group);
   }
   if (m_publish_full_sections)
   {
     m_map_full_section_pub = this->create_publisher<vdb_mapping_interfaces::msg::UpdateGrid>(
       "~/vdb_map_full_sections", rclcpp::QoS(1).durability_volatile().best_effort());
     m_full_section_timer =
-      this->create_wall_timer(section_update_period,
-                              std::bind(&VDBMappingROS2::fullSectionTimerCallback, this),
-                              m_remote_cb_group);
+      this->create_timer(section_update_period,
+                         std::bind(&VDBMappingROS2::fullSectionTimerCallback, this),
+                         m_remote_cb_group);
   }
 }
 
