@@ -66,7 +66,7 @@
 #include <vdb_mapping/OccupancyVDBMapping.hpp>
 #include <vdb_mapping_ros2/VDBMappingTools.hpp>
 
-// Survey map stream point (SURVEY_RADIOMETRICS_PLAN.md): wire layout matches
+// Survey map stream point: wire layout matches
 // the map_points union exactly (x@0 y@4 z@8 intensity@16 range@20
 // incidence@24, 32-byte stride).
 struct SurveyPoint
