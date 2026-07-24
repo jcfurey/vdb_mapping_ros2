@@ -73,4 +73,4 @@ if(BUILD_TESTING)
     DESTINATION lib/${PROJECT_NAME})
 endif()
 
-ament_auto_package()
+ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)
