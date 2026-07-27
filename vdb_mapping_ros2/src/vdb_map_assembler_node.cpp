@@ -37,8 +37,12 @@
  */
 
 #include <cmath>
+#include <ctime>
 #include <deque>
+#include <filesystem>
+#include <iomanip>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -53,10 +57,16 @@
 #include <pcl/filters/impl/filter.hpp>
 #include <pcl/filters/impl/voxel_grid.hpp>
 #include <pcl/impl/pcl_base.hpp>
+// PCD read/write for the custom point types: same PCL_NO_PRECOMPILE reason as
+// the filter impls above -- the prebuilt libraries carry no instantiation for
+// SurveyPoint/SurveyExportPoint, so this TU must supply its own.
+#include <pcl/io/pcd_io.h>
+#include <pcl/io/impl/pcd_io.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
@@ -82,6 +92,32 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(
   SurveyPoint,
   (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(
     float, range, range)(float, incidence, incidence))
+
+// Consolidated survey product written to PCD: the same eight fields the
+// ~/survey_pointcloud topic carries.
+//
+// This struct is deliberately NOT layout-compatible with that topic. The
+// message is packed (offsets 0,4,...,28, stride 32) while PCL_ADD_POINT4D puts
+// a 4-byte hole after z, so this is stride 48. That is fine and not worth
+// "fixing": a PCD file declares its own FIELDS/OFFSET table in the header and
+// every reader addresses fields by name, so the file is self-describing
+// regardless of in-memory padding. The topic keeps hand-packing its rows.
+struct SurveyExportPoint
+{
+  PCL_ADD_POINT4D;
+  float intensity;
+  float range;
+  float incidence;
+  float support;
+  float pose_sigma;
+  PCL_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(
+  SurveyExportPoint,
+  (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(
+    float, range, range)(float, incidence, incidence)(float, support, support)(
+    float, pose_sigma, pose_sigma))
 
 namespace vdb_mapping_ros2 {
 
@@ -127,6 +163,16 @@ public:
     declare_parameter<double>("pose_epsilon_xy", 0.05);
     declare_parameter<double>("pose_epsilon_yaw", 0.02);
     declare_parameter<int>("two_dim_projection_threshold", 3);
+    // Evidence spill. Keyframe clouds are write-once -- after append only the
+    // POSE is ever mutated -- so they can live on disk and be streamed back at
+    // render time, which is what keeps RAM flat over a long survey instead of
+    // growing linearly with keyframe count. Empty disables (clouds stay in
+    // RAM, the original behaviour).
+    declare_parameter<std::string>("spill_dir", "");
+    // Consolidated survey product, written by ~/export_survey and (optionally)
+    // at shutdown. Empty disables.
+    declare_parameter<std::string>("export_path", "");
+    declare_parameter<bool>("export_on_shutdown", true);
 
     get_parameter("resolution", m_resolution);
     get_parameter("map_frame", m_map_frame);
@@ -140,6 +186,9 @@ public:
     get_parameter("survey_resolution", m_survey_resolution);
     get_parameter("survey_occupancy_mask", m_survey_occupancy_mask);
     get_parameter("odom_frame", m_odom_frame);
+    get_parameter("export_path", m_export_path);
+    get_parameter("export_on_shutdown", m_export_on_shutdown);
+    setUpSpill();
 
     m_map = std::make_unique<VDBMapT>(m_resolution);
     vdb_mapping::Config cfg;
@@ -199,6 +248,13 @@ public:
         create_publisher<sensor_msgs::msg::PointCloud2>("~/survey_pointcloud", 1);
     }
 
+    m_export_srv = create_service<std_srvs::srv::Trigger>(
+      "~/export_survey",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        res->success = exportSurvey(res->message);
+      });
+
     m_render_timer = create_timer(std::chrono::milliseconds(500),
                                   [this] { renderIfNeeded(); });
 
@@ -219,6 +275,11 @@ private:
   {
     double stamp = 0.0;
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();  // map <- robot
+    // Cloud handles are null once the keyframe has been spilled; the counts
+    // below stay valid either way, so callers can skip a load that would
+    // return nothing. Everything else here is the ~150 bytes per keyframe
+    // that MUST stay resident: the pose is rewritten by the optimizer and is
+    // what makes a re-render possible at all.
     CloudPtrT hits;                  // robot frame
     CloudPtrT clear;
     // dense 6-field survey aggregate (ALL inter-keyframe map_points clouds,
@@ -228,6 +289,20 @@ private:
     Eigen::Vector3d clear_origin = Eigen::Vector3d::Zero();
     bool integrated = false;
     bool has_evidence = false;
+    bool spilled = false;
+    size_t n_hits = 0;
+    size_t n_clear = 0;
+    size_t n_survey = 0;
+  };
+
+  // Evidence resolved for one keyframe: either the resident handles or clouds
+  // just read back from disk. Held only for the duration of one keyframe's
+  // integration, which is what bounds render-time RAM to a single keyframe.
+  struct LoadedEvidence
+  {
+    CloudPtrT hits;
+    CloudPtrT clear;
+    SurveyCloudPtrT survey;
   };
 
   struct BufferedSurvey
@@ -235,6 +310,188 @@ private:
     double stamp;
     SurveyCloudPtrT cloud;  // in robot frame at `stamp`
   };
+
+  // Per-voxel reduction of the survey product. At class scope because the
+  // accumulator now outlives a single render (see renderIfNeeded).
+  struct VoxAcc
+  {
+    double x = 0, y = 0, z = 0, i = 0, r = 0, ci = 0;
+    int n = 0, nci = 0;
+  };
+
+  void setUpSpill()
+  {
+    std::string dir;
+    get_parameter("spill_dir", dir);
+    if (dir.empty())
+    {
+      RCLCPP_INFO(get_logger(),
+                  "Evidence spill disabled (spill_dir unset): keyframe clouds "
+                  "stay resident and RAM grows with survey length.");
+      return;
+    }
+    // Namespace every run. These files ARE the persistence, so overwriting a
+    // previous survey's keyframes is data loss; worse, a reused index would
+    // splice two trajectories into one map at render time.
+    const std::time_t now = std::time(nullptr);
+    std::tm tm_buf{};
+    localtime_r(&now, &tm_buf);
+    std::ostringstream sub;
+    sub << "run_" << std::put_time(&tm_buf, "%Y%m%d_%H%M%S");
+
+    const std::filesystem::path root = std::filesystem::path(dir) / sub.str();
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    if (ec)
+    {
+      RCLCPP_ERROR(get_logger(),
+                   "Cannot create spill directory %s (%s); keeping evidence in "
+                   "RAM instead.",
+                   root.string().c_str(), ec.message().c_str());
+      return;
+    }
+    m_spill_dir = root.string();
+    RCLCPP_INFO(get_logger(), "Spilling keyframe evidence to %s",
+                m_spill_dir.c_str());
+  }
+
+  std::string spillPath(const size_t idx, const char* kind) const
+  {
+    std::ostringstream p;
+    p << m_spill_dir << "/kf_" << std::setw(6) << std::setfill('0') << idx
+      << '_' << kind << ".pcd";
+    return p.str();
+  }
+
+  template <typename CloudPtr>
+  bool writeSpill(const CloudPtr& cloud, const std::string& path)
+  {
+    // An unorganized cloud whose width/height do not match size() writes a
+    // header that disagrees with the payload, and the read back silently
+    // returns the wrong point count.
+    cloud->width    = static_cast<uint32_t>(cloud->size());
+    cloud->height   = 1;
+    cloud->is_dense = false;
+    try
+    {
+      pcl::PCDWriter writer;
+      if (writer.writeBinary(path, *cloud) == 0)
+      {
+        return true;
+      }
+    }
+    catch (const std::exception& e)
+    {
+      RCLCPP_ERROR(get_logger(), "spill write %s failed: %s", path.c_str(),
+                   e.what());
+      return false;
+    }
+    RCLCPP_ERROR(get_logger(), "spill write %s failed", path.c_str());
+    return false;
+  }
+
+  template <typename CloudTT>
+  typename CloudTT::Ptr readSpill(const std::string& path)
+  {
+    typename CloudTT::Ptr out(new CloudTT);
+    try
+    {
+      pcl::PCDReader reader;
+      if (reader.read(path, *out) == 0)
+      {
+        return out;
+      }
+    }
+    catch (const std::exception& e)
+    {
+      RCLCPP_ERROR(get_logger(), "spill read %s failed: %s", path.c_str(),
+                   e.what());
+      out->clear();
+      return out;
+    }
+    RCLCPP_ERROR(get_logger(), "spill read %s failed", path.c_str());
+    out->clear();
+    return out;
+  }
+
+  void spillKeyframe(KeyframeEvidence& kf, const size_t idx)
+  {
+    if (m_spill_dir.empty())
+    {
+      return;
+    }
+    kf.n_hits   = kf.hits ? kf.hits->size() : 0;
+    kf.n_clear  = kf.clear ? kf.clear->size() : 0;
+    kf.n_survey = kf.survey ? kf.survey->size() : 0;
+
+    bool ok = true;
+    if (kf.n_hits > 0)
+    {
+      ok = writeSpill(kf.hits, spillPath(idx, "hits")) && ok;
+    }
+    if (kf.n_clear > 0)
+    {
+      ok = writeSpill(kf.clear, spillPath(idx, "clear")) && ok;
+    }
+    if (kf.n_survey > 0)
+    {
+      ok = writeSpill(kf.survey, spillPath(idx, "survey")) && ok;
+    }
+    if (!ok)
+    {
+      // Dropping the handles after a partial write would delete evidence that
+      // never reached disk, and every future re-render would be quietly
+      // missing this keyframe. Keep it resident: one keyframe of RAM is a
+      // cheaper failure than a map with a hole in it.
+      ++m_spill_failures;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                           "keyframe %zu spill failed; keeping it in RAM "
+                           "(%zu failures so far)",
+                           idx, m_spill_failures);
+      return;
+    }
+    kf.hits.reset();
+    kf.clear.reset();
+    kf.survey.reset();
+    kf.spilled = true;
+  }
+
+  // Resolve one keyframe's evidence, reading it back only if it was spilled
+  // and only the parts the caller will actually use.
+  LoadedEvidence loadEvidence(const KeyframeEvidence& kf, const size_t idx,
+                              const bool want_occupancy, const bool want_survey)
+  {
+    LoadedEvidence e;
+    if (!kf.spilled)
+    {
+      if (want_occupancy)
+      {
+        e.hits  = kf.hits;
+        e.clear = kf.clear;
+      }
+      if (want_survey)
+      {
+        e.survey = kf.survey;
+      }
+      return e;
+    }
+    if (want_occupancy)
+    {
+      if (kf.n_hits > 0)
+      {
+        e.hits = readSpill<CloudT>(spillPath(idx, "hits"));
+      }
+      if (kf.n_clear > 0)
+      {
+        e.clear = readSpill<CloudT>(spillPath(idx, "clear"));
+      }
+    }
+    if (want_survey && kf.n_survey > 0)
+    {
+      e.survey = readSpill<SurveyCloudT>(spillPath(idx, "survey"));
+    }
+    return e;
+  }
 
   // transform an incoming cloud into the robot frame AT THE CLOUD'S STAMP —
   // the sonar frame rides the live pivot_head (cameraHead.tilt, +/-54 deg),
@@ -398,6 +655,11 @@ private:
         {
           kf.pose = pose;
           m_dirty = true;
+          // This keyframe's points were folded into the survey accumulator at
+          // the OLD pose and there is no way to subtract one keyframe's
+          // contribution back out of a voxel mean, so the accumulator has to
+          // be rebuilt from scratch on the next render.
+          m_survey_stale = true;
         }
         continue;
       }
@@ -462,6 +724,9 @@ private:
         m_last_assoc_stamp = kf.stamp;
       }
 
+      // Spill before the move so the write sees the clouds, and key the files
+      // by the index this keyframe is about to occupy.
+      spillKeyframe(kf, m_keyframes.size());
       m_keyframes.push_back(std::move(kf));
       m_have_new = true;
     }
@@ -492,26 +757,159 @@ private:
     return (q(x) << 42) | (q(y) << 21) | q(z);
   }
 
-  void integrateKeyframe(KeyframeEvidence& kf)
+  void integrateKeyframe(KeyframeEvidence& kf, const size_t idx)
   {
+    // Scoped: the loaded clouds are released when this returns, so a full
+    // re-render holds one keyframe at a time rather than all of them.
+    const LoadedEvidence e =
+      loadEvidence(kf, idx, /*want_occupancy=*/true, /*want_survey=*/false);
     // Use each cloud's own sensor origin: raycastPointCloud does max-range
     // clipping relative to the origin, so hit endpoints must be judged against
     // the hits cloud's origin, not the clear cloud's (which used to overwrite it).
-    if (kf.hits && !kf.hits->empty())
+    if (e.hits && !e.hits->empty())
     {
       const Eigen::Vector3d origin = kf.pose * kf.hits_origin;
       CloudPtrT in_map(new CloudT);
-      pcl::transformPointCloud(*kf.hits, *in_map, kf.pose.cast<float>());
+      pcl::transformPointCloud(*e.hits, *in_map, kf.pose.cast<float>());
       m_map->insertPointCloud(in_map, origin, "hits");
     }
-    if (kf.clear && !kf.clear->empty())
+    if (e.clear && !e.clear->empty())
     {
       const Eigen::Vector3d origin = kf.pose * kf.clear_origin;
       CloudPtrT in_map(new CloudT);
-      pcl::transformPointCloud(*kf.clear, *in_map, kf.pose.cast<float>());
+      pcl::transformPointCloud(*e.clear, *in_map, kf.pose.cast<float>());
       m_map->insertPointCloud(in_map, origin, "clear");
     }
     kf.integrated = true;
+  }
+
+  void accumulateSurvey(const KeyframeEvidence& kf, const size_t idx)
+  {
+    const LoadedEvidence e =
+      loadEvidence(kf, idx, /*want_occupancy=*/false, /*want_survey=*/true);
+    if (!e.survey || e.survey->empty())
+    {
+      return;
+    }
+    SurveyCloudT in_map;
+    pcl::transformPointCloud(*e.survey, in_map, kf.pose.cast<float>());
+    for (const auto& p : in_map.points)
+    {
+      VoxAcc& a = m_vox[voxelKey(p.x, p.y, p.z, m_survey_resolution)];
+      a.x += p.x;
+      a.y += p.y;
+      a.z += p.z;
+      a.i += p.intensity;
+      a.r += p.range;
+      if (p.incidence >= 0.0f)
+      {
+        a.ci += p.incidence;
+        ++a.nci;
+      }
+      ++a.n;
+    }
+  }
+
+  // Walk the accumulated survey voxels, applying the occupancy mask, and hand
+  // each reduced 8-field row to `fn`. Shared by the topic and the PCD export
+  // so the published product and the file on disk cannot drift apart.
+  template <typename F>
+  void forEachSurveyRow(F&& fn)
+  {
+    auto grid = m_map->getGrid();  // handle first, then lock (locks internally)
+    std::shared_lock mask_lock(*m_map->getMapMutex());
+    auto acc = grid->getConstAccessor();
+    for (const auto& [key, a] : m_vox)
+    {
+      (void)key;
+      if (a.n <= 0)
+      {
+        continue;
+      }
+      const float cx = static_cast<float>(a.x / a.n);
+      const float cy = static_cast<float>(a.y / a.n);
+      const float cz = static_cast<float>(a.z / a.n);
+      if (m_survey_occupancy_mask)
+      {
+        const openvdb::Coord c =
+          openvdb::Coord::round(grid->worldToIndex(openvdb::Vec3d(cx, cy, cz)));
+        if (!(acc.isValueOn(c) && acc.getValue(c) > 0.0f))
+        {
+          continue;
+        }
+      }
+      const float row[8] = {
+        cx,
+        cy,
+        cz,
+        static_cast<float>(a.i / a.n),
+        static_cast<float>(a.r / a.n),
+        a.nci > 0 ? static_cast<float>(a.ci / a.nci) : -1.0f,
+        static_cast<float>(a.n),
+        0.0f};
+      fn(row);
+    }
+  }
+
+  // Write the consolidated survey product. Returns false with `message` set on
+  // any failure so the service reports it rather than claiming success.
+  bool exportSurvey(std::string& message)
+  {
+    if (m_export_path.empty())
+    {
+      message = "export_path is unset";
+      return false;
+    }
+    if (!m_survey_pub)
+    {
+      message = "survey stream is disabled (survey_topic unset)";
+      return false;
+    }
+    pcl::PointCloud<SurveyExportPoint> out;
+    out.reserve(m_vox.size());
+    forEachSurveyRow([&out](const float row[8]) {
+      SurveyExportPoint p;
+      p.x          = row[0];
+      p.y          = row[1];
+      p.z          = row[2];
+      p.intensity  = row[3];
+      p.range      = row[4];
+      p.incidence  = row[5];
+      p.support    = row[6];
+      p.pose_sigma = row[7];
+      out.push_back(p);
+    });
+    if (out.empty())
+    {
+      message = "nothing to export (no survey voxels)";
+      return false;
+    }
+    const std::filesystem::path path(m_export_path);
+    if (path.has_parent_path())
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(path.parent_path(), ec);
+    }
+    // Write to a sibling temp and rename: an export interrupted midway would
+    // otherwise leave a truncated file in place of the previous good one, and
+    // rename within a directory is atomic.
+    const std::string tmp = m_export_path + ".part";
+    auto cloud = out.makeShared();
+    if (!writeSpill(cloud, tmp))
+    {
+      message = "failed to write " + tmp;
+      return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec)
+    {
+      message = "failed to move " + tmp + " into place: " + ec.message();
+      return false;
+    }
+    message = "wrote " + std::to_string(out.size()) + " points to " + m_export_path;
+    RCLCPP_INFO(get_logger(), "%s", message.c_str());
+    return true;
   }
 
   void renderIfNeeded()
@@ -527,11 +925,11 @@ private:
       {
         kf.integrated = false;
       }
-      for (auto& kf : m_keyframes)
+      for (size_t i = 0; i < m_keyframes.size(); ++i)
       {
-        if (kf.has_evidence)
+        if (m_keyframes[i].has_evidence)
         {
-          integrateKeyframe(kf);
+          integrateKeyframe(m_keyframes[i], i);
         }
       }
       m_dirty            = false;
@@ -543,11 +941,11 @@ private:
     else if (m_have_new)
     {
       // append-only: integrate keyframes that haven't been rendered yet
-      for (auto& kf : m_keyframes)
+      for (size_t i = 0; i < m_keyframes.size(); ++i)
       {
-        if (kf.has_evidence && !kf.integrated)
+        if (m_keyframes[i].has_evidence && !m_keyframes[i].integrated)
         {
-          integrateKeyframe(kf);
+          integrateKeyframe(m_keyframes[i], i);
           changed = true;
         }
       }
@@ -597,36 +995,24 @@ private:
     // know it (>= 0), -1 when none do — no sentinel dilution.
     if (m_survey_pub)
     {
-      struct VoxAcc
+      // Fold in only what is new. Re-accumulating every keyframe on every
+      // render was affordable while the clouds were resident; with them on
+      // disk it would re-read the whole survey history every
+      // render_min_period. The accumulator is therefore kept across renders
+      // and discarded only when the graph moves -- which is precisely when
+      // the old contributions became wrong -- so the published product still
+      // always reflects the current optimized poses.
+      if (m_survey_stale)
       {
-        double x = 0, y = 0, z = 0, i = 0, r = 0, ci = 0;
-        int n = 0, nci = 0;
-      };
-      std::unordered_map<uint64_t, VoxAcc> vox;
-      for (const auto& kf : m_keyframes)
-      {
-        if (!kf.survey || kf.survey->empty())
-        {
-          continue;
-        }
-        SurveyCloudT in_map;
-        pcl::transformPointCloud(*kf.survey, in_map, kf.pose.cast<float>());
-        for (const auto& p : in_map.points)
-        {
-          VoxAcc& a = vox[voxelKey(p.x, p.y, p.z, m_survey_resolution)];
-          a.x += p.x;
-          a.y += p.y;
-          a.z += p.z;
-          a.i += p.intensity;
-          a.r += p.range;
-          if (p.incidence >= 0.0f)
-          {
-            a.ci += p.incidence;
-            ++a.nci;
-          }
-          ++a.n;
-        }
+        m_vox.clear();
+        m_survey_upto  = 0;
+        m_survey_stale = false;
       }
+      for (size_t i = m_survey_upto; i < m_keyframes.size(); ++i)
+      {
+        accumulateSurvey(m_keyframes[i], i);
+      }
+      m_survey_upto = m_keyframes.size();
 
       sensor_msgs::msg::PointCloud2 survey_msg;
       survey_msg.header.stamp    = stamp;
@@ -647,38 +1033,12 @@ private:
         survey_msg.fields.push_back(pf);
       }
       survey_msg.point_step = 32;
-      survey_msg.data.reserve(vox.size() * survey_msg.point_step);
+      survey_msg.data.reserve(m_vox.size() * survey_msg.point_step);
 
-      {
-        std::shared_lock mask_lock(*m_map->getMapMutex());
-        auto acc = grid->getConstAccessor();
-        for (const auto& [key, a] : vox)
-        {
-          const float cx = static_cast<float>(a.x / a.n);
-          const float cy = static_cast<float>(a.y / a.n);
-          const float cz = static_cast<float>(a.z / a.n);
-          if (m_survey_occupancy_mask)
-          {
-            const openvdb::Coord c = openvdb::Coord::round(
-              grid->worldToIndex(openvdb::Vec3d(cx, cy, cz)));
-            if (!(acc.isValueOn(c) && acc.getValue(c) > 0.0f))
-            {
-              continue;
-            }
-          }
-          const float row[8] = {
-            cx,
-            cy,
-            cz,
-            static_cast<float>(a.i / a.n),
-            static_cast<float>(a.r / a.n),
-            a.nci > 0 ? static_cast<float>(a.ci / a.nci) : -1.0f,
-            static_cast<float>(a.n),
-            0.0f};
-          const auto* bytes = reinterpret_cast<const uint8_t*>(row);
-          survey_msg.data.insert(survey_msg.data.end(), bytes, bytes + 32);
-        }
-      }
+      forEachSurveyRow([&survey_msg](const float row[8]) {
+        const auto* bytes = reinterpret_cast<const uint8_t*>(row);
+        survey_msg.data.insert(survey_msg.data.end(), bytes, bytes + 32);
+      });
       survey_msg.width    = static_cast<uint32_t>(survey_msg.data.size() /
                                                   survey_msg.point_step);
       survey_msg.row_step = survey_msg.point_step * survey_msg.width;
@@ -721,6 +1081,24 @@ private:
   bool m_have_new = false;
   double m_last_full_render = 0.0;
 
+  // Evidence spill / export. Empty spill dir = disabled (clouds stay
+  // resident); m_spill_failures counts keyframes that had to stay in RAM
+  // because their write failed.
+  std::string m_spill_dir;
+  size_t m_spill_failures = 0;
+  std::string m_export_path;
+  bool m_export_on_shutdown = true;
+
+  // Survey accumulator, persistent across renders. Unlike the keyframe
+  // evidence this is bounded by the surveyed VOLUME rather than by elapsed
+  // time -- revisiting ground merges into existing voxels instead of adding
+  // new ones -- so it saturates and is safe to keep resident. m_survey_upto
+  // is how many keyframes are already folded in; m_survey_stale forces a
+  // rebuild after the graph moves.
+  std::unordered_map<uint64_t, VoxAcc> m_vox;
+  size_t m_survey_upto = 0;
+  bool m_survey_stale  = false;
+
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_hits_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_clear_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_traj_sub;
@@ -728,7 +1106,25 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_cloud_pub;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr m_grid_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_survey_pub;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr m_export_srv;
   rclcpp::TimerBase::SharedPtr m_render_timer;
+
+public:
+  // Called from main() after spin() returns, while the node and its logger are
+  // still alive -- doing this from the destructor would run after
+  // rclcpp::shutdown() has torn the context down.
+  void exportOnShutdown()
+  {
+    if (!m_export_on_shutdown || m_export_path.empty())
+    {
+      return;
+    }
+    std::string message;
+    if (!exportSurvey(message))
+    {
+      RCLCPP_WARN(get_logger(), "shutdown export skipped: %s", message.c_str());
+    }
+  }
 };
 
 }  // namespace vdb_mapping_ros2
@@ -736,7 +1132,9 @@ private:
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<vdb_mapping_ros2::VDBMapAssembler>());
+  auto node = std::make_shared<vdb_mapping_ros2::VDBMapAssembler>();
+  rclcpp::spin(node);
+  node->exportOnShutdown();
   rclcpp::shutdown();
   return 0;
 }
