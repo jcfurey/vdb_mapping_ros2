@@ -36,6 +36,7 @@
  *    buffered evidence clouds (same source-ping stamps) to keyframes.
  */
 
+#include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <deque>
@@ -158,6 +159,11 @@ public:
     // evidence association
     declare_parameter<double>("buffer_seconds", 6.0);
     declare_parameter<double>("stamp_tolerance", 0.06);
+    declare_parameter<int>("input_queue_depth", 5);
+    declare_parameter<bool>("input_reliable", false);
+    declare_parameter<bool>("allow_latest_tf_fallback", true);
+    declare_parameter<bool>("reset_on_time_rewind", true);
+    declare_parameter<double>("time_rewind_tolerance", 0.5);
     // rendering policy
     declare_parameter<double>("render_min_period", 2.0);
     declare_parameter<double>("pose_epsilon_xy", 0.05);
@@ -179,6 +185,13 @@ public:
     get_parameter("robot_frame", m_robot_frame);
     get_parameter("buffer_seconds", m_buffer_seconds);
     get_parameter("stamp_tolerance", m_stamp_tolerance);
+    get_parameter("input_queue_depth", m_input_queue_depth);
+    get_parameter("input_reliable", m_input_reliable);
+    get_parameter("allow_latest_tf_fallback", m_allow_latest_tf_fallback);
+    get_parameter("reset_on_time_rewind", m_reset_on_time_rewind);
+    get_parameter("time_rewind_tolerance", m_time_rewind_tolerance);
+    m_input_queue_depth = std::max(1, m_input_queue_depth);
+    m_time_rewind_tolerance = std::max(0.0, m_time_rewind_tolerance);
     get_parameter("render_min_period", m_render_min_period);
     get_parameter("pose_epsilon_xy", m_pose_eps_xy);
     get_parameter("pose_epsilon_yaw", m_pose_eps_yaw);
@@ -201,6 +214,11 @@ public:
     cfg.fast_mode           = false;  // batch re-render: DDA is fine and simplest
     cfg.accumulation_period = 1.0;
     m_map->setConfig(cfg);
+    const auto ros_clock = get_clock();
+    m_map->setTimeCallback([ros_clock]() -> uint64_t {
+      return static_cast<uint64_t>(
+        std::max<int64_t>(0, ros_clock->now().nanoseconds()));
+    });
     // fill evidence: endpoints paint, rays never carve
     m_map->addInputSource("hits", 0.0, 0.0, /*ray_clearing=*/false, /*endpoint_hits=*/true);
     // clearing evidence: rays carve their full length, endpoints never paint
@@ -218,7 +236,16 @@ public:
       RCLCPP_ERROR(get_logger(), "hits_topic / clear_topic must be set");
     }
 
-    auto qos = rclcpp::QoS(5).best_effort();
+    auto qos = rclcpp::QoS(
+      rclcpp::KeepLast(static_cast<std::size_t>(m_input_queue_depth)));
+    if (m_input_reliable)
+    {
+      qos.reliable();
+    }
+    else
+    {
+      qos.best_effort();
+    }
     m_hits_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
       hits_topic, qos, [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
         bufferCloud(*msg, m_hits_buffer, true);
@@ -226,10 +253,12 @@ public:
     m_clear_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
       clear_topic, qos, [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
         bufferCloud(*msg, m_clear_buffer, false);
-      });
+    });
     // trajectory is latched by the SLAM node
     m_traj_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
-      traj_topic, rclcpp::QoS(1).reliable().transient_local(),
+      traj_topic,
+      rclcpp::QoS(rclcpp::KeepLast(static_cast<std::size_t>(m_input_queue_depth)))
+        .reliable().transient_local(),
       [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { onTrajectory(*msg); });
 
     m_cloud_pub = create_publisher<sensor_msgs::msg::PointCloud2>("~/vdb_map_pointcloud", 1);
@@ -337,7 +366,8 @@ private:
     std::tm tm_buf{};
     localtime_r(&now, &tm_buf);
     std::ostringstream sub;
-    sub << "run_" << std::put_time(&tm_buf, "%Y%m%d_%H%M%S");
+    sub << "run_" << std::put_time(&tm_buf, "%Y%m%d_%H%M%S")
+        << "_seg" << std::setw(3) << std::setfill('0') << m_replay_segment;
 
     const std::filesystem::path root = std::filesystem::path(dir) / sub.str();
     std::error_code ec;
@@ -500,6 +530,15 @@ private:
                    std::deque<BufferedCloud>& buffer,
                    const bool downsample)
   {
+    const double stamp = rclcpp::Time(msg.header.stamp).seconds();
+    double& last_stamp = downsample ? m_last_hits_stamp : m_last_clear_stamp;
+    if (observeInputStamp(stamp, last_stamp, downsample ? "hits" : "clear"))
+    {
+      // resetReplaySession invalidated references to the old buffers, but the
+      // member selected by the caller remains the same object and is safe to
+      // continue filling for the new replay segment.
+      last_stamp = stamp;
+    }
     Eigen::Isometry3d t_robot_sensor;
     if (msg.width * msg.height == 0 ||
         !lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor))
@@ -522,7 +561,7 @@ private:
       in_robot = ds;
     }
     BufferedCloud entry;
-    entry.stamp         = rclcpp::Time(msg.header.stamp).seconds();
+    entry.stamp         = stamp;
     entry.cloud         = in_robot;
     entry.sensor_origin = t_robot_sensor.translation();
     buffer.push_back(std::move(entry));
@@ -548,6 +587,14 @@ private:
     }
     catch (const tf2::TransformException&)
     {
+      if (!m_allow_latest_tf_fallback)
+      {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                             "No exact TF %s <- %s at %.9f; dropping cloud "
+                             "(latest-TF fallback disabled)",
+                             tgt.c_str(), frame.c_str(), rclcpp::Time(stamp).seconds());
+        return false;
+      }
       try
       {
         tfs = m_tf_buffer->lookupTransform(tgt, frame, tf2::TimePointZero);
@@ -571,6 +618,8 @@ private:
   // buffer a survey (map_points union) cloud in the robot frame at its stamp
   void bufferSurvey(const sensor_msgs::msg::PointCloud2& msg)
   {
+    const double stamp = rclcpp::Time(msg.header.stamp).seconds();
+    observeInputStamp(stamp, m_last_survey_stamp, "survey");
     Eigen::Isometry3d t_robot_sensor;
     if (msg.width * msg.height == 0 ||
         !lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor))
@@ -582,7 +631,7 @@ private:
     SurveyCloudPtrT in_robot(new SurveyCloudT);
     pcl::transformPointCloud(*raw, *in_robot, t_robot_sensor.cast<float>());
     BufferedSurvey entry;
-    entry.stamp = rclcpp::Time(msg.header.stamp).seconds();
+    entry.stamp = stamp;
     entry.cloud = in_robot;
     m_survey_buffer.push_back(std::move(entry));
     while (!m_survey_buffer.empty() &&
@@ -610,6 +659,58 @@ private:
     return best;
   }
 
+  // Each topic is tracked separately: a delayed cloud from one source must
+  // not look like a seek merely because another source has advanced farther.
+  // A true regression on any one stream starts a clean replay segment.
+  bool observeInputStamp(const double stamp, double& last_stamp, const char* source)
+  {
+    if (m_reset_on_time_rewind &&
+        stamp > 0.0 &&
+        last_stamp > 0.0 &&
+        stamp + m_time_rewind_tolerance < last_stamp)
+    {
+      RCLCPP_WARN(get_logger(),
+                  "%s time moved backwards by %.3f s; starting a clean map "
+                  "assembler replay segment",
+                  source, last_stamp - stamp);
+      resetReplaySession();
+      last_stamp = stamp;
+      return true;
+    }
+    last_stamp = std::max(last_stamp, stamp);
+    return false;
+  }
+
+  void resetReplaySession()
+  {
+    m_hits_buffer.clear();
+    m_clear_buffer.clear();
+    m_survey_buffer.clear();
+    m_keyframes.clear();
+    m_vox.clear();
+    m_map->resetMap();
+
+    m_keyframes_without_evidence = 0;
+    m_full_renders = 0;
+    m_dirty = false;
+    m_have_new = false;
+    m_last_full_render = 0.0;
+    m_last_assoc_stamp = 0.0;
+    m_survey_upto = 0;
+    m_survey_stale = false;
+    m_last_hits_stamp = 0.0;
+    m_last_clear_stamp = 0.0;
+    m_last_survey_stamp = 0.0;
+    m_last_traj_stamp = 0.0;
+    m_spill_failures = 0;
+
+    // Keep old segment files recoverable and write replayed evidence into a
+    // fresh namespace so repeated keyframe indices never overwrite or splice.
+    ++m_replay_segment;
+    m_spill_dir.clear();
+    setUpSpill();
+  }
+
   void onTrajectory(const sensor_msgs::msg::PointCloud2& msg)
   {
     // require all consumed fields: a PointCloud2ConstIterator throws
@@ -631,6 +732,7 @@ private:
     }
 
     const double msg_stamp = rclcpp::Time(msg.header.stamp).seconds();
+    observeInputStamp(msg_stamp, m_last_traj_stamp, "trajectory");
     sensor_msgs::PointCloud2ConstIterator<float> ix(msg, "x"), iy(msg, "y"), iz(msg, "z"),
       iroll(msg, "roll"), ipitch(msg, "pitch"), iyaw(msg, "yaw"), ii(msg, "i"),
       it(msg, "t");
@@ -1057,6 +1159,11 @@ private:
   std::string m_robot_frame;
   double m_buffer_seconds   = 6.0;
   double m_stamp_tolerance  = 0.06;
+  int m_input_queue_depth   = 5;
+  bool m_input_reliable = false;
+  bool m_allow_latest_tf_fallback = true;
+  bool m_reset_on_time_rewind = true;
+  double m_time_rewind_tolerance = 0.5;
   double m_render_min_period = 2.0;
   double m_pose_eps_xy      = 0.05;
   double m_pose_eps_yaw     = 0.02;
@@ -1086,6 +1193,7 @@ private:
   // because their write failed.
   std::string m_spill_dir;
   size_t m_spill_failures = 0;
+  size_t m_replay_segment = 0;
   std::string m_export_path;
   bool m_export_on_shutdown = true;
 
@@ -1098,6 +1206,10 @@ private:
   std::unordered_map<uint64_t, VoxAcc> m_vox;
   size_t m_survey_upto = 0;
   bool m_survey_stale  = false;
+  double m_last_hits_stamp = 0.0;
+  double m_last_clear_stamp = 0.0;
+  double m_last_survey_stamp = 0.0;
+  double m_last_traj_stamp = 0.0;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_hits_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_clear_sub;

@@ -203,6 +203,28 @@ void VDBMappingROS2::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPt
                           error);
     return;
   }
+
+  const int64_t stamp_ns = rclcpp::Time(cloud_msg->header.stamp).nanoseconds();
+  const int64_t rewind_tolerance_ns =
+    static_cast<int64_t>(std::llround(m_time_rewind_tolerance * 1.0e9));
+  const auto previous_stamp = m_last_input_stamp_ns.find(sensor_source.source_id);
+  const int64_t previous_stamp_ns =
+    previous_stamp == m_last_input_stamp_ns.end() ? 0 : previous_stamp->second;
+  if (m_reset_on_time_rewind &&
+      stamp_ns > 0 &&
+      previous_stamp_ns > 0 &&
+      stamp_ns + rewind_tolerance_ns < previous_stamp_ns)
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "Input source %s moved backwards by %.3f s; resetting VDB replay session",
+                sensor_source.source_id.c_str(),
+                static_cast<double>(previous_stamp_ns - stamp_ns) * 1.0e-9);
+    m_vdb_map->resetMap();
+    m_last_input_stamp_ns.clear();
+  }
+  auto& source_stamp_ns = m_last_input_stamp_ns[sensor_source.source_id];
+  source_stamp_ns = std::max(source_stamp_ns, stamp_ns);
+
   VDBMapT::PointCloudT::Ptr cloud(new VDBMapT::PointCloudT);
   pcl::fromROSMsg(*cloud_msg, *cloud);
   geometry_msgs::msg::TransformStamped cloud_origin_tf;
@@ -258,11 +280,23 @@ void VDBMappingROS2::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPt
     }
     cloud->header.frame_id = m_map_frame;
   }
-  m_vdb_map->addDataToAccumulate(
-    cloud, tf2::transformToEigen(cloud_origin_tf).translation(), sensor_source.source_id);
-  if (!m_accumulate_updates)
+  const Eigen::Vector3d sensor_origin = tf2::transformToEigen(cloud_origin_tf).translation();
+  if (m_deterministic_input)
   {
+    // The live accumulator deliberately keeps only the newest pending sample
+    // to minimize latency. That is the wrong contract for recorded data:
+    // integrate the complete delivered sequence before accepting the next
+    // callback so host load and playback rate cannot select the map inputs.
+    m_vdb_map->accumulateUpdate(cloud, sensor_origin, sensor_source.source_id);
     m_vdb_map->integrateUpdate();
+  }
+  else
+  {
+    m_vdb_map->addDataToAccumulate(cloud, sensor_origin, sensor_source.source_id);
+    if (!m_accumulate_updates)
+    {
+      m_vdb_map->integrateUpdate();
+    }
   }
 }
 
@@ -1044,6 +1078,14 @@ void VDBMappingROS2::setUpVDBMap()
   this->get_parameter("resolution", m_resolution);
   m_vdb_map = std::make_shared<VDBMapT>(m_resolution);
   trySetLogCallback(*m_vdb_map, this->get_logger(), 0);
+  // The generic library deliberately has no ROS dependency. Supply the node
+  // clock here so its deadlines follow /clock during replay and ordinary ROS
+  // time on the live vehicle.
+  const auto ros_clock = get_clock();
+  m_vdb_map->setTimeCallback([ros_clock]() -> uint64_t {
+    return static_cast<uint64_t>(
+      std::max<int64_t>(0, ros_clock->now().nanoseconds()));
+  });
 
   this->declare_parameter<double>("max_range", 10.0);
   this->get_parameter("max_range", m_config.max_range);
@@ -1061,6 +1103,18 @@ void VDBMappingROS2::setUpVDBMap()
   this->get_parameter("two_dim_projection_threshold", m_two_dim_projection_threshold);
   this->declare_parameter<double>("tf_lookup_timeout", 0.1);
   this->get_parameter("tf_lookup_timeout", m_tf_lookup_timeout);
+  this->declare_parameter<bool>("deterministic_input", false);
+  this->get_parameter("deterministic_input", m_deterministic_input);
+  this->declare_parameter<bool>("reset_on_time_rewind", true);
+  this->get_parameter("reset_on_time_rewind", m_reset_on_time_rewind);
+  this->declare_parameter<double>("time_rewind_tolerance", 0.5);
+  this->get_parameter("time_rewind_tolerance", m_time_rewind_tolerance);
+  this->declare_parameter<int>("input_queue_depth", 5);
+  this->get_parameter("input_queue_depth", m_input_queue_depth);
+  this->declare_parameter<bool>("force_reliable_input", false);
+  this->get_parameter("force_reliable_input", m_force_reliable_input);
+  m_time_rewind_tolerance = std::max(0.0, m_time_rewind_tolerance);
+  m_input_queue_depth = std::max(1, m_input_queue_depth);
   this->declare_parameter<double>("max_raytrace_length", 1000.0);
   this->get_parameter("max_raytrace_length", m_max_raytrace_length);
   if (m_max_raytrace_length <= 0.0)
@@ -1194,8 +1248,9 @@ void VDBMappingROS2::setUpLocalSources()
   opt.callback_group = m_accumulation_cb_group;
   for (const SensorSource& stored : m_sensor_sources)
   {
-    rclcpp::QoS qos_profile(1);
-    if (stored.reliable)
+    rclcpp::QoS qos_profile(
+      rclcpp::KeepLast(static_cast<std::size_t>(m_input_queue_depth)));
+    if (stored.reliable || m_force_reliable_input)
     {
       qos_profile = qos_profile.durability_volatile().reliable();
     }

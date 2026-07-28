@@ -213,6 +213,17 @@ private:
   // Only declared/read when apply_raw_sensor_data is true; keep a defined
   // value on the pure-remote path.
   bool m_accumulate_updates = false;
+  // Replay mode processes every cloud synchronously instead of handing it to
+  // the live latest-sample worker. This makes the map independent of host CPU
+  // scheduling and bag playback rate.
+  bool m_deterministic_input = false;
+  bool m_reset_on_time_rewind = true;
+  double m_time_rewind_tolerance = 0.5;
+  int m_input_queue_depth = 5;
+  bool m_force_reliable_input = false;
+  // Track each source independently: hits and clearing clouds are not
+  // guaranteed to be delivered in lockstep, especially during replay.
+  std::map<std::string, int64_t> m_last_input_stamp_ns;
   int m_remote_section_smoothing_iterations;
 
   std::map<std::string, std::shared_ptr<RemoteSource>> m_remote_sources;
