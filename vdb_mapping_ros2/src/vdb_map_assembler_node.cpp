@@ -284,9 +284,13 @@ public:
         .reliable().transient_local(),
       [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { onTrajectory(*msg); });
 
-    m_cloud_pub = create_publisher<sensor_msgs::msg::PointCloud2>("~/vdb_map_pointcloud", 1);
-    m_grid_pub =
-      create_publisher<nav_msgs::msg::OccupancyGrid>("~/vdb_map_occupancy", 1);
+    // These are complete map snapshots, not observations. Latch the latest
+    // render so Nav2/RViz consumers that start later receive current state.
+    const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
+    m_cloud_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
+      "~/vdb_map_pointcloud", map_qos);
+    m_grid_pub = create_publisher<nav_msgs::msg::OccupancyGrid>(
+      "~/vdb_map_occupancy", map_qos);
 
     std::string survey_topic;
     get_parameter("survey_topic", survey_topic);
@@ -296,8 +300,8 @@ public:
         survey_topic, qos, [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
           bufferSurvey(*msg);
         });
-      m_survey_pub =
-        create_publisher<sensor_msgs::msg::PointCloud2>("~/survey_pointcloud", 1);
+      m_survey_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "~/survey_pointcloud", map_qos);
     }
 
     m_export_srv = create_service<std_srvs::srv::Trigger>(
