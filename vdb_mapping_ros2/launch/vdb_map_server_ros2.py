@@ -1,12 +1,18 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
 
 
 def generate_launch_description():
     ld = LaunchDescription()
+    ld.add_action(DeclareLaunchArgument(
+        'use_sim_time',
+        default_value=EnvironmentVariable('use_sim_time', default_value='False'),
+    ))
 
     config = os.path.join(
             get_package_share_directory('vdb_mapping_ros2'),
@@ -24,7 +30,10 @@ def generate_launch_description():
                 package='vdb_mapping_ros2',
                 plugin='vdb_mapping_ros2::VDBMappingROS2',
                 name='vdb_mapping',
-                parameters=[config],
+                parameters=[
+                    config,
+                    {'use_sim_time': LaunchConfiguration('use_sim_time')},
+                ],
             )
         ],
         output='screen',
