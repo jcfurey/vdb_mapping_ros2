@@ -37,6 +37,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <ctime>
 #include <deque>
@@ -77,32 +78,42 @@
 #include <vdb_mapping/OccupancyVDBMapping.hpp>
 #include <vdb_mapping_ros2/VDBMappingTools.hpp>
 
-// Survey map stream point: wire layout matches
-// the map_points union exactly (x@0 y@4 z@8 intensity@16 range@20
-// incidence@24, 32-byte stride).
+// Survey stream point. The PointXYZI-compatible prefix is followed by
+// radiometric texture moments and elevation uncertainty. PCL addresses fields
+// by name, so the in-memory padding need not match sonar_proc's packed
+// PointCloud2 stride.
 struct SurveyPoint
 {
   PCL_ADD_POINT4D;
   float intensity;
   float range;
   float incidence;
+  float texture;
+  float texture_squared;
+  float elevation_lo_offset;
+  float elevation_hi_offset;
+  float elevation_resolved;
   PCL_MAKE_ALIGNED_OPERATOR_NEW
 } EIGEN_ALIGN16;
 
 POINT_CLOUD_REGISTER_POINT_STRUCT(
   SurveyPoint,
   (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(
-    float, range, range)(float, incidence, incidence))
+    float, range, range)(float, incidence, incidence)(float, texture, texture)(
+    float, texture_squared, texture_squared)(
+    float, elevation_lo_offset, elevation_lo_offset)(
+    float, elevation_hi_offset, elevation_hi_offset)(
+    float, elevation_resolved, elevation_resolved))
 
-// Consolidated survey product written to PCD: the same eight fields the
+// Consolidated survey product written to PCD: the same thirteen fields the
 // ~/survey_pointcloud topic carries.
 //
 // This struct is deliberately NOT layout-compatible with that topic. The
-// message is packed (offsets 0,4,...,28, stride 32) while PCL_ADD_POINT4D puts
-// a 4-byte hole after z, so this is stride 48. That is fine and not worth
-// "fixing": a PCD file declares its own FIELDS/OFFSET table in the header and
-// every reader addresses fields by name, so the file is self-describing
-// regardless of in-memory padding. The topic keeps hand-packing its rows.
+// message is tightly packed while PCL_ADD_POINT4D puts a 4-byte hole after z.
+// That is fine and not worth "fixing": a PCD file declares its own field table
+// in the header and every reader addresses fields by name, so the file is
+// self-describing regardless of in-memory padding. The topic keeps
+// hand-packing its rows.
 struct SurveyExportPoint
 {
   PCL_ADD_POINT4D;
@@ -111,6 +122,11 @@ struct SurveyExportPoint
   float incidence;
   float support;
   float pose_sigma;
+  float texture;
+  float texture_variance;
+  float elevation_lo_offset;
+  float elevation_hi_offset;
+  float elevation_resolved_fraction;
   PCL_MAKE_ALIGNED_OPERATOR_NEW
 } EIGEN_ALIGN16;
 
@@ -118,9 +134,16 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(
   SurveyExportPoint,
   (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(
     float, range, range)(float, incidence, incidence)(float, support, support)(
-    float, pose_sigma, pose_sigma))
+    float, pose_sigma, pose_sigma)(float, texture, texture)(
+    float, texture_variance, texture_variance)(
+    float, elevation_lo_offset, elevation_lo_offset)(
+    float, elevation_hi_offset, elevation_hi_offset)(
+    float, elevation_resolved_fraction, elevation_resolved_fraction))
 
 namespace vdb_mapping_ros2 {
+
+constexpr std::size_t kSurveyOutputFields = 13;
+using SurveyRow = std::array<float, kSurveyOutputFields>;
 
 class VDBMapAssembler : public rclcpp::Node
 {
@@ -146,9 +169,9 @@ public:
     declare_parameter<std::string>("hits_topic", "");
     declare_parameter<std::string>("clear_topic", "");
     declare_parameter<std::string>("traj_topic", "/bruce/slam/slam/traj");
-    // Dense graph-anchored SURVEY product: subscribe the 6-field map_points
-    // union, aggregate ALL inter-keyframe clouds into each keyframe's frame
-    // (odom-delta transforms), and re-render the intensity cloud at the
+    // Dense graph-anchored SURVEY product: aggregate ALL inter-keyframe
+    // survey clouds into each keyframe's frame (odom-delta transforms), then
+    // re-render intensity, texture moments and elevation uncertainty at the
     // optimized poses alongside the occupancy map. Empty disables.
     declare_parameter<std::string>("survey_topic", "");
     declare_parameter<double>("survey_resolution", 0.05);
@@ -311,7 +334,7 @@ private:
     // what makes a re-render possible at all.
     CloudPtrT hits;                  // robot frame
     CloudPtrT clear;
-    // dense 6-field survey aggregate (ALL inter-keyframe map_points clouds,
+    // dense survey aggregate (ALL inter-keyframe survey_points clouds,
     // odom-delta transformed into THIS keyframe's robot frame)
     SurveyCloudPtrT survey;
     Eigen::Vector3d hits_origin  = Eigen::Vector3d::Zero();
@@ -345,7 +368,10 @@ private:
   struct VoxAcc
   {
     double x = 0, y = 0, z = 0, i = 0, r = 0, ci = 0;
-    int n = 0, nci = 0;
+    double texture = 0, texture_squared = 0;
+    double elevation_lo = 0, elevation_hi = 0;
+    double elevation_resolved = 0;
+    int n = 0, nci = 0, ntexture = 0, nelevation = 0;
   };
 
   void setUpSpill()
@@ -615,7 +641,8 @@ private:
     return true;
   }
 
-  // buffer a survey (map_points union) cloud in the robot frame at its stamp
+  // Buffer a rich survey_points cloud in the robot frame at its stamp. Scalar
+  // texture/elevation attributes ride through the coordinate transform.
   void bufferSurvey(const sensor_msgs::msg::PointCloud2& msg)
   {
     const double stamp = rclcpp::Time(msg.header.stamp).seconds();
@@ -908,6 +935,25 @@ private:
         a.ci += p.incidence;
         ++a.nci;
       }
+      if (std::isfinite(p.texture) && std::isfinite(p.texture_squared))
+      {
+        a.texture += p.texture;
+        a.texture_squared += p.texture_squared;
+        ++a.ntexture;
+      }
+      if (std::isfinite(p.elevation_lo_offset) &&
+          std::isfinite(p.elevation_hi_offset) &&
+          std::isfinite(p.elevation_resolved))
+      {
+        // Store absolute bounds while accumulating so the final offsets are
+        // relative to the reduced voxel centroid, not to whichever source
+        // representative happened to arrive first.
+        a.elevation_lo += p.z + p.elevation_lo_offset;
+        a.elevation_hi += p.z + p.elevation_hi_offset;
+        a.elevation_resolved +=
+          std::clamp(static_cast<double>(p.elevation_resolved), 0.0, 1.0);
+        ++a.nelevation;
+      }
       ++a.n;
     }
   }
@@ -940,7 +986,14 @@ private:
           continue;
         }
       }
-      const float row[8] = {
+      const float texture =
+        a.ntexture > 0 ? static_cast<float>(a.texture / a.ntexture) : 0.0f;
+      const double texture_variance =
+        a.ntexture > 0
+          ? a.texture_squared / a.ntexture -
+              static_cast<double>(texture) * texture
+          : 0.0;
+      const SurveyRow row = {
         cx,
         cy,
         cz,
@@ -948,7 +1001,18 @@ private:
         static_cast<float>(a.r / a.n),
         a.nci > 0 ? static_cast<float>(a.ci / a.nci) : -1.0f,
         static_cast<float>(a.n),
-        0.0f};
+        0.0f,
+        texture,
+        static_cast<float>(std::max(0.0, texture_variance)),
+        a.nelevation > 0
+          ? static_cast<float>(a.elevation_lo / a.nelevation - cz)
+          : 0.0f,
+        a.nelevation > 0
+          ? static_cast<float>(a.elevation_hi / a.nelevation - cz)
+          : 0.0f,
+        a.nelevation > 0
+          ? static_cast<float>(a.elevation_resolved / a.nelevation)
+          : 0.0f};
       fn(row);
     }
   }
@@ -969,7 +1033,7 @@ private:
     }
     pcl::PointCloud<SurveyExportPoint> out;
     out.reserve(m_vox.size());
-    forEachSurveyRow([&out](const float row[8]) {
+    forEachSurveyRow([&out](const SurveyRow& row) {
       SurveyExportPoint p;
       p.x          = row[0];
       p.y          = row[1];
@@ -979,6 +1043,11 @@ private:
       p.incidence  = row[5];
       p.support    = row[6];
       p.pose_sigma = row[7];
+      p.texture = row[8];
+      p.texture_variance = row[9];
+      p.elevation_lo_offset = row[10];
+      p.elevation_hi_offset = row[11];
+      p.elevation_resolved_fraction = row[12];
       out.push_back(p);
     });
     if (out.empty())
@@ -1084,12 +1153,14 @@ private:
     m_cloud_pub->publish(cloud_msg);
     m_grid_pub->publish(grid_msg);
 
-    // Graph-anchored dense SURVEY render: keyframe-local 6-field clouds at
+    // Graph-anchored dense SURVEY render: keyframe-local rich survey clouds at
     // the CURRENT optimized poses, aggregated by a support-counting voxel
     // pass (pcl::VoxelGrid cannot emit counts) and optionally masked to
     // occupied voxels so the clearing evidence scrubs transients out of the
-    // survey product too. Output layout (8 float32 fields, 32-byte stride):
-    //   x y z intensity range incidence support pose_sigma
+    // survey product too. Output layout (13 float32 fields, 52-byte stride):
+    //   x y z intensity range incidence support pose_sigma texture
+    //   texture_variance elevation_lo_offset elevation_hi_offset
+    //   elevation_resolved_fraction
     // `support` = points merged into the voxel (observation density —
     // per-voxel confidence and the coverage measure in one field);
     // `pose_sigma` is RESERVED (0) until the trajectory topic carries
@@ -1122,10 +1193,21 @@ private:
       survey_msg.height          = 1;
       survey_msg.is_bigendian    = false;
       survey_msg.is_dense        = true;
-      static const char* names[8] = {"x",     "y",         "z",
-                                     "intensity", "range", "incidence",
-                                     "support",   "pose_sigma"};
-      for (int f = 0; f < 8; ++f)
+      static const char* names[kSurveyOutputFields] = {
+        "x",
+        "y",
+        "z",
+        "intensity",
+        "range",
+        "incidence",
+        "support",
+        "pose_sigma",
+        "texture",
+        "texture_variance",
+        "elevation_lo_offset",
+        "elevation_hi_offset",
+        "elevation_resolved_fraction"};
+      for (std::size_t f = 0; f < kSurveyOutputFields; ++f)
       {
         sensor_msgs::msg::PointField pf;
         pf.name     = names[f];
@@ -1134,12 +1216,16 @@ private:
         pf.count    = 1;
         survey_msg.fields.push_back(pf);
       }
-      survey_msg.point_step = 32;
+      survey_msg.point_step =
+        static_cast<uint32_t>(kSurveyOutputFields * sizeof(float));
       survey_msg.data.reserve(m_vox.size() * survey_msg.point_step);
 
-      forEachSurveyRow([&survey_msg](const float row[8]) {
-        const auto* bytes = reinterpret_cast<const uint8_t*>(row);
-        survey_msg.data.insert(survey_msg.data.end(), bytes, bytes + 32);
+      forEachSurveyRow([&survey_msg](const SurveyRow& row) {
+        const auto* bytes =
+          reinterpret_cast<const uint8_t*>(row.data());
+        survey_msg.data.insert(
+          survey_msg.data.end(), bytes,
+          bytes + kSurveyOutputFields * sizeof(float));
       });
       survey_msg.width    = static_cast<uint32_t>(survey_msg.data.size() /
                                                   survey_msg.point_step);
