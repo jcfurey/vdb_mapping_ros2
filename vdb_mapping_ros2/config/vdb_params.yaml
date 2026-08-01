@@ -7,8 +7,11 @@
     resolution: 0.05
     prob_hit: 0.7
     prob_miss: 0.4
-    prob_thres_min: 0.12
-    prob_thres_max: 0.97
+    # Activation thresholds (occupied above max, free below min). NOT the
+    # OctoMap 0.12/0.97 pair — those are Eq. 4 CLAMPING bounds; used here
+    # they cost ~5 accumulation windows before an obstacle appears at all.
+    prob_thres_min: 0.49
+    prob_thres_max: 0.51
     map_directory_path: ""
     fast_mode: true
 

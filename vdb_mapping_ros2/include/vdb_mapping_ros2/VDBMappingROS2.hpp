@@ -203,13 +203,13 @@ private:
   std::shared_ptr<VDBMapT> m_vdb_map;
   vdb_mapping::Config m_config;
 
-  bool m_publish_pointcloud;
-  bool m_publish_vis_marker;
-  bool m_publish_occupancy_grid;
-  bool m_publish_sections;
-  bool m_publish_full_sections;
-  bool m_apply_raw_sensor_data;
-  bool m_smooth_remote_sections;
+  bool m_publish_pointcloud{false};
+  bool m_publish_vis_marker{false};
+  bool m_publish_occupancy_grid{false};
+  bool m_publish_sections{false};
+  bool m_publish_full_sections{false};
+  bool m_apply_raw_sensor_data{false};
+  bool m_smooth_remote_sections{false};
   // Only declared/read when apply_raw_sensor_data is true; keep a defined
   // value on the pure-remote path.
   bool m_accumulate_updates = false;

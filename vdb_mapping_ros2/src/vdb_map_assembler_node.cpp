@@ -78,32 +78,11 @@
 #include <vdb_mapping/OccupancyVDBMapping.hpp>
 #include <vdb_mapping_ros2/VDBMappingTools.hpp>
 
-// Survey stream point. The PointXYZI-compatible prefix is followed by
-// radiometric texture moments and elevation uncertainty. PCL addresses fields
-// by name, so the in-memory padding need not match sonar_proc's packed
-// PointCloud2 stride.
-struct SurveyPoint
-{
-  PCL_ADD_POINT4D;
-  float intensity;
-  float range;
-  float incidence;
-  float texture;
-  float texture_squared;
-  float elevation_lo_offset;
-  float elevation_hi_offset;
-  float elevation_resolved;
-  PCL_MAKE_ALIGNED_OPERATOR_NEW
-} EIGEN_ALIGN16;
-
-POINT_CLOUD_REGISTER_POINT_STRUCT(
-  SurveyPoint,
-  (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(
-    float, range, range)(float, incidence, incidence)(float, texture, texture)(
-    float, texture_squared, texture_squared)(
-    float, elevation_lo_offset, elevation_lo_offset)(
-    float, elevation_hi_offset, elevation_hi_offset)(
-    float, elevation_resolved, elevation_resolved))
+// SurveyPoint and its all-fields voxel reduction live in survey_voxel.hpp:
+// pcl::VoxelGrid's closed accumulator set silently zeroed every custom field
+// (texture moments, elevation bounds, range, incidence) during reduction,
+// and the zeros passed every downstream validity guard.
+#include <vdb_mapping_ros2/survey_voxel.hpp>
 
 // Consolidated survey product written to PCD: the same thirteen fields the
 // ~/survey_pointcloud topic carries.
@@ -191,6 +170,7 @@ public:
     declare_parameter<double>("render_min_period", 2.0);
     declare_parameter<double>("pose_epsilon_xy", 0.05);
     declare_parameter<double>("pose_epsilon_yaw", 0.02);
+    declare_parameter<double>("pose_epsilon_z", 0.05);
     declare_parameter<int>("two_dim_projection_threshold", 3);
     // Evidence spill. Keyframe clouds are write-once -- after append only the
     // POSE is ever mutated -- so they can live on disk and be streamed back at
@@ -218,6 +198,7 @@ public:
     get_parameter("render_min_period", m_render_min_period);
     get_parameter("pose_epsilon_xy", m_pose_eps_xy);
     get_parameter("pose_epsilon_yaw", m_pose_eps_yaw);
+    get_parameter("pose_epsilon_z", m_pose_eps_z);
     get_parameter("two_dim_projection_threshold", m_two_dim_projection_threshold);
     get_parameter("survey_resolution", m_survey_resolution);
     get_parameter("survey_occupancy_mask", m_survey_occupancy_mask);
@@ -783,7 +764,11 @@ private:
         auto& kf                    = m_keyframes[idx];
         const Eigen::Vector3d dxyz  = pose.translation() - kf.pose.translation();
         const Eigen::AngleAxisd rot(kf.pose.rotation().transpose() * pose.rotation());
+        // z has its own epsilon: a depth-only SLAM correction moves the
+        // whole elevation product, and the xy/yaw gate used to swallow it —
+        // the map stayed anchored at unoptimized depths forever.
         if (dxyz.head<2>().norm() > m_pose_eps_xy ||
+            std::fabs(dxyz.z()) > m_pose_eps_z ||
             std::fabs(rot.angle()) > m_pose_eps_yaw)
         {
           kf.pose = pose;
@@ -853,8 +838,22 @@ private:
           {
             kf.survey = voxelSurvey(agg, static_cast<float>(m_survey_resolution));
           }
+          // Advance past the acceptance window's UPPER edge: advancing only
+          // to kf.stamp left (kf.stamp, kf.stamp + tolerance] eligible for
+          // this keyframe AND the next — the same clouds re-anchored through
+          // two poses, inflating support. And advance only on a successful
+          // odom lookup: on failure the batch stays buffered for the next
+          // keyframe instead of being silently unassociated forever.
+          m_last_assoc_stamp = kf.stamp + m_stamp_tolerance;
         }
-        m_last_assoc_stamp = kf.stamp;
+        else
+        {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 10000,
+            "keyframe odom lookup failed at %.3f; holding %zu survey clouds "
+            "for the next keyframe",
+            kf.stamp, m_survey_buffer.size());
+        }
       }
 
       // Spill before the move so the write sees the clouds, and key the files
@@ -867,16 +866,9 @@ private:
 
   static SurveyCloudPtrT voxelSurvey(const SurveyCloudPtrT& in, const float leaf)
   {
-    if (!in || in->empty() || leaf <= 0.0f)
-    {
-      return in;
-    }
-    pcl::VoxelGrid<SurveyPoint> vg;
-    vg.setLeafSize(leaf, leaf, leaf);
-    vg.setInputCloud(in);
-    SurveyCloudPtrT out(new SurveyCloudT);
-    vg.filter(*out);
-    return out;
+    // NOT pcl::VoxelGrid: its centroid accumulators are a closed set and
+    // value-initialize every custom field to 0.0 — see survey_voxel.hpp.
+    return voxelReduceSurvey(in, leaf);
   }
 
   // 21 bits per axis (signed, two's-complement low bits) -> +/-1M cells,
@@ -1035,6 +1027,18 @@ private:
       message = "survey stream is disabled (survey_topic unset)";
       return false;
     }
+    // Never serialize a stale product: a trajectory update that landed
+    // within render_min_period of this call (shutdown included) would
+    // otherwise leave the occupancy mask and the accumulator at the old
+    // poses, with nothing logged. Force the render path, then fold anything
+    // the accumulator has not seen.
+    if (m_dirty || m_have_new)
+    {
+      m_last_full_render = -std::numeric_limits<double>::infinity();
+      renderIfNeeded();
+    }
+    syncSurveyAccumulator();
+
     pcl::PointCloud<SurveyExportPoint> out;
     out.reserve(m_vox.size());
     forEachSurveyRow([&out](const SurveyRow& row) {
@@ -1085,6 +1089,30 @@ private:
     message = "wrote " + std::to_string(out.size()) + " points to " + m_export_path;
     RCLCPP_INFO(get_logger(), "%s", message.c_str());
     return true;
+  }
+
+  // Bring the survey accumulator up to date with the keyframe list: rebuild
+  // from scratch when the graph moved (the old contributions are wrong),
+  // then fold any keyframes it has not seen. Shared by the render path and
+  // the export path so neither can read a lagging accumulator — survey-only
+  // keyframes used to wait for the next OCCUPANCY change to be folded in.
+  void syncSurveyAccumulator()
+  {
+    if (!m_survey_pub)
+    {
+      return;
+    }
+    if (m_survey_stale)
+    {
+      m_vox.clear();
+      m_survey_upto  = 0;
+      m_survey_stale = false;
+    }
+    for (size_t i = m_survey_upto; i < m_keyframes.size(); ++i)
+    {
+      accumulateSurvey(m_keyframes[i], i);
+    }
+    m_survey_upto = m_keyframes.size();
   }
 
   void renderIfNeeded()
@@ -1179,17 +1207,7 @@ private:
       // and discarded only when the graph moves -- which is precisely when
       // the old contributions became wrong -- so the published product still
       // always reflects the current optimized poses.
-      if (m_survey_stale)
-      {
-        m_vox.clear();
-        m_survey_upto  = 0;
-        m_survey_stale = false;
-      }
-      for (size_t i = m_survey_upto; i < m_keyframes.size(); ++i)
-      {
-        accumulateSurvey(m_keyframes[i], i);
-      }
-      m_survey_upto = m_keyframes.size();
+      syncSurveyAccumulator();
 
       sensor_msgs::msg::PointCloud2 survey_msg;
       survey_msg.header.stamp    = stamp;
@@ -1257,6 +1275,7 @@ private:
   double m_render_min_period = 2.0;
   double m_pose_eps_xy      = 0.05;
   double m_pose_eps_yaw     = 0.02;
+  double m_pose_eps_z       = 0.05;
   int m_two_dim_projection_threshold = 3;
 
   double m_survey_resolution   = 0.05;

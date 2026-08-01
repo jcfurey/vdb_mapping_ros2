@@ -128,9 +128,14 @@ VDBMappingROS2::VDBMappingROS2(const rclcpp::NodeOptions& options)
 
   setUpVDBMap();
   setUpRemoteSources();
+  // Publishers (and the m_publish_* flags they read) must exist before the
+  // visualization timer and the services go live: resetMap/loadMap fire
+  // publishMap(), and a service call or timer tick in the init window read
+  // uninitialized flags and dereferenced null publishers — the same failure
+  // class the cloud-subscription ordering below already guards against.
+  setUpPublishers();
   setUpVisualization();
   setUpServices();
-  setUpPublishers();
   setUpMapServer();
   // Local cloud subscriptions go live last: cloudCallback runs on
   // m_accumulation_cb_group on a separate executor thread the moment the

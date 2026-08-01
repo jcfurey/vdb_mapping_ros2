@@ -60,6 +60,16 @@ install(DIRECTORY
 
 
 if(BUILD_TESTING)
+  # Survey voxel reduction: every field must survive (pcl::VoxelGrid zeroed
+  # the custom ones), sentinels must neither dilute nor fabricate.
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_survey_voxel test/unit/test_survey_voxel.cpp)
+  if(TARGET test_survey_voxel)
+    target_include_directories(test_survey_voxel PRIVATE include)
+    target_link_libraries(test_survey_voxel ${PCL_LIBRARIES})
+    ament_target_dependencies(test_survey_voxel pcl_conversions)
+  endif()
+
   # End-to-end launch tests: start a vdb_mapping_ros_node, feed it a synthetic
   # wall cloud and validate the published occupancy grid / marker and the
   # raytrace + get_map_section services against the known geometry.
