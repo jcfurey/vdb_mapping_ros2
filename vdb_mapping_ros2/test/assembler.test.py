@@ -41,6 +41,9 @@ def generate_test_description():
             'render_min_period': 0.2,
             'input_reliable': True,
             'export_on_shutdown': False,
+            # spill evidence to disk so the z-correction re-render in stage 2
+            # exercises the readSpill round-trip, not just resident clouds
+            'spill_dir': '/tmp/assembler_test_spill',
         }],
     )
 
