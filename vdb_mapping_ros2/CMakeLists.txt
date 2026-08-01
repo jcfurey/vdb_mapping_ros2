@@ -75,11 +75,16 @@ if(BUILD_TESTING)
   # raytrace + get_map_section services against the known geometry.
   find_package(launch_testing_ament_cmake REQUIRED)
   add_launch_test(test/smoke.test.py TIMEOUT 150)
+  # End-to-end assembler test: one keyframe of synthetic evidence through the
+  # real node; pins survey metadata survival, odom-delta re-anchoring, and
+  # the z-only pose-correction re-render.
+  add_launch_test(test/assembler.test.py TIMEOUT 200)
   add_launch_test(test/raytrace.test.py TIMEOUT 150)
 
   install(PROGRAMS
     test/smoke_test.py
     test/raytrace_test.py
+    test/assembler_test.py
     DESTINATION lib/${PROJECT_NAME})
 endif()
 
