@@ -217,7 +217,10 @@ public:
     cfg.map_directory_path  = "";
     cfg.fast_mode           = false;  // batch re-render: DDA is fine and simplest
     cfg.accumulation_period = 1.0;
-    m_map->setConfig(cfg);
+    if (!m_map->setConfig(cfg))
+      RCLCPP_FATAL(get_logger(),
+                   "assembler map config REJECTED — re-renders will produce "
+                   "empty maps until the parameters are fixed");
     const auto ros_clock = get_clock();
     m_map->setTimeCallback([ros_clock]() -> uint64_t {
       return static_cast<uint64_t>(

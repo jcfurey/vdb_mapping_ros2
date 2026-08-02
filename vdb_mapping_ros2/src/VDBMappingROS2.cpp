@@ -1157,7 +1157,16 @@ void VDBMappingROS2::setUpVDBMap()
   this->declare_parameter<double>("artificial_positive_height", 1.5);
   this->get_parameter("artificial_positive_height", m_artificial_positive_height);
 
-  m_vdb_map->setConfig(m_config);
+  if (!m_vdb_map->setConfig(m_config))
+  {
+    // A rejected config means the map integrates NOTHING (one error per
+    // cloud). Say so once, loudly, at the moment the yaml can still be
+    // correlated with the failure.
+    RCLCPP_FATAL(this->get_logger(),
+                 "vdb_mapping config REJECTED (see library log above) — the "
+                 "node will run but integrate no clouds until the parameters "
+                 "are fixed");
+  }
 
   this->declare_parameter<std::string>("map_frame", "");
   this->get_parameter("map_frame", m_map_frame);
