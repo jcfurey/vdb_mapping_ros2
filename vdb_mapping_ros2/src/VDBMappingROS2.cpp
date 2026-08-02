@@ -177,6 +177,12 @@ bool VDBMappingROS2::loadMap(
 {
   RCLCPP_INFO(this->get_logger(), "Loading Map");
   bool success = m_vdb_map->loadMap(req->path);
+  // The core adopts a loaded map's resolution when it differs; without this
+  // refresh every published OccupancyGrid keeps claiming the configured
+  // resolution — a 0.1 m map served with 0.05 m metadata is nav-consumed at
+  // 2x wrong scale while the pointcloud/marker outputs stay correct and
+  // mask the fault.
+  m_resolution = m_vdb_map->getResolution();
   publishMap();
   res->success = success;
   return success;
@@ -188,6 +194,8 @@ bool VDBMappingROS2::loadMapFromPCD(
 {
   RCLCPP_INFO(this->get_logger(), "Loading Map from PCD file");
   bool success = m_vdb_map->loadMapFromPCD(req->path, req->set_background, req->clear_map);
+  // Same resolution refresh as loadMap above.
+  m_resolution = m_vdb_map->getResolution();
   publishMap();
   res->success = success;
   return success;

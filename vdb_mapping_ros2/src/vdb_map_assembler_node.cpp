@@ -583,11 +583,17 @@ private:
   }
 
   // TF lookup at a specific stamp with latest-sample fallback (the sonar
-  // frame is DYNAMIC — pivot head — so no caching)
+  // frame is DYNAMIC — pivot head — so no caching). allow_fallback=false
+  // forces stamp-exact: odom-DELTA anchoring (keyframe vs survey entry) is
+  // only meaningful between two poses at their own stamps — "latest" there
+  // is wrong by the robot's motion since, and a mis-anchored batch bakes
+  // into kf.survey permanently, silently bypassing the designed
+  // hold-for-next-keyframe failure path.
   bool lookupAtStamp(const std::string& frame,
                      const builtin_interfaces::msg::Time& stamp,
                      Eigen::Isometry3d& out,
-                     const std::string& target = "")
+                     const std::string& target = "",
+                     bool allow_fallback = true)
   {
     const std::string& tgt = target.empty() ? m_robot_frame : target;
     geometry_msgs::msg::TransformStamped tfs;
@@ -598,7 +604,7 @@ private:
     }
     catch (const tf2::TransformException&)
     {
-      if (!m_allow_latest_tf_fallback)
+      if (!m_allow_latest_tf_fallback || !allow_fallback)
       {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
                              "No exact TF %s <- %s at %.9f; dropping cloud "
@@ -813,7 +819,8 @@ private:
       {
         const rclcpp::Time kf_time(static_cast<int64_t>(kf.stamp * 1e9));
         Eigen::Isometry3d t_odom_kf;
-        if (lookupAtStamp(m_robot_frame, kf_time, t_odom_kf, m_odom_frame))
+        if (lookupAtStamp(m_robot_frame, kf_time, t_odom_kf, m_odom_frame,
+                          /*allow_fallback=*/false))
         {
           SurveyCloudPtrT agg(new SurveyCloudT);
           for (const auto& entry : m_survey_buffer)
@@ -825,7 +832,8 @@ private:
             }
             const rclcpp::Time e_time(static_cast<int64_t>(entry.stamp * 1e9));
             Eigen::Isometry3d t_odom_e;
-            if (!lookupAtStamp(m_robot_frame, e_time, t_odom_e, m_odom_frame))
+            if (!lookupAtStamp(m_robot_frame, e_time, t_odom_e, m_odom_frame,
+                               /*allow_fallback=*/false))
             {
               continue;
             }
