@@ -18,18 +18,25 @@ vdb_mapping_ros2/                     # Repository root
 │   ├── package.xml
 │   ├── include/vdb_mapping_ros2/
 │   │   ├── VDBMappingROS2.hpp        # Main node class declarations
-│   │   └── VDBMappingTools.hpp       # Static helpers for visualization output
+│   │   ├── VDBMappingTools.hpp       # Static helpers for visualization output
+│   │   └── survey_voxel.hpp          # SurveyPoint type + all-fields voxel reduction
 │   ├── src/
 │   │   ├── VDBMappingROS2.cpp              # Main node implementation + composable registration
-│   │   └── vdb_mapping_ros_node.cpp        # Standalone node entry point
+│   │   ├── vdb_mapping_ros_node.cpp        # Standalone node entry point
+│   │   └── vdb_map_assembler_node.cpp      # Keyframe-graph survey/occupancy assembler
 │   ├── launch/
 │   │   ├── vdb_mapping_ros2.py             # Main mapping (multi-threaded)
 │   │   ├── vdb_map_server_ros2.py          # Map server (single-threaded)
 │   │   └── vdb_remote_mapping_ros2.py      # Remote mapping instance
-│   └── config/
-│       ├── vdb_params.yaml                 # Main mapping parameters
-│       ├── vdb_map_server_params.yaml      # Map server parameters
-│       └── vdb_remote_params.yaml          # Remote instance parameters
+│   ├── config/
+│   │   ├── vdb_params.yaml                 # Main mapping parameters (activation thresholds 0.49/0.51 — see the comment there)
+│   │   ├── vdb_map_server_params.yaml      # Map server parameters
+│   │   └── vdb_remote_params.yaml          # Remote instance parameters
+│   └── test/
+│       ├── smoke.test.py / raytrace.test.py  # launch_testing end-to-end tests (+ sibling *_test.py modules)
+│       ├── assembler.test.py               # metadata survival, odom-delta anchoring, z re-render, spill round-trip
+│       ├── section_sync.test.py            # end-to-end remote section sync
+│       └── unit/test_survey_voxel.cpp      # gtest for the survey voxel reduction
 └── vdb_mapping_interfaces/           # Interface definitions package
     ├── CMakeLists.txt
     ├── package.xml
@@ -63,12 +70,18 @@ vdb_mapping_ros2/                     # Repository root
 
 - **`RemoteSource`** / **`SensorSource`** (structs in `VDBMappingROS2.hpp`) - Configuration structs for remote mapping sources and local sensor inputs.
 
+- **`vdb_map_assembler_node`** (`vdb_map_assembler_node.cpp`) - Standalone executable assembling SLAM keyframe clouds into latched survey/occupancy products. Re-renders when a keyframe's graph correction exceeds `pose_epsilon_xy`/`pose_epsilon_yaw`/`pose_epsilon_z` (the z epsilon exists because pure-depth corrections previously never marked the graph dirty). Keyframe clouds are write-once, so they spill to binary PCD under `spill_dir` and stream back at render time (RAM stays flat over survey duration); `~/export_survey` and `export_on_shutdown` write the consolidated survey PCD via a `.part` rename.
+
+- **`SurveyPoint` + voxel reduction** (`survey_voxel.hpp`) - Survey stream point type (PointXYZI-compatible prefix, then range/incidence/texture moments/relative elevation bounds) and its all-fields voxel reduction with sentinel rules (incidence ≥ 0 only, finite-only texture/elevation, elevation offsets re-relativized against the reduced centroid). **Never run this type through `pcl::VoxelGrid`**: its centroid machinery is a closed accumulator set and silently zeroes every custom field while the zeros pass downstream validity guards.
+
 ### Node Execution Model
 
 The node runs as a **composable ROS 2 component** (`rclcpp_components`). Launch files use `ComposableNodeContainer` to load it. The main launch uses `component_container_mt` (multi-threaded executor). Three callback groups provide thread isolation:
 - `m_accumulation_cb_group` - Sensor data accumulation
 - `m_visualization_cb_group` - Map visualization publishing
 - `m_remote_cb_group` - Remote mapping operations
+
+Constructor ordering is load-bearing under the multi-threaded executor: publishers (and the `m_publish_*` flags they read) must exist before the visualization timer and services go live — `resetMap`/`loadMap` fire `publishMap()`, and a service call or timer tick in the init window otherwise reads uninitialized flags and dereferences null publishers. Local cloud subscriptions go live last for the same reason. Preserve this order (`setUpPublishers()` → `setUpVisualization()` → `setUpServices()` → subscriptions) when touching the constructor.
 
 ### Core External Dependency
 
@@ -118,7 +131,14 @@ GitLab CI pipeline testing three ROS 2 distributions:
 - **Jazzy** (Ubuntu 24.04, Clang Format 18)
 - **Rolling** (Ubuntu 24.04, Clang Format 18)
 
-Pipeline is inherited from an external `continuous_integration/ci_scripts` project. No local test suite exists in the repository.
+Pipeline is inherited from an external `continuous_integration/ci_scripts` project.
+
+## Testing
+
+A local test suite exists under `vdb_mapping_ros2/test/` (run with `colcon test --packages-select vdb_mapping_ros2`):
+
+- **launch_testing end-to-end tests** — each `*.test.py` launch harness pairs with a `*_test.py` module: `smoke` (node comes up and maps), `raytrace` (service semantics), `assembler` (survey metadata survives assembly, odom-delta keyframe anchoring, z-triggered re-render, evidence-spill round-trip) and `section_sync` (remote section sync end to end).
+- **`test/unit/test_survey_voxel.cpp`** — gtest (`ament_add_gtest`) for the SurveyPoint voxel reduction and its sentinel rules.
 
 ## Code Conventions
 
