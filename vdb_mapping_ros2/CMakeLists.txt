@@ -79,12 +79,16 @@ if(BUILD_TESTING)
   # real node; pins survey metadata survival, odom-delta re-anchoring, and
   # the z-only pose-correction re-render.
   add_launch_test(test/assembler.test.py TIMEOUT 200)
+  # Remote section sync: mapper A -> sections -> remote B, including the
+  # clear-after-reset transition through pruned tiles.
+  add_launch_test(test/section_sync.test.py TIMEOUT 250)
   add_launch_test(test/raytrace.test.py TIMEOUT 150)
 
   install(PROGRAMS
     test/smoke_test.py
     test/raytrace_test.py
     test/assembler_test.py
+    test/section_sync_test.py
     DESTINATION lib/${PROJECT_NAME})
 endif()
 
