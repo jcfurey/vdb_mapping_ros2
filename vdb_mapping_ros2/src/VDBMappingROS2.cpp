@@ -1106,10 +1106,21 @@ void VDBMappingROS2::setUpVDBMap()
   this->get_parameter("prob_hit", m_config.prob_hit);
   this->declare_parameter<double>("prob_miss", 0.4);
   this->get_parameter("prob_miss", m_config.prob_miss);
-  this->declare_parameter<double>("prob_thres_min", 0.12);
+  // Defaults match the library's (0.49/0.51 activation thresholds). The old
+  // 0.12/0.97 pair was the misused OctoMap CLAMPING bounds the core fixed —
+  // a yaml that omits these keys silently got ~5 accumulation windows of
+  // activation latency ("map looks sparse").
+  this->declare_parameter<double>("prob_thres_min", 0.49);
   this->get_parameter("prob_thres_min", m_config.prob_thres_min);
-  this->declare_parameter<double>("prob_thres_max", 0.97);
+  this->declare_parameter<double>("prob_thres_max", 0.51);
   this->get_parameter("prob_thres_max", m_config.prob_thres_max);
+  // Clamping bounds were library-only before: tuning prob_thres_max >= 0.99
+  // made setConfig reject the whole config with no yaml knob to widen them,
+  // and the node then ran while integrating nothing.
+  this->declare_parameter<double>("prob_clamp_min", 0.01);
+  this->get_parameter("prob_clamp_min", m_config.prob_clamp_min);
+  this->declare_parameter<double>("prob_clamp_max", 0.99);
+  this->get_parameter("prob_clamp_max", m_config.prob_clamp_max);
   this->declare_parameter<std::string>("map_directory_path", "");
   this->get_parameter("map_directory_path", m_config.map_directory_path);
   this->declare_parameter<int>("two_dim_projection_threshold", 5);
