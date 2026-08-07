@@ -75,14 +75,18 @@ if(BUILD_TESTING)
   # raytrace + get_map_section services against the known geometry.
   find_package(launch_testing_ament_cmake REQUIRED)
   add_launch_test(test/smoke.test.py TIMEOUT 150)
+  set_tests_properties(test_smoke.test.py PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=152")
   # End-to-end assembler test: one keyframe of synthetic evidence through the
   # real node; pins survey metadata survival, odom-delta re-anchoring, and
   # the z-only pose-correction re-render.
   add_launch_test(test/assembler.test.py TIMEOUT 200)
+  set_tests_properties(test_assembler.test.py PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=153")
   # Remote section sync: mapper A -> sections -> remote B, including the
   # clear-after-reset transition through pruned tiles.
   add_launch_test(test/section_sync.test.py TIMEOUT 250)
+  set_tests_properties(test_section_sync.test.py PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=154")
   add_launch_test(test/raytrace.test.py TIMEOUT 150)
+  set_tests_properties(test_raytrace.test.py PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=155")
 
   install(PROGRAMS
     test/smoke_test.py
