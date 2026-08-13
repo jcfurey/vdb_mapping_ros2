@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <filesystem>
@@ -83,6 +84,7 @@
 // (texture moments, elevation bounds, range, incidence) during reduction,
 // and the zeros passed every downstream validity guard.
 #include <vdb_mapping_ros2/survey_voxel.hpp>
+#include <vdb_mapping_ros2/sonar_reconstruction.hpp>
 
 // Consolidated survey product written to PCD: the same thirteen fields the
 // ~/survey_pointcloud topic carries.
@@ -133,6 +135,8 @@ public:
   using CloudPtrT = CloudT::Ptr;
   using SurveyCloudT    = pcl::PointCloud<SurveyPoint>;
   using SurveyCloudPtrT = SurveyCloudT::Ptr;
+  using ReconstructionCloudT = ReconstructionCloud;
+  using ReconstructionCloudPtrT = ReconstructionCloudPtr;
 
   VDBMapAssembler()
     : Node("vdb_map_assembler")
@@ -157,6 +161,16 @@ public:
     // publish only survey points whose occupancy voxel is occupied — the
     // clearing evidence then scrubs transients out of the survey product too
     declare_parameter<bool>("survey_occupancy_mask", true);
+    // Two graph-corrected products derived from one immutable sonar tile:
+    // (A) a centre-plane intensity mosaic and (B) a multi-view 3-D surface
+    // whose voxels must be intersected by aperture ribbons from distinct head
+    // angles. Empty tile_topic disables both.
+    declare_parameter<std::string>("tile_topic", "");
+    declare_parameter<double>("tile_resolution", 0.05);
+    declare_parameter<double>("surface_resolution", 0.10);
+    declare_parameter<int>("surface_min_observations", 3);
+    declare_parameter<double>("surface_min_view_span_deg", 6.0);
+    declare_parameter<int>("surface_max_samples_per_return", 31);
     declare_parameter<std::string>("odom_frame", "odom");
     // evidence association
     declare_parameter<double>("buffer_seconds", 6.0);
@@ -202,6 +216,20 @@ public:
     get_parameter("two_dim_projection_threshold", m_two_dim_projection_threshold);
     get_parameter("survey_resolution", m_survey_resolution);
     get_parameter("survey_occupancy_mask", m_survey_occupancy_mask);
+    get_parameter("tile_resolution", m_tile_resolution);
+    get_parameter("surface_resolution", m_surface_resolution);
+    get_parameter("surface_min_observations", m_surface_min_observations);
+    get_parameter("surface_min_view_span_deg", m_surface_min_view_span_deg);
+    get_parameter("surface_max_samples_per_return", m_surface_max_samples_per_return);
+    m_tile_resolution = std::max(1e-3, m_tile_resolution);
+    m_surface_resolution = std::max(1e-3, m_surface_resolution);
+    m_surface_min_observations = std::max(1, m_surface_min_observations);
+    m_surface_max_samples_per_return =
+      std::max(3, m_surface_max_samples_per_return);
+    m_surface_accumulator = std::make_unique<MultiViewSurfaceAccumulator>(
+      static_cast<float>(m_surface_resolution), m_surface_min_observations,
+      static_cast<float>(std::max(0.0, m_surface_min_view_span_deg) * M_PI / 180.0),
+      m_surface_max_samples_per_return);
     get_parameter("odom_frame", m_odom_frame);
     get_parameter("export_path", m_export_path);
     get_parameter("export_on_shutdown", m_export_on_shutdown);
@@ -288,6 +316,20 @@ public:
         "~/survey_pointcloud", map_qos);
     }
 
+    std::string tile_topic;
+    get_parameter("tile_topic", tile_topic);
+    if (!tile_topic.empty())
+    {
+      m_tile_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
+        tile_topic, qos, [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+          bufferTile(*msg);
+        });
+      m_tile_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "~/tile_pointcloud", map_qos);
+      m_surface_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "~/surface_pointcloud", map_qos);
+    }
+
     m_export_srv = create_service<std_srvs::srv::Trigger>(
       "~/export_survey",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
@@ -299,8 +341,9 @@ public:
                                   [this] { renderIfNeeded(); });
 
     RCLCPP_INFO(get_logger(),
-                "Map assembler up: hits=%s clear=%s traj=%s res=%.2f",
-                hits_topic.c_str(), clear_topic.c_str(), traj_topic.c_str(), m_resolution);
+                "Map assembler up: hits=%s clear=%s traj=%s tile=%s res=%.2f",
+                hits_topic.c_str(), clear_topic.c_str(), traj_topic.c_str(),
+                tile_topic.empty() ? "disabled" : tile_topic.c_str(), m_resolution);
   }
 
 private:
@@ -325,6 +368,7 @@ private:
     // dense survey aggregate (ALL inter-keyframe survey_points clouds,
     // odom-delta transformed into THIS keyframe's robot frame)
     SurveyCloudPtrT survey;
+    ReconstructionCloudPtrT reconstruction;
     Eigen::Vector3d hits_origin  = Eigen::Vector3d::Zero();
     Eigen::Vector3d clear_origin = Eigen::Vector3d::Zero();
     bool integrated = false;
@@ -333,6 +377,7 @@ private:
     size_t n_hits = 0;
     size_t n_clear = 0;
     size_t n_survey = 0;
+    size_t n_reconstruction = 0;
   };
 
   // Evidence resolved for one keyframe: either the resident handles or clouds
@@ -343,12 +388,19 @@ private:
     CloudPtrT hits;
     CloudPtrT clear;
     SurveyCloudPtrT survey;
+    ReconstructionCloudPtrT reconstruction;
   };
 
   struct BufferedSurvey
   {
     double stamp;
     SurveyCloudPtrT cloud;  // in robot frame at `stamp`
+  };
+
+  struct BufferedReconstruction
+  {
+    double stamp;
+    ReconstructionCloudPtrT cloud;  // robot frame at `stamp`
   };
 
   // Per-voxel reduction of the survey product. At class scope because the
@@ -360,6 +412,13 @@ private:
     double elevation_lo = 0, elevation_hi = 0;
     double elevation_resolved = 0;
     int n = 0, nci = 0, ntexture = 0, nelevation = 0;
+  };
+
+  struct TileVoxAcc
+  {
+    double x = 0.0, y = 0.0, z = 0.0;
+    double intensity = 0.0, range = 0.0, half_angle = 0.0;
+    int n = 0;
   };
 
   void setUpSpill()
@@ -467,6 +526,8 @@ private:
     kf.n_hits   = kf.hits ? kf.hits->size() : 0;
     kf.n_clear  = kf.clear ? kf.clear->size() : 0;
     kf.n_survey = kf.survey ? kf.survey->size() : 0;
+    kf.n_reconstruction =
+      kf.reconstruction ? kf.reconstruction->size() : 0;
 
     bool ok = true;
     if (kf.n_hits > 0)
@@ -480,6 +541,11 @@ private:
     if (kf.n_survey > 0)
     {
       ok = writeSpill(kf.survey, spillPath(idx, "survey")) && ok;
+    }
+    if (kf.n_reconstruction > 0)
+    {
+      ok = writeSpill(
+        kf.reconstruction, spillPath(idx, "reconstruction")) && ok;
     }
     if (!ok)
     {
@@ -497,13 +563,15 @@ private:
     kf.hits.reset();
     kf.clear.reset();
     kf.survey.reset();
+    kf.reconstruction.reset();
     kf.spilled = true;
   }
 
   // Resolve one keyframe's evidence, reading it back only if it was spilled
   // and only the parts the caller will actually use.
   LoadedEvidence loadEvidence(const KeyframeEvidence& kf, const size_t idx,
-                              const bool want_occupancy, const bool want_survey)
+                              const bool want_occupancy, const bool want_survey,
+                              const bool want_reconstruction = false)
   {
     LoadedEvidence e;
     if (!kf.spilled)
@@ -516,6 +584,10 @@ private:
       if (want_survey)
       {
         e.survey = kf.survey;
+      }
+      if (want_reconstruction)
+      {
+        e.reconstruction = kf.reconstruction;
       }
       return e;
     }
@@ -533,6 +605,11 @@ private:
     if (want_survey && kf.n_survey > 0)
     {
       e.survey = readSpill<SurveyCloudT>(spillPath(idx, "survey"));
+    }
+    if (want_reconstruction && kf.n_reconstruction > 0)
+    {
+      e.reconstruction = readSpill<ReconstructionCloudT>(
+        spillPath(idx, "reconstruction"));
     }
     return e;
   }
@@ -663,6 +740,82 @@ private:
     }
   }
 
+  // Attach the exact ping-time pivot-head pose to every centre-plane tile
+  // sample.  The resulting record is self-contained reconstruction evidence:
+  // graph re-renders can transform its centre, origin and two orientation
+  // vectors together without another historical TF lookup.
+  void bufferTile(const sensor_msgs::msg::PointCloud2& msg)
+  {
+    const double stamp = rclcpp::Time(msg.header.stamp).seconds();
+    observeInputStamp(stamp, m_last_tile_stamp, "tile");
+    Eigen::Isometry3d t_robot_sensor;
+    if (msg.width * msg.height == 0 ||
+        // Reconstruction geometry is allowed to fail closed.  A latest TF is
+        // adequate for some display-oriented products, but here it would
+        // silently attach the wrong encoder angle to an entire sonar ribbon
+        // and manufacture multi-view support.  The production TF comes from
+        // cameraHead.tilt.position (live or regenerated from bridge telemetry
+        // during replay); the Oculus AHRS is deliberately not consulted.
+        !lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor,
+                       /*target=*/"", /*allow_fallback=*/false))
+    {
+      return;
+    }
+
+    pcl::PointCloud<SonarTilePoint>::Ptr raw(
+      new pcl::PointCloud<SonarTilePoint>);
+    pcl::fromROSMsg(msg, *raw);
+    if (raw->empty())
+    {
+      return;
+    }
+
+    ReconstructionCloudPtrT in_robot(new ReconstructionCloudT);
+    in_robot->reserve(raw->size());
+    const Eigen::Isometry3f tf = t_robot_sensor.cast<float>();
+    Eigen::Vector3f elevation_axis = tf.linear() * Eigen::Vector3f::UnitX();
+    Eigen::Vector3f boresight = tf.linear() * Eigen::Vector3f::UnitZ();
+    elevation_axis.normalize();
+    boresight.normalize();
+    const Eigen::Vector3f origin = tf.translation();
+    const std::uint32_t observation = ++m_observation_sequence;
+    for (const auto& p : raw->points)
+    {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+          !std::isfinite(p.intensity) || !std::isfinite(p.range) ||
+          !std::isfinite(p.vertical_uncertainty) || !(p.range > 0.0F))
+      {
+        continue;
+      }
+      SonarReconstructionPoint out{};
+      setPointPosition(out, tf * Eigen::Vector3f(p.x, p.y, p.z));
+      out.intensity = p.intensity;
+      out.range = p.range;
+      out.azimuth = p.azimuth;
+      out.elevation_half_angle = std::atan2(
+        std::fabs(p.vertical_uncertainty), p.range);
+      setPointOrigin(out, origin);
+      setPointElevationAxis(out, elevation_axis);
+      setPointBoresight(out, boresight);
+      out.observation = observation;
+      in_robot->push_back(out);
+    }
+    in_robot->width = static_cast<std::uint32_t>(in_robot->size());
+    in_robot->height = 1;
+    in_robot->is_dense = false;
+    if (in_robot->empty())
+    {
+      return;
+    }
+    m_tile_buffer.push_back({stamp, in_robot});
+    while (!m_tile_buffer.empty() &&
+           m_tile_buffer.back().stamp - m_tile_buffer.front().stamp >
+             m_buffer_seconds)
+    {
+      m_tile_buffer.pop_front();
+    }
+  }
+
   const BufferedCloud* findNearest(const std::deque<BufferedCloud>& buffer,
                                    const double stamp) const
   {
@@ -707,8 +860,11 @@ private:
     m_hits_buffer.clear();
     m_clear_buffer.clear();
     m_survey_buffer.clear();
+    m_tile_buffer.clear();
     m_keyframes.clear();
     m_vox.clear();
+    m_tile_vox.clear();
+    m_surface_accumulator->clear();
     m_map->resetMap();
 
     m_keyframes_without_evidence = 0;
@@ -717,12 +873,17 @@ private:
     m_have_new = false;
     m_last_full_render = 0.0;
     m_last_assoc_stamp = 0.0;
+    m_last_tile_assoc_stamp = 0.0;
     m_survey_upto = 0;
     m_survey_stale = false;
+    m_reconstruction_upto = 0;
+    m_reconstruction_stale = false;
     m_last_hits_stamp = 0.0;
     m_last_clear_stamp = 0.0;
     m_last_survey_stamp = 0.0;
+    m_last_tile_stamp = 0.0;
     m_last_traj_stamp = 0.0;
+    m_observation_sequence = 0;
     m_spill_failures = 0;
 
     // Keep old segment files recoverable and write replayed evidence into a
@@ -787,6 +948,7 @@ private:
           // contribution back out of a voxel mean, so the accumulator has to
           // be rebuilt from scratch on the next render.
           m_survey_stale = true;
+          m_reconstruction_stale = true;
         }
         continue;
       }
@@ -864,6 +1026,54 @@ private:
             "keyframe odom lookup failed at %.3f; holding %zu survey clouds "
             "for the next keyframe",
             kf.stamp, m_survey_buffer.size());
+        }
+      }
+
+      // Reconstruction aggregation mirrors the survey's odom-delta deskew,
+      // but preserves each ping's sensor origin, elevation axis, boresight and
+      // observation id.  Collapsing these clouds to XYZ here would destroy
+      // exactly the view geometry Product B needs for aperture intersection.
+      if (m_tile_pub)
+      {
+        const rclcpp::Time kf_time(static_cast<int64_t>(kf.stamp * 1e9));
+        Eigen::Isometry3d t_odom_kf;
+        if (lookupAtStamp(m_robot_frame, kf_time, t_odom_kf, m_odom_frame,
+                          /*allow_fallback=*/false))
+        {
+          ReconstructionCloudPtrT agg(new ReconstructionCloudT);
+          for (const auto& entry : m_tile_buffer)
+          {
+            if (entry.stamp <= m_last_tile_assoc_stamp ||
+                entry.stamp > kf.stamp + m_stamp_tolerance)
+            {
+              continue;
+            }
+            const rclcpp::Time e_time(static_cast<int64_t>(entry.stamp * 1e9));
+            Eigen::Isometry3d t_odom_e;
+            if (!lookupAtStamp(m_robot_frame, e_time, t_odom_e, m_odom_frame,
+                               /*allow_fallback=*/false))
+            {
+              continue;
+            }
+            const Eigen::Isometry3f t_kf_e =
+              (t_odom_kf.inverse() * t_odom_e).cast<float>();
+            ReconstructionCloudPtrT moved =
+              transformReconstructionCloud(entry.cloud, t_kf_e);
+            *agg += *moved;
+          }
+          if (!agg->empty())
+          {
+            kf.reconstruction = agg;
+          }
+          m_last_tile_assoc_stamp = kf.stamp + m_stamp_tolerance;
+        }
+        else
+        {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 10000,
+            "keyframe odom lookup failed at %.3f; holding %zu tile clouds "
+            "for the next keyframe",
+            kf.stamp, m_tile_buffer.size());
         }
       }
 
@@ -1126,6 +1336,135 @@ private:
     m_survey_upto = m_keyframes.size();
   }
 
+  void accumulateReconstruction(const KeyframeEvidence& kf, const size_t idx)
+  {
+    const LoadedEvidence e = loadEvidence(
+      kf, idx, /*want_occupancy=*/false, /*want_survey=*/false,
+      /*want_reconstruction=*/true);
+    if (!e.reconstruction || e.reconstruction->empty())
+    {
+      return;
+    }
+    const Eigen::Isometry3f pose = kf.pose.cast<float>();
+    for (const auto& local : e.reconstruction->points)
+    {
+      const SonarReconstructionPoint p =
+        transformReconstructionPoint(local, pose);
+      TileVoxAcc& a = m_tile_vox[voxelKey(
+        p.x, p.y, p.z, m_tile_resolution)];
+      a.x += p.x;
+      a.y += p.y;
+      a.z += p.z;
+      a.intensity += p.intensity;
+      a.range += p.range;
+      a.half_angle += p.elevation_half_angle;
+      ++a.n;
+      m_surface_accumulator->add(p);
+    }
+  }
+
+  void syncReconstructionAccumulators()
+  {
+    if (!m_tile_pub)
+    {
+      return;
+    }
+    if (m_reconstruction_stale)
+    {
+      m_tile_vox.clear();
+      m_surface_accumulator->clear();
+      m_reconstruction_upto = 0;
+      m_reconstruction_stale = false;
+    }
+    for (size_t i = m_reconstruction_upto; i < m_keyframes.size(); ++i)
+    {
+      accumulateReconstruction(m_keyframes[i], i);
+    }
+    m_reconstruction_upto = m_keyframes.size();
+  }
+
+  template<std::size_t N>
+  void publishFloatRows(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher,
+    const std::array<const char*, N>& names,
+    const std::vector<std::array<float, N>>& rows,
+    const rclcpp::Time& stamp)
+  {
+    sensor_msgs::msg::PointCloud2 msg;
+    msg.header.stamp = stamp;
+    msg.header.frame_id = m_map_frame;
+    msg.height = 1;
+    msg.width = static_cast<std::uint32_t>(rows.size());
+    msg.is_bigendian = false;
+    msg.is_dense = true;
+    msg.point_step = static_cast<std::uint32_t>(N * sizeof(float));
+    msg.row_step = msg.point_step * msg.width;
+    msg.fields.reserve(N);
+    for (std::size_t f = 0; f < N; ++f)
+    {
+      sensor_msgs::msg::PointField field;
+      field.name = names[f];
+      field.offset = static_cast<std::uint32_t>(f * sizeof(float));
+      field.datatype = sensor_msgs::msg::PointField::FLOAT32;
+      field.count = 1;
+      msg.fields.push_back(field);
+    }
+    msg.data.resize(rows.size() * msg.point_step);
+    if (!rows.empty())
+    {
+      std::memcpy(msg.data.data(), rows.data(), msg.data.size());
+    }
+    publisher->publish(msg);
+  }
+
+  void publishReconstructionProducts(const rclcpp::Time& stamp)
+  {
+    if (!m_tile_pub)
+    {
+      return;
+    }
+    syncReconstructionAccumulators();
+
+    // Product A: graph-corrected centre-plane intensity tiles. Aperture is
+    // metadata here, never painted as thickness.
+    constexpr std::array<const char*, 7> tile_names = {
+      "x", "y", "z", "intensity", "range", "support", "aperture_half_deg"};
+    std::vector<std::array<float, 7>> tile_rows;
+    tile_rows.reserve(m_tile_vox.size());
+    for (const auto& [key, a] : m_tile_vox)
+    {
+      (void)key;
+      if (a.n <= 0)
+      {
+        continue;
+      }
+      tile_rows.push_back({
+        static_cast<float>(a.x / a.n),
+        static_cast<float>(a.y / a.n),
+        static_cast<float>(a.z / a.n),
+        static_cast<float>(a.intensity / a.n),
+        static_cast<float>(a.range / a.n),
+        static_cast<float>(a.n),
+        static_cast<float>(a.half_angle / a.n * 180.0 / M_PI)});
+    }
+    publishFloatRows(m_tile_pub, tile_names, tile_rows, stamp);
+
+    // Product B: only ribbon intersections with independent angular support.
+    constexpr std::array<const char*, 7> surface_names = {
+      "x", "y", "z", "intensity", "support", "view_span_deg", "confidence"};
+    const std::vector<ReconstructionRow> reconstructed =
+      m_surface_accumulator->rows();
+    std::vector<std::array<float, 7>> surface_rows;
+    surface_rows.reserve(reconstructed.size());
+    for (const auto& p : reconstructed)
+    {
+      surface_rows.push_back({
+        p.x, p.y, p.z, p.intensity, p.support,
+        p.view_span_deg, p.confidence});
+    }
+    publishFloatRows(m_surface_pub, surface_names, surface_rows, stamp);
+  }
+
   void renderIfNeeded()
   {
     const double now = get_clock()->now().seconds();
@@ -1155,6 +1494,7 @@ private:
     else if (m_have_new)
     {
       // append-only: integrate keyframes that haven't been rendered yet
+      const bool have_reconstruction_product = static_cast<bool>(m_tile_pub);
       for (size_t i = 0; i < m_keyframes.size(); ++i)
       {
         if (m_keyframes[i].has_evidence && !m_keyframes[i].integrated)
@@ -1163,6 +1503,11 @@ private:
           changed = true;
         }
       }
+      // Reconstruction and survey evidence are useful products even when a
+      // keyframe has no nearest occupancy snapshot. Do not let the occupancy
+      // integration flag suppress their render.
+      changed = changed || have_reconstruction_product ||
+        static_cast<bool>(m_survey_pub);
       m_have_new = false;
     }
 
@@ -1266,6 +1611,8 @@ private:
       m_survey_pub->publish(survey_msg);
     }
 
+    publishReconstructionProducts(stamp);
+
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
                          "assembled map: %zu keyframes (%zu without evidence), "
                          "%zu full re-renders",
@@ -1293,6 +1640,12 @@ private:
   bool m_survey_occupancy_mask = true;
   std::string m_odom_frame     = "odom";
   double m_last_assoc_stamp    = 0.0;
+  double m_tile_resolution = 0.05;
+  double m_surface_resolution = 0.10;
+  int m_surface_min_observations = 3;
+  double m_surface_min_view_span_deg = 6.0;
+  int m_surface_max_samples_per_return = 31;
+  double m_last_tile_assoc_stamp = 0.0;
 
   std::unique_ptr<VDBMapT> m_map;
   std::unique_ptr<tf2_ros::Buffer> m_tf_buffer;
@@ -1301,6 +1654,7 @@ private:
   std::deque<BufferedCloud> m_hits_buffer;
   std::deque<BufferedCloud> m_clear_buffer;
   std::deque<BufferedSurvey> m_survey_buffer;
+  std::deque<BufferedReconstruction> m_tile_buffer;
   std::vector<KeyframeEvidence> m_keyframes;
   size_t m_keyframes_without_evidence = 0;
   size_t m_full_renders               = 0;
@@ -1324,20 +1678,29 @@ private:
   // is how many keyframes are already folded in; m_survey_stale forces a
   // rebuild after the graph moves.
   std::unordered_map<uint64_t, VoxAcc> m_vox;
+  std::unordered_map<uint64_t, TileVoxAcc> m_tile_vox;
+  std::unique_ptr<MultiViewSurfaceAccumulator> m_surface_accumulator;
   size_t m_survey_upto = 0;
   bool m_survey_stale  = false;
+  size_t m_reconstruction_upto = 0;
+  bool m_reconstruction_stale = false;
   double m_last_hits_stamp = 0.0;
   double m_last_clear_stamp = 0.0;
   double m_last_survey_stamp = 0.0;
+  double m_last_tile_stamp = 0.0;
   double m_last_traj_stamp = 0.0;
+  std::uint32_t m_observation_sequence = 0;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_hits_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_clear_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_traj_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_survey_sub;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_tile_sub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_cloud_pub;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr m_grid_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_survey_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_tile_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_surface_pub;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr m_export_srv;
   rclcpp::TimerBase::SharedPtr m_render_timer;
 

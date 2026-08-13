@@ -27,12 +27,18 @@ def generate_test_description():
             'hits_topic': '/test/hits',
             'clear_topic': '/test/clear',
             'survey_topic': '/test/survey',
+            'tile_topic': '/test/tile',
             'traj_topic': '/test/traj',
             'robot_frame': 'base_link',
             'odom_frame': 'odom',
             'map_frame': 'map',
             # one synthetic point per cloud: mask/threshold friction off
             'survey_occupancy_mask': False,
+            'tile_resolution': 0.1,
+            'surface_resolution': 0.2,
+            'surface_min_observations': 3,
+            'surface_min_view_span_deg': 6.0,
+            'surface_max_samples_per_return': 5,
             'prob_thres_min': 0.49,
             'prob_thres_max': 0.51,
             # exact-stamp TF only: a fallback to latest would silently

@@ -21,7 +21,7 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
 
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import PointCloud2, PointField
-from tf2_ros import TransformBroadcaster
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 T_E = 10.0      # survey evidence stamp
 T_KF = 10.5     # keyframe stamp
@@ -44,6 +44,10 @@ SURVEY_FIELDS = [
     "texture", "texture_squared", "elevation_lo_offset",
     "elevation_hi_offset", "elevation_resolved"]
 SURVEY_OFFSETS = [0, 4, 8, 16, 20, 24, 28, 32, 36, 40, 44, 48]
+TILE_FIELDS = [
+    "x", "y", "z", "intensity", "range", "azimuth",
+    "vertical_uncertainty"]
+TILE_ANGLES = (-10.0, 0.0, 10.0)
 
 
 def make_survey_cloud(stamp_s):
@@ -95,6 +99,31 @@ def make_xyz_cloud(stamp_s, xyz):
     return msg
 
 
+def make_tile_cloud(stamp_s, frame):
+    msg = PointCloud2()
+    msg.header.stamp.sec = int(stamp_s)
+    msg.header.stamp.nanosec = int((stamp_s - int(stamp_s)) * 1e9)
+    msg.header.frame_id = frame
+    msg.height = 1
+    msg.width = 1
+    msg.is_bigendian = False
+    msg.is_dense = True
+    for i, name in enumerate(TILE_FIELDS):
+        f = PointField()
+        f.name = name
+        f.offset = 4 * i
+        f.datatype = PointField.FLOAT32
+        f.count = 1
+        msg.fields.append(f)
+    msg.point_step = 4 * len(TILE_FIELDS)
+    msg.row_step = msg.point_step
+    half = math.radians(10.0)
+    msg.data = struct.pack(
+        "<7f", 0.0, 0.0, 5.0, 0.6, 5.0, 0.0,
+        5.0 * math.tan(half))
+    return msg
+
+
 def make_traj(kf_xyz):
     # [x y z roll pitch yaw i t] float32, t relative to the message stamp
     msg = PointCloud2()
@@ -141,18 +170,43 @@ class Harness(Node):
                              durability=DurabilityPolicy.TRANSIENT_LOCAL,
                              history=HistoryPolicy.KEEP_LAST)
         self.tfb = TransformBroadcaster(self)
+        self.static_tfb = StaticTransformBroadcaster(self)
         self.hits_pub = self.create_publisher(PointCloud2, "/test/hits", reliable)
         self.survey_pub = self.create_publisher(PointCloud2, "/test/survey", reliable)
+        self.tile_pub = self.create_publisher(PointCloud2, "/test/tile", reliable)
         # the assembler's trajectory subscription is transient_local
         self.traj_pub = self.create_publisher(PointCloud2, "/test/traj", latched)
         self.snapshots = []
+        self.tile_snapshots = []
+        self.surface_snapshots = []
         self.create_subscription(
             PointCloud2, "/assembler/survey_pointcloud",
             lambda m: self.snapshots.append(parse_survey(m)), latched)
+        self.create_subscription(
+            PointCloud2, "/assembler/tile_pointcloud",
+            lambda m: self.tile_snapshots.append(parse_survey(m)), latched)
+        self.create_subscription(
+            PointCloud2, "/assembler/surface_pointcloud",
+            lambda m: self.surface_snapshots.append(parse_survey(m)), latched)
+
+        transforms = []
+        for angle in TILE_ANGLES:
+            t = TransformStamped()
+            t.header.frame_id = "base_link"
+            t.child_frame_id = f"tile_{int(angle):+d}"
+            # Camera optical +Z points horizontally at angle elevation;
+            # optical +X remains the independent elevation-aperture axis.
+            theta = math.pi / 2.0 - math.radians(angle)
+            t.transform.rotation.y = math.sin(theta / 2.0)
+            t.transform.rotation.w = math.cos(theta / 2.0)
+            transforms.append(t)
+        self.static_tfb.sendTransform(transforms)
 
     def broadcast_odom(self):
         # exact-stamp odom -> base_link samples bracketing both stamps
-        for stamp, x in ((T_E - 0.4, ODOM_X_E), (T_E, ODOM_X_E),
+        for stamp, x in ((T_E - 0.4, ODOM_X_E),
+                         (T_E, ODOM_X_E), (T_E + 0.1, ODOM_X_E),
+                         (T_E + 0.2, ODOM_X_E),
                          (T_KF, ODOM_X_KF), (T_KF + 0.4, ODOM_X_KF)):
             t = TransformStamped()
             t.header.stamp.sec = int(stamp)
@@ -187,6 +241,9 @@ def main():
         node.broadcast_odom()
 
     node.survey_pub.publish(make_survey_cloud(T_E))
+    for index, angle in enumerate(TILE_ANGLES):
+        node.tile_pub.publish(make_tile_cloud(
+            T_E + 0.1 * index, f"tile_{int(angle):+d}"))
     node.hits_pub.publish(make_xyz_cloud(T_KF, (3.0, 0.0, 0.0)))
     for _ in range(5):
         rclpy.spin_once(node, timeout_sec=0.1)
@@ -229,8 +286,36 @@ def main():
         return 1
     print("[1] survey metadata + odom-delta anchoring OK", flush=True)
 
+    if not spin_until(
+            node,
+            lambda: bool(node.tile_snapshots) and bool(node.surface_snapshots),
+            10.0):
+        print("FAIL: reconstruction products were not published", flush=True)
+        return 1
+    tiles = node.tile_snapshots[-1]
+    if len(tiles) < 3 or not all("intensity" in p and "support" in p
+                                 for p in tiles):
+        print(f"FAIL: malformed tile mosaic: {tiles}", flush=True)
+        return 1
+    surfaces = node.surface_snapshots[-1]
+    target = next((p for p in surfaces
+                   if close(p["x"], 6.0, 0.25)
+                   and close(p["y"], 0.0, 0.25)
+                   and close(p["z"], 0.0, 0.25)), None)
+    if target is None:
+        print(f"FAIL: no multi-view intersection near (6,0,0): {surfaces}",
+              flush=True)
+        return 1
+    if target.get("support", 0.0) < 3.0 or \
+            target.get("view_span_deg", 0.0) < 19.0 or \
+            target.get("confidence", 0.0) < 0.99:
+        print(f"FAIL: weak/non-diverse surface evidence: {target}", flush=True)
+        return 1
+    print("[2] tile mosaic + angular multi-view surface OK", flush=True)
+
     # z-only correction must re-render the product at the new depth
     n_before = len(node.snapshots)
+    n_surface_before = len(node.surface_snapshots)
     node.traj_pub.publish(make_traj((MAP_KF[0], MAP_KF[1],
                                      MAP_KF[2] + Z_CORRECTION)))
 
@@ -248,7 +333,19 @@ def main():
               f"saw z = {zs} (a stale z means the pose gate ignored depth)",
               flush=True)
         return 1
-    print("[2] z-only correction re-rendered OK", flush=True)
+    def surface_z_moved():
+        node.broadcast_odom()
+        for snap in node.surface_snapshots[n_surface_before:]:
+            if any(close(p["x"], 6.0, 0.25) and
+                   close(p["z"], Z_CORRECTION, 0.25) for p in snap):
+                return True
+        return False
+
+    if not spin_until(node, surface_z_moved, 10.0):
+        print("FAIL: multi-view surface did not follow graph z correction",
+              flush=True)
+        return 1
+    print("[3] z-only correction re-rendered every product OK", flush=True)
     print("PASS", flush=True)
     return 0
 
