@@ -318,7 +318,12 @@ public:
     {
       for (size_t i = 0; i < occ_voxel_projection_grid.size(); i++)
       {
-        if (occ_voxel_projection_grid[i] > two_dim_proj_threshold)
+        // The parameter is the minimum occupied-voxel count, not a strict
+        // lower bound: a threshold of 3 must mark a column containing exactly
+        // three occupied voxels. The former `>` silently required four and
+        // erased the thinnest valid sonar wall columns.
+        if (occ_voxel_projection_grid[i] >=
+            std::max(1, two_dim_proj_threshold))
         {
           occ_voxel_projection_grid[i] = 100;   // lethal: enough occupied voxels
         }

@@ -44,6 +44,7 @@
 #include <deque>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -62,7 +63,8 @@
 #include <pcl/impl/pcl_base.hpp>
 // PCD read/write for the custom point types: same PCL_NO_PRECOMPILE reason as
 // the filter impls above -- the prebuilt libraries carry no instantiation for
-// SurveyPoint/SurveyExportPoint, so this TU must supply its own.
+// SurveyPoint/SurveyExportPoint/SurfaceExportPoint, so this TU must supply its
+// own.
 #include <pcl/io/pcd_io.h>
 #include <pcl/io/impl/pcd_io.hpp>
 #include <pcl_conversions/pcl_conversions.h>
@@ -121,6 +123,26 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(
     float, elevation_hi_offset, elevation_hi_offset)(
     float, elevation_resolved_fraction, elevation_resolved_fraction))
 
+// Clean graph-corrected navigation surface written to PCD. This intentionally
+// has the same named fields as the live ~/navigation_pointcloud topic so an
+// operator can use one product live and after the mission without a schema
+// conversion step.
+struct SurfaceExportPoint
+{
+  PCL_ADD_POINT4D;
+  float intensity;
+  float support;
+  float view_span_deg;
+  float confidence;
+  PCL_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(
+  SurfaceExportPoint,
+  (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(
+    float, support, support)(float, view_span_deg, view_span_deg)(
+    float, confidence, confidence))
+
 namespace vdb_mapping_ros2 {
 
 constexpr std::size_t kSurveyOutputFields = 13;
@@ -171,6 +193,14 @@ public:
     declare_parameter<int>("surface_min_observations", 3);
     declare_parameter<double>("surface_min_view_span_deg", 6.0);
     declare_parameter<int>("surface_max_samples_per_return", 31);
+    declare_parameter<int>("surface_peak_radius_voxels", 0);
+    declare_parameter<double>("surface_min_return_intensity", 0.0);
+    // Operator-facing subset of the diagnostic surface: retain only
+    // echo-backed, well-constrained voxels for an uncluttered live navigation
+    // aid. The full surface and full tile products remain separately
+    // available for diagnosis and offline analysis.
+    declare_parameter<double>("navigation_min_confidence", 0.45);
+    declare_parameter<double>("navigation_min_intensity", 0.20);
     declare_parameter<std::string>("odom_frame", "odom");
     // evidence association
     declare_parameter<double>("buffer_seconds", 6.0);
@@ -178,6 +208,7 @@ public:
     declare_parameter<int>("input_queue_depth", 5);
     declare_parameter<bool>("input_reliable", false);
     declare_parameter<bool>("allow_latest_tf_fallback", true);
+    declare_parameter<double>("tf_buffer_duration", 10.0);
     declare_parameter<bool>("reset_on_time_rewind", true);
     declare_parameter<double>("time_rewind_tolerance", 0.5);
     // rendering policy
@@ -196,6 +227,10 @@ public:
     // at shutdown. Empty disables.
     declare_parameter<std::string>("export_path", "");
     declare_parameter<bool>("export_on_shutdown", true);
+    // Clean navigation surface, written independently of the broad survey
+    // export. Empty disables.
+    declare_parameter<std::string>("navigation_export_path", "");
+    declare_parameter<bool>("navigation_export_on_shutdown", true);
 
     get_parameter("resolution", m_resolution);
     get_parameter("map_frame", m_map_frame);
@@ -205,9 +240,11 @@ public:
     get_parameter("input_queue_depth", m_input_queue_depth);
     get_parameter("input_reliable", m_input_reliable);
     get_parameter("allow_latest_tf_fallback", m_allow_latest_tf_fallback);
+    get_parameter("tf_buffer_duration", m_tf_buffer_duration);
     get_parameter("reset_on_time_rewind", m_reset_on_time_rewind);
     get_parameter("time_rewind_tolerance", m_time_rewind_tolerance);
     m_input_queue_depth = std::max(1, m_input_queue_depth);
+    m_tf_buffer_duration = std::max(0.1, m_tf_buffer_duration);
     m_time_rewind_tolerance = std::max(0.0, m_time_rewind_tolerance);
     get_parameter("render_min_period", m_render_min_period);
     get_parameter("pose_epsilon_xy", m_pose_eps_xy);
@@ -221,18 +258,33 @@ public:
     get_parameter("surface_min_observations", m_surface_min_observations);
     get_parameter("surface_min_view_span_deg", m_surface_min_view_span_deg);
     get_parameter("surface_max_samples_per_return", m_surface_max_samples_per_return);
+    get_parameter("surface_peak_radius_voxels", m_surface_peak_radius_voxels);
+    get_parameter("surface_min_return_intensity", m_surface_min_return_intensity);
+    get_parameter("navigation_min_confidence", m_navigation_min_confidence);
+    get_parameter("navigation_min_intensity", m_navigation_min_intensity);
     m_tile_resolution = std::max(1e-3, m_tile_resolution);
     m_surface_resolution = std::max(1e-3, m_surface_resolution);
     m_surface_min_observations = std::max(1, m_surface_min_observations);
     m_surface_max_samples_per_return =
       std::max(3, m_surface_max_samples_per_return);
+    m_surface_peak_radius_voxels = std::max(0, m_surface_peak_radius_voxels);
+    m_surface_min_return_intensity = std::clamp(
+      m_surface_min_return_intensity, 0.0, 1.0);
+    m_navigation_min_confidence = std::clamp(
+      m_navigation_min_confidence, 0.0, 1.0);
+    m_navigation_min_intensity = std::clamp(
+      m_navigation_min_intensity, 0.0, 1.0);
     m_surface_accumulator = std::make_unique<MultiViewSurfaceAccumulator>(
       static_cast<float>(m_surface_resolution), m_surface_min_observations,
       static_cast<float>(std::max(0.0, m_surface_min_view_span_deg) * M_PI / 180.0),
-      m_surface_max_samples_per_return);
+      m_surface_max_samples_per_return, m_surface_peak_radius_voxels,
+      static_cast<float>(m_surface_min_return_intensity));
     get_parameter("odom_frame", m_odom_frame);
     get_parameter("export_path", m_export_path);
     get_parameter("export_on_shutdown", m_export_on_shutdown);
+    get_parameter("navigation_export_path", m_navigation_export_path);
+    get_parameter(
+      "navigation_export_on_shutdown", m_navigation_export_on_shutdown);
     setUpSpill();
 
     m_map = std::make_unique<VDBMapT>(m_resolution);
@@ -259,7 +311,8 @@ public:
     // clearing evidence: rays carve their full length, endpoints never paint
     m_map->addInputSource("clear", 0.0, 0.0, /*ray_clearing=*/true, /*endpoint_hits=*/false);
 
-    m_tf_buffer   = std::make_unique<tf2_ros::Buffer>(get_clock());
+    m_tf_buffer = std::make_unique<tf2_ros::Buffer>(
+      get_clock(), tf2::durationFromSec(m_tf_buffer_duration));
     m_tf_listener = std::make_shared<tf2_ros::TransformListener>(*m_tf_buffer);
 
     std::string hits_topic, clear_topic, traj_topic;
@@ -328,6 +381,8 @@ public:
         "~/tile_pointcloud", map_qos);
       m_surface_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/surface_pointcloud", map_qos);
+      m_navigation_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "~/navigation_pointcloud", map_qos);
     }
 
     m_export_srv = create_service<std_srvs::srv::Trigger>(
@@ -335,6 +390,12 @@ public:
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
              std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
         res->success = exportSurvey(res->message);
+      });
+    m_navigation_export_srv = create_service<std_srvs::srv::Trigger>(
+      "~/export_navigation_surface",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        res->success = exportNavigationSurface(res->message);
       });
 
     m_render_timer = create_timer(std::chrono::milliseconds(500),
@@ -467,7 +528,9 @@ private:
   }
 
   template <typename CloudPtr>
-  bool writeSpill(const CloudPtr& cloud, const std::string& path)
+  bool writeSpill(
+    const CloudPtr& cloud, const std::string& path,
+    const bool compressed = false)
   {
     // An unorganized cloud whose width/height do not match size() writes a
     // header that disagrees with the payload, and the read back silently
@@ -478,7 +541,15 @@ private:
     try
     {
       pcl::PCDWriter writer;
-      if (writer.writeBinary(path, *cloud) == 0)
+      // Full tile reconstruction evidence dominates spill volume (millions of
+      // points per keyframe, with highly repetitive origin/axis/observation
+      // fields). PCL's binary-compressed encoding is lossless and is read
+      // transparently by PCDReader, so it preserves the tile product while
+      // substantially reducing long-survey disk bandwidth and capacity.
+      const int status = compressed
+        ? writer.writeBinaryCompressed(path, *cloud)
+        : writer.writeBinary(path, *cloud);
+      if (status == 0)
       {
         return true;
       }
@@ -545,7 +616,8 @@ private:
     if (kf.n_reconstruction > 0)
     {
       ok = writeSpill(
-        kf.reconstruction, spillPath(idx, "reconstruction")) && ok;
+        kf.reconstruction, spillPath(idx, "reconstruction"),
+        /*compressed=*/true) && ok;
     }
     if (!ok)
     {
@@ -833,6 +905,20 @@ private:
     return best;
   }
 
+  template<typename BufferedT>
+  static void discardAssociated(
+    std::deque<BufferedT>& buffer, const double associated_through)
+  {
+    // Association is strictly one-way: the next keyframe ignores every
+    // entry <= m_last_*_assoc_stamp. Keeping those clouds until the generic
+    // time horizon expired retained several seconds of the full-resolution
+    // tile stream even though they could never be consumed again.
+    while (!buffer.empty() && buffer.front().stamp <= associated_through)
+    {
+      buffer.pop_front();
+    }
+  }
+
   // Each topic is tracked separately: a delayed cloud from one source must
   // not look like a seek merely because another source has advanced farther.
   // A true regression on any one stream starts a clean replay segment.
@@ -863,7 +949,7 @@ private:
     m_tile_buffer.clear();
     m_keyframes.clear();
     m_vox.clear();
-    m_tile_vox.clear();
+    releaseTileAccumulator();
     m_surface_accumulator->clear();
     m_map->resetMap();
 
@@ -871,13 +957,15 @@ private:
     m_full_renders = 0;
     m_dirty = false;
     m_have_new = false;
-    m_last_full_render = 0.0;
+    m_last_product_render = 0.0;
     m_last_assoc_stamp = 0.0;
     m_last_tile_assoc_stamp = 0.0;
     m_survey_upto = 0;
     m_survey_stale = false;
-    m_reconstruction_upto = 0;
-    m_reconstruction_stale = false;
+    m_surface_upto = 0;
+    m_surface_stale = false;
+    m_tile_upto = 0;
+    m_tile_stale = true;
     m_last_hits_stamp = 0.0;
     m_last_clear_stamp = 0.0;
     m_last_survey_stamp = 0.0;
@@ -948,7 +1036,8 @@ private:
           // contribution back out of a voxel mean, so the accumulator has to
           // be rebuilt from scratch on the next render.
           m_survey_stale = true;
-          m_reconstruction_stale = true;
+          m_surface_stale = true;
+          m_tile_stale = true;
         }
         continue;
       }
@@ -1018,6 +1107,7 @@ private:
           // odom lookup: on failure the batch stays buffered for the next
           // keyframe instead of being silently unassociated forever.
           m_last_assoc_stamp = kf.stamp + m_stamp_tolerance;
+          discardAssociated(m_survey_buffer, m_last_assoc_stamp);
         }
         else
         {
@@ -1066,6 +1156,7 @@ private:
             kf.reconstruction = agg;
           }
           m_last_tile_assoc_stamp = kf.stamp + m_stamp_tolerance;
+          discardAssociated(m_tile_buffer, m_last_tile_assoc_stamp);
         }
         else
         {
@@ -1255,8 +1346,12 @@ private:
     // the accumulator has not seen.
     if (m_dirty || m_have_new)
     {
-      m_last_full_render = -std::numeric_limits<double>::infinity();
-      renderIfNeeded();
+      m_last_product_render = -std::numeric_limits<double>::infinity();
+      // The service only needs the latest occupancy state for masking; avoid
+      // serializing every live product as a side effect. This is also safe
+      // during SIGINT shutdown, when the ROS context may already be invalid
+      // even though file I/O and the node object are still usable.
+      renderIfNeeded(/*publish_outputs=*/false);
     }
     syncSurveyAccumulator();
 
@@ -1312,6 +1407,84 @@ private:
     return true;
   }
 
+  bool isNavigationPoint(const ReconstructionRow& p) const
+  {
+    return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+      std::isfinite(p.intensity) && std::isfinite(p.confidence) &&
+      p.intensity >= static_cast<float>(m_navigation_min_intensity) &&
+      p.confidence >= static_cast<float>(m_navigation_min_confidence);
+  }
+
+  // Export the exact same clean subset carried by ~/navigation_pointcloud.
+  // Unlike exportSurvey(), this does not require an occupancy render first:
+  // graph pose updates mark the surface accumulator stale immediately, and
+  // rebuilding it from keyframe-local evidence applies the current poses.
+  bool exportNavigationSurface(std::string& message)
+  {
+    if (m_navigation_export_path.empty())
+    {
+      message = "navigation_export_path is unset";
+      return false;
+    }
+    if (!m_navigation_pub)
+    {
+      message = "navigation surface is disabled (tile_topic unset)";
+      return false;
+    }
+
+    syncSurfaceAccumulator();
+    const std::vector<ReconstructionRow> reconstructed =
+      m_surface_accumulator->rows();
+    pcl::PointCloud<SurfaceExportPoint> out;
+    out.reserve(reconstructed.size());
+    for (const auto& row : reconstructed)
+    {
+      if (!isNavigationPoint(row))
+      {
+        continue;
+      }
+      SurfaceExportPoint p;
+      p.x = row.x;
+      p.y = row.y;
+      p.z = row.z;
+      p.intensity = row.intensity;
+      p.support = row.support;
+      p.view_span_deg = row.view_span_deg;
+      p.confidence = row.confidence;
+      out.push_back(p);
+    }
+    if (out.empty())
+    {
+      message = "nothing to export (no navigation surface voxels passed the gates)";
+      return false;
+    }
+
+    const std::filesystem::path path(m_navigation_export_path);
+    if (path.has_parent_path())
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(path.parent_path(), ec);
+    }
+    const std::string tmp = m_navigation_export_path + ".part";
+    auto cloud = out.makeShared();
+    if (!writeSpill(cloud, tmp))
+    {
+      message = "failed to write " + tmp;
+      return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec)
+    {
+      message = "failed to move " + tmp + " into place: " + ec.message();
+      return false;
+    }
+    message = "wrote " + std::to_string(out.size()) + " navigation points to " +
+      m_navigation_export_path;
+    RCLCPP_INFO(get_logger(), "%s", message.c_str());
+    return true;
+  }
+
   // Bring the survey accumulator up to date with the keyframe list: rebuild
   // from scratch when the graph moved (the old contributions are wrong),
   // then fold any keyframes it has not seen. Shared by the render path and
@@ -1336,7 +1509,9 @@ private:
     m_survey_upto = m_keyframes.size();
   }
 
-  void accumulateReconstruction(const KeyframeEvidence& kf, const size_t idx)
+  void accumulateReconstruction(
+    const KeyframeEvidence& kf, const size_t idx,
+    const bool accumulate_tile, const bool accumulate_surface)
   {
     const LoadedEvidence e = loadEvidence(
       kf, idx, /*want_occupancy=*/false, /*want_survey=*/false,
@@ -1350,55 +1525,98 @@ private:
     {
       const SonarReconstructionPoint p =
         transformReconstructionPoint(local, pose);
-      TileVoxAcc& a = m_tile_vox[voxelKey(
-        p.x, p.y, p.z, m_tile_resolution)];
-      a.x += p.x;
-      a.y += p.y;
-      a.z += p.z;
-      a.intensity += p.intensity;
-      a.range += p.range;
-      a.half_angle += p.elevation_half_angle;
-      ++a.n;
-      m_surface_accumulator->add(p);
+      if (accumulate_tile)
+      {
+        TileVoxAcc& a = m_tile_vox[voxelKey(
+          p.x, p.y, p.z, m_tile_resolution)];
+        a.x += p.x;
+        a.y += p.y;
+        a.z += p.z;
+        a.intensity += p.intensity;
+        a.range += p.range;
+        a.half_angle += p.elevation_half_angle;
+        ++a.n;
+      }
+      if (accumulate_surface)
+      {
+        m_surface_accumulator->add(p);
+      }
     }
   }
 
-  void syncReconstructionAccumulators()
+  void syncSurfaceAccumulator()
   {
     if (!m_tile_pub)
     {
       return;
     }
-    if (m_reconstruction_stale)
+    if (m_surface_stale)
     {
-      m_tile_vox.clear();
       m_surface_accumulator->clear();
-      m_reconstruction_upto = 0;
-      m_reconstruction_stale = false;
+      m_surface_upto = 0;
+      m_surface_stale = false;
     }
-    for (size_t i = m_reconstruction_upto; i < m_keyframes.size(); ++i)
+    for (size_t i = m_surface_upto; i < m_keyframes.size(); ++i)
     {
-      accumulateReconstruction(m_keyframes[i], i);
+      accumulateReconstruction(
+        m_keyframes[i], i, /*accumulate_tile=*/false,
+        /*accumulate_surface=*/true);
     }
-    m_reconstruction_upto = m_keyframes.size();
+    m_surface_upto = m_keyframes.size();
   }
 
-  template<std::size_t N>
+  void syncTileAccumulator()
+  {
+    if (!m_tile_pub)
+    {
+      return;
+    }
+    if (m_tile_stale)
+    {
+      std::unordered_map<uint64_t, TileVoxAcc> empty;
+      m_tile_vox.swap(empty);
+      m_tile_upto = 0;
+      m_tile_stale = false;
+    }
+    for (size_t i = m_tile_upto; i < m_keyframes.size(); ++i)
+    {
+      accumulateReconstruction(
+        m_keyframes[i], i, /*accumulate_tile=*/true,
+        /*accumulate_surface=*/false);
+    }
+    m_tile_upto = m_keyframes.size();
+  }
+
+  void releaseTileAccumulator()
+  {
+    // The immutable full-resolution reconstruction evidence remains on disk.
+    // Releasing this derived hash table therefore loses no product: a later
+    // subscriber rebuilds the exact graph-corrected tile mosaic on demand.
+    // swap(), unlike clear(), also returns the multi-million-bucket allocation.
+    if (!m_tile_vox.empty())
+    {
+      std::unordered_map<uint64_t, TileVoxAcc> empty;
+      m_tile_vox.swap(empty);
+    }
+    m_tile_upto = 0;
+    m_tile_stale = true;
+  }
+
+  template<std::size_t N, typename EmitRows>
   void publishFloatRows(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher,
     const std::array<const char*, N>& names,
-    const std::vector<std::array<float, N>>& rows,
+    const std::size_t maximum_rows,
+    EmitRows&& emit_rows,
     const rclcpp::Time& stamp)
   {
     sensor_msgs::msg::PointCloud2 msg;
     msg.header.stamp = stamp;
     msg.header.frame_id = m_map_frame;
     msg.height = 1;
-    msg.width = static_cast<std::uint32_t>(rows.size());
     msg.is_bigendian = false;
     msg.is_dense = true;
     msg.point_step = static_cast<std::uint32_t>(N * sizeof(float));
-    msg.row_step = msg.point_step * msg.width;
     msg.fields.reserve(N);
     for (std::size_t f = 0; f < N; ++f)
     {
@@ -1409,12 +1627,32 @@ private:
       field.count = 1;
       msg.fields.push_back(field);
     }
-    msg.data.resize(rows.size() * msg.point_step);
-    if (!rows.empty())
-    {
-      std::memcpy(msg.data.data(), rows.data(), msg.data.size());
-    }
+    msg.data.resize(maximum_rows * msg.point_step);
+    std::size_t emitted = 0;
+    const auto append = [&msg, &emitted, maximum_rows](
+      const std::array<float, N>& row) {
+        if (emitted >= maximum_rows)
+        {
+          return;
+        }
+        std::memcpy(
+          msg.data.data() + emitted * msg.point_step,
+          row.data(), msg.point_step);
+        ++emitted;
+      };
+    emit_rows(append);
+    msg.data.resize(emitted * msg.point_step);
+    msg.width = static_cast<std::uint32_t>(emitted);
+    msg.row_step = msg.point_step * msg.width;
     publisher->publish(msg);
+  }
+
+  static bool hasSubscribers(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher)
+  {
+    return publisher &&
+      (publisher->get_subscription_count() +
+       publisher->get_intra_process_subscription_count()) > 0;
   }
 
   void publishReconstructionProducts(const rclcpp::Time& stamp)
@@ -1423,54 +1661,140 @@ private:
     {
       return;
     }
-    syncReconstructionAccumulators();
-
-    // Product A: graph-corrected centre-plane intensity tiles. Aperture is
-    // metadata here, never painted as thickness.
-    constexpr std::array<const char*, 7> tile_names = {
-      "x", "y", "z", "intensity", "range", "support", "aperture_half_deg"};
-    std::vector<std::array<float, 7>> tile_rows;
-    tile_rows.reserve(m_tile_vox.size());
-    for (const auto& [key, a] : m_tile_vox)
+    const bool tile_requested = hasSubscribers(m_tile_pub);
+    if (tile_requested)
     {
-      (void)key;
-      if (a.n <= 0)
-      {
-        continue;
-      }
-      tile_rows.push_back({
-        static_cast<float>(a.x / a.n),
-        static_cast<float>(a.y / a.n),
-        static_cast<float>(a.z / a.n),
-        static_cast<float>(a.intensity / a.n),
-        static_cast<float>(a.range / a.n),
-        static_cast<float>(a.n),
-        static_cast<float>(a.half_angle / a.n * 180.0 / M_PI)});
+      syncTileAccumulator();
+
+      // Product A: graph-corrected centre-plane intensity tiles. Aperture is
+      // metadata here, never painted as thickness. The immutable source
+      // evidence remains on disk, so this large derived cache is resident and
+      // serialized only while somebody is actually inspecting the tile.
+      constexpr std::array<const char*, 7> tile_names = {
+        "x", "y", "z", "intensity", "range", "support", "aperture_half_deg"};
+      publishFloatRows(
+        m_tile_pub, tile_names, m_tile_vox.size(),
+        [this](const auto& append) {
+          for (const auto& [key, a] : m_tile_vox)
+          {
+            (void)key;
+            if (a.n <= 0)
+            {
+              continue;
+            }
+            append(std::array<float, 7>{
+              static_cast<float>(a.x / a.n),
+              static_cast<float>(a.y / a.n),
+              static_cast<float>(a.z / a.n),
+              static_cast<float>(a.intensity / a.n),
+              static_cast<float>(a.range / a.n),
+              static_cast<float>(a.n),
+              static_cast<float>(a.half_angle / a.n * 180.0 / M_PI)});
+          }
+        }, stamp);
     }
-    publishFloatRows(m_tile_pub, tile_names, tile_rows, stamp);
+    else
+    {
+      releaseTileAccumulator();
+    }
 
     // Product B: only ribbon intersections with independent angular support.
     constexpr std::array<const char*, 7> surface_names = {
       "x", "y", "z", "intensity", "support", "view_span_deg", "confidence"};
+    syncSurfaceAccumulator();
     const std::vector<ReconstructionRow> reconstructed =
       m_surface_accumulator->rows();
-    std::vector<std::array<float, 7>> surface_rows;
-    surface_rows.reserve(reconstructed.size());
-    for (const auto& p : reconstructed)
+    if (hasSubscribers(m_surface_pub))
     {
-      surface_rows.push_back({
-        p.x, p.y, p.z, p.intensity, p.support,
-        p.view_span_deg, p.confidence});
+      publishFloatRows(
+        m_surface_pub, surface_names, reconstructed.size(),
+        [&reconstructed](const auto& append) {
+          for (const auto& p : reconstructed)
+          {
+            append(std::array<float, 7>{
+              p.x, p.y, p.z, p.intensity, p.support,
+              p.view_span_deg, p.confidence});
+          }
+        }, stamp);
     }
-    publishFloatRows(m_surface_pub, surface_names, surface_rows, stamp);
+
+    // Product C: the compact operator-facing surface. Publish this one every
+    // render even before RViz starts so transient-local delivery gives a late
+    // operator the current graph-corrected map immediately.
+    std::size_t navigation_count = 0;
+    publishFloatRows(
+      m_navigation_pub, surface_names, reconstructed.size(),
+      [this, &reconstructed, &navigation_count](const auto& append) {
+        for (const auto& p : reconstructed)
+        {
+          if (!isNavigationPoint(p))
+          {
+            continue;
+          }
+          append(std::array<float, 7>{
+            p.x, p.y, p.z, p.intensity, p.support,
+            p.view_span_deg, p.confidence});
+          ++navigation_count;
+        }
+      }, stamp);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 30000,
+      "reconstruction products: tile %s (%zu voxels), %zu navigation / "
+      "%zu/%zu surface voxels, "
+      "%zu survey + %zu tile pings awaiting keyframe association",
+      tile_requested ? "resident" : "on disk", m_tile_vox.size(),
+      navigation_count, reconstructed.size(),
+      m_surface_accumulator->candidateCellCount(),
+      m_survey_buffer.size(), m_tile_buffer.size());
   }
 
-  void renderIfNeeded()
+  void replaceLatchedTileWithEmpty(const rclcpp::Time& stamp)
+  {
+    constexpr std::array<const char*, 7> tile_names = {
+      "x", "y", "z", "intensity", "range", "support", "aperture_half_deg"};
+    publishFloatRows(
+      m_tile_pub, tile_names, 0,
+      [](const auto&) {}, stamp);
+  }
+
+  void renderIfNeeded(const bool publish_outputs = true)
   {
     const double now = get_clock()->now().seconds();
-    bool changed     = false;
+    const bool tile_requested = hasSubscribers(m_tile_pub);
+    const bool surface_requested = hasSubscribers(m_surface_pub);
+    const bool survey_requested = hasSubscribers(m_survey_pub);
+    const bool cloud_requested = hasSubscribers(m_cloud_pub);
+    const bool consumer_started =
+      (tile_requested && !m_tile_requested_previous) ||
+      (surface_requested && !m_surface_requested_previous) ||
+      (survey_requested && !m_survey_requested_previous) ||
+      (cloud_requested && !m_cloud_requested_previous);
 
-    if (m_dirty && now - m_last_full_render >= m_render_min_period)
+    // A durable full tile sample can itself hold more than 100 MB in DDS.
+    // Once the inspector disconnects, replace it with an empty schema-bearing
+    // sample and return the derived hash-table allocation. A later subscriber
+    // is detected above and triggers an exact rebuild from the disk evidence.
+    if (!tile_requested)
+    {
+      if (m_tile_requested_previous)
+      {
+        replaceLatchedTileWithEmpty(get_clock()->now());
+      }
+      releaseTileAccumulator();
+    }
+    m_tile_requested_previous = tile_requested;
+    m_surface_requested_previous = surface_requested;
+    m_survey_requested_previous = survey_requested;
+    m_cloud_requested_previous = cloud_requested;
+
+    // Discovery normally completes before the first keyframe. Do not latch a
+    // synthetic empty snapshot merely because a viewer connected during that
+    // startup window; the first real keyframe will publish it normally.
+    bool changed = consumer_started && !m_keyframes.empty();
+    bool evidence_rendered = false;
+
+    if (m_dirty && now - m_last_product_render >= m_render_min_period)
     {
       // the graph moved: re-render everything at the current poses
       m_map->resetMap();
@@ -1487,11 +1811,12 @@ private:
       }
       m_dirty            = false;
       m_have_new         = false;
-      m_last_full_render = now;
       ++m_full_renders;
       changed = true;
+      evidence_rendered = true;
     }
-    else if (m_have_new)
+    else if (m_have_new &&
+             now - m_last_product_render >= m_render_min_period)
     {
       // append-only: integrate keyframes that haven't been rendered yet
       const bool have_reconstruction_product = static_cast<bool>(m_tile_pub);
@@ -1509,9 +1834,21 @@ private:
       changed = changed || have_reconstruction_product ||
         static_cast<bool>(m_survey_pub);
       m_have_new = false;
+      evidence_rendered = true;
     }
 
     if (!changed)
+    {
+      return;
+    }
+    // This gates every complete-map publication. Previously only graph-move
+    // rebuilds updated the timestamp, so append-only replay serialized the
+    // entire multi-million-point tile/surface products every 500 ms.
+    if (evidence_rendered)
+    {
+      m_last_product_render = now;
+    }
+    if (!publish_outputs)
     {
       return;
     }
@@ -1528,7 +1865,7 @@ private:
                                                   cloud_msg,
                                                   grid_msg,
                                                   /*create_marker=*/false,
-                                                  /*create_pointcloud=*/true,
+                                                  /*create_pointcloud=*/cloud_requested,
                                                   /*create_occupancy_grid=*/true,
                                                   /*lower_z_limit=*/0.0,
                                                   /*upper_z_limit=*/0.0,
@@ -1538,7 +1875,10 @@ private:
     const auto stamp      = get_clock()->now();
     cloud_msg.header.stamp = stamp;
     grid_msg.header.stamp  = stamp;
-    m_cloud_pub->publish(cloud_msg);
+    if (cloud_requested)
+    {
+      m_cloud_pub->publish(cloud_msg);
+    }
     m_grid_pub->publish(grid_msg);
 
     // Graph-anchored dense SURVEY render: keyframe-local rich survey clouds at
@@ -1554,7 +1894,7 @@ private:
     // `pose_sigma` is RESERVED (0) until the trajectory topic carries
     // per-keyframe marginals. `incidence` is averaged over the points that
     // know it (>= 0), -1 when none do — no sentinel dilution.
-    if (m_survey_pub)
+    if (survey_requested)
     {
       // Fold in only what is new. Re-accumulating every keyframe on every
       // render was affordable while the clouds were resident; with them on
@@ -1628,6 +1968,7 @@ private:
   int m_input_queue_depth   = 5;
   bool m_input_reliable = false;
   bool m_allow_latest_tf_fallback = true;
+  double m_tf_buffer_duration = 10.0;
   bool m_reset_on_time_rewind = true;
   double m_time_rewind_tolerance = 0.5;
   double m_render_min_period = 2.0;
@@ -1645,6 +1986,10 @@ private:
   int m_surface_min_observations = 3;
   double m_surface_min_view_span_deg = 6.0;
   int m_surface_max_samples_per_return = 31;
+  int m_surface_peak_radius_voxels = 0;
+  double m_surface_min_return_intensity = 0.0;
+  double m_navigation_min_confidence = 0.45;
+  double m_navigation_min_intensity = 0.20;
   double m_last_tile_assoc_stamp = 0.0;
 
   std::unique_ptr<VDBMapT> m_map;
@@ -1660,7 +2005,7 @@ private:
   size_t m_full_renders               = 0;
   bool m_dirty    = false;
   bool m_have_new = false;
-  double m_last_full_render = 0.0;
+  double m_last_product_render = 0.0;
 
   // Evidence spill / export. Empty spill dir = disabled (clouds stay
   // resident); m_spill_failures counts keyframes that had to stay in RAM
@@ -1670,6 +2015,8 @@ private:
   size_t m_replay_segment = 0;
   std::string m_export_path;
   bool m_export_on_shutdown = true;
+  std::string m_navigation_export_path;
+  bool m_navigation_export_on_shutdown = true;
 
   // Survey accumulator, persistent across renders. Unlike the keyframe
   // evidence this is bounded by the surveyed VOLUME rather than by elapsed
@@ -1682,8 +2029,14 @@ private:
   std::unique_ptr<MultiViewSurfaceAccumulator> m_surface_accumulator;
   size_t m_survey_upto = 0;
   bool m_survey_stale  = false;
-  size_t m_reconstruction_upto = 0;
-  bool m_reconstruction_stale = false;
+  size_t m_surface_upto = 0;
+  bool m_surface_stale = false;
+  size_t m_tile_upto = 0;
+  bool m_tile_stale = true;
+  bool m_tile_requested_previous = false;
+  bool m_surface_requested_previous = false;
+  bool m_survey_requested_previous = false;
+  bool m_cloud_requested_previous = false;
   double m_last_hits_stamp = 0.0;
   double m_last_clear_stamp = 0.0;
   double m_last_survey_stamp = 0.0;
@@ -1701,7 +2054,9 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_survey_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_tile_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_surface_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_navigation_pub;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr m_export_srv;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr m_navigation_export_srv;
   rclcpp::TimerBase::SharedPtr m_render_timer;
 
 public:
@@ -1710,14 +2065,24 @@ public:
   // rclcpp::shutdown() has torn the context down.
   void exportOnShutdown()
   {
-    if (!m_export_on_shutdown || m_export_path.empty())
+    if (m_export_on_shutdown && !m_export_path.empty())
     {
-      return;
+      std::string message;
+      if (!exportSurvey(message))
+      {
+        RCLCPP_WARN(
+          get_logger(), "shutdown survey export skipped: %s", message.c_str());
+      }
     }
-    std::string message;
-    if (!exportSurvey(message))
+    if (m_navigation_export_on_shutdown && !m_navigation_export_path.empty())
     {
-      RCLCPP_WARN(get_logger(), "shutdown export skipped: %s", message.c_str());
+      std::string message;
+      if (!exportNavigationSurface(message))
+      {
+        RCLCPP_WARN(
+          get_logger(), "shutdown navigation export skipped: %s",
+          message.c_str());
+      }
     }
   }
 };

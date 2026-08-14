@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 
 #include <vdb_mapping_ros2/sonar_reconstruction.hpp>
@@ -87,6 +88,55 @@ TEST(SonarReconstruction, OnePingCountsOnceAndViewDiversityIsRequired)
   EXPECT_GE(target->support, 3.0F);
   EXPECT_GE(target->view_span_deg, 19.0F);
   EXPECT_NEAR(target->intensity, 0.6F, 1e-5F);
+  EXPECT_GT(target->confidence, 0.0F);
+  EXPECT_LT(target->confidence, 1.0F);
+}
+
+TEST(SonarReconstruction, ElevationPeakFilterRejectsApertureVolume)
+{
+  vdb_mapping_ros2::MultiViewSurfaceAccumulator volume(
+    0.20F, 3, 6.0F * static_cast<float>(M_PI) / 180.0F, 21, 0);
+  vdb_mapping_ros2::MultiViewSurfaceAccumulator surface(
+    0.20F, 3, 6.0F * static_cast<float>(M_PI) / 180.0F, 21, 2);
+  for (const float angle : {-5.0F, 0.0F, 5.0F})
+  {
+    const auto p = observation(
+      angle, static_cast<std::uint32_t>(angle + 6.0F));
+    volume.add(p);
+    surface.add(p);
+  }
+  const auto volume_rows = volume.rows();
+  const auto surface_rows = surface.rows();
+  ASSERT_FALSE(volume_rows.empty());
+  ASSERT_FALSE(surface_rows.empty());
+  EXPECT_LT(surface_rows.size(), volume_rows.size());
+  EXPECT_TRUE(std::any_of(
+    surface_rows.begin(), surface_rows.end(), [](const auto& row) {
+      return std::fabs(row.x - 5.0F) < 0.15F &&
+        std::hypot(row.y, row.z) < 0.15F;
+    }));
+}
+
+TEST(SonarReconstruction, WeakReturnsCannotVoteForStructure)
+{
+  vdb_mapping_ros2::MultiViewSurfaceAccumulator surface(
+    0.20F, 3, 6.0F * static_cast<float>(M_PI) / 180.0F, 21, 2, 0.20F);
+  for (const float angle : {-5.0F, 0.0F, 5.0F})
+  {
+    auto p = observation(angle, static_cast<std::uint32_t>(angle + 6.0F));
+    p.intensity = 0.19F;
+    surface.add(p);
+  }
+  EXPECT_TRUE(surface.rows().empty());
+
+  surface.clear();
+  for (const float angle : {-5.0F, 0.0F, 5.0F})
+  {
+    auto p = observation(angle, static_cast<std::uint32_t>(angle + 6.0F));
+    p.intensity = 0.20F;
+    surface.add(p);
+  }
+  EXPECT_FALSE(surface.rows().empty());
 }
 
 int main(int argc, char** argv)

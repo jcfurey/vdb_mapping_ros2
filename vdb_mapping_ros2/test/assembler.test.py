@@ -39,6 +39,12 @@ def generate_test_description():
             'surface_min_observations': 3,
             'surface_min_view_span_deg': 6.0,
             'surface_max_samples_per_return': 5,
+            'surface_peak_radius_voxels': 2,
+            'surface_min_return_intensity': 0.2,
+            'navigation_min_confidence': 0.45,
+            'navigation_min_intensity': 0.2,
+            'navigation_export_path': '/tmp/assembler_test_navigation.pcd',
+            'navigation_export_on_shutdown': True,
             'prob_thres_min': 0.49,
             'prob_thres_max': 0.51,
             # exact-stamp TF only: a fallback to latest would silently
@@ -74,3 +80,13 @@ class TestAssembler(unittest.TestCase):
 class TestAfterShutdown(unittest.TestCase):
     def test_exit_code(self, proc_info, harness):
         assertExitCodes(proc_info, allowable_exit_codes=[0], process=harness)
+
+    def test_navigation_surface_was_exported_on_shutdown(self):
+        path = '/tmp/assembler_test_navigation.pcd'
+        self.assertTrue(os.path.exists(path))
+        with open(path, 'rb') as stream:
+            header = stream.read(512).decode('ascii', errors='ignore')
+        self.assertIn(
+            'FIELDS x y z intensity support view_span_deg confidence',
+            header,
+        )

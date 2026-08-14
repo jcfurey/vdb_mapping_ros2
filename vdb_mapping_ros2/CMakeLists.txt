@@ -77,6 +77,12 @@ if(BUILD_TESTING)
     ament_target_dependencies(test_sonar_reconstruction pcl_conversions)
   endif()
 
+  ament_add_gtest(test_mapping_tools test/unit/test_mapping_tools.cpp)
+  if(TARGET test_mapping_tools)
+    target_include_directories(test_mapping_tools PRIVATE include)
+    target_link_libraries(test_mapping_tools ${PROJECT_NAME})
+  endif()
+
   # End-to-end launch tests: start a vdb_mapping_ros_node, feed it a synthetic
   # wall cloud and validate the published occupancy grid / marker and the
   # raytrace + get_map_section services against the known geometry.

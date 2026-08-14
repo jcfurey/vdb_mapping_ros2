@@ -263,9 +263,13 @@ class MultiViewSurfaceAccumulator
 public:
   MultiViewSurfaceAccumulator(
     const float resolution, const int min_observations,
-    const float min_view_span_rad, const int max_samples)
+    const float min_view_span_rad, const int max_samples,
+    const int peak_radius_voxels = 0,
+    const float min_return_intensity = 0.0F)
     : resolution_(resolution), min_observations_(min_observations),
-      min_view_span_rad_(min_view_span_rad), max_samples_(max_samples)
+      min_view_span_rad_(min_view_span_rad), max_samples_(max_samples),
+      peak_radius_voxels_(std::max(0, peak_radius_voxels)),
+      min_return_intensity_(std::clamp(min_return_intensity, 0.0F, 1.0F))
   {}
 
   void clear()
@@ -276,13 +280,20 @@ public:
   void add(const SonarReconstructionPoint& p)
   {
     const float aspect = boresightElevation(p);
-    if (!std::isfinite(aspect) || !std::isfinite(p.intensity))
+    Eigen::Vector3f elevation_axis = pointElevationAxis(p);
+    const float axis_norm = elevation_axis.norm();
+    if (!std::isfinite(aspect) || !std::isfinite(p.intensity) ||
+        p.intensity < min_return_intensity_ ||
+        !elevation_axis.allFinite() || !(axis_norm > 1e-6F))
     {
       return;
     }
+    elevation_axis /= axis_norm;
+    const Eigen::Vector3f measured_position = pointPosition(p);
     forEachElevationRibbonSample(
       p, resolution_, max_samples_,
-      [this, &p, aspect](const Eigen::Vector3f& q) {
+      [this, &p, aspect, &elevation_axis, &measured_position](
+        const Eigen::Vector3f& q) {
         if (!q.allFinite())
         {
           return;
@@ -297,12 +308,16 @@ public:
           c.pending_intensity = p.intensity;
           c.pending_position = q;
           c.pending_aspect = aspect;
+          c.pending_axis = elevation_axis;
+          c.pending_centre_distance = (q - measured_position).squaredNorm();
         }
         else if (p.intensity > c.pending_intensity)
         {
           c.pending_intensity = p.intensity;
           c.pending_position = q;
           c.pending_aspect = aspect;
+          c.pending_axis = elevation_axis;
+          c.pending_centre_distance = (q - measured_position).squaredNorm();
         }
       });
   }
@@ -310,25 +325,37 @@ public:
   std::vector<ReconstructionRow> rows()
   {
     std::vector<ReconstructionRow> out;
-    out.reserve(cells_.size());
+    // Most ribbon candidates never earn the independent support/view-span
+    // gates. Reserving for every candidate made a sparse output allocate as
+    // though all uncertainty volume were publishable (hundreds of MB on the
+    // 08-12 survey). Grow from a modest seed instead.
+    out.reserve(std::min<std::size_t>(cells_.size(), 65536));
     for (auto& [key, c] : cells_)
     {
       (void)key;
       commit(c);
-      if (c.support < min_observations_)
-      {
-        continue;
-      }
+    }
+    for (const auto& [key, c] : cells_)
+    {
+      if (!qualifies(c)) continue;
       const float span = c.max_aspect - c.min_aspect;
-      if (span + 1e-6F < min_view_span_rad_)
+      float strongest_neighbor = 0.0F;
+      if (!isElevationPeak(key, c, strongest_neighbor))
       {
         continue;
       }
-      const float support_score = std::min(
-        1.0F, static_cast<float>(c.support) /
-          static_cast<float>(std::max(1, min_observations_)));
+      // Unlike the former value/threshold clamp, these scores retain useful
+      // dynamic range after thresholding (the old formula made confidence
+      // mathematically equal to 1 for every emitted point).
+      const float support_score = 1.0F - std::exp(
+        -static_cast<float>(c.support) /
+        static_cast<float>(std::max(1, min_observations_)));
       const float span_score = min_view_span_rad_ > 0.0F
-        ? std::min(1.0F, span / min_view_span_rad_) : 1.0F;
+        ? 1.0F - std::exp(-span / min_view_span_rad_) : 1.0F;
+      const float score = evidenceScore(c);
+      const float prominence = score > 1e-6F
+        ? std::clamp((score - strongest_neighbor) / score, 0.0F, 1.0F)
+        : 0.0F;
       const Eigen::Vector3f centre = c.position_sum /
         static_cast<float>(c.support);
       out.push_back({
@@ -336,7 +363,8 @@ public:
         c.intensity_sum / static_cast<float>(c.support),
         static_cast<float>(c.support),
         span * 180.0F / static_cast<float>(M_PI),
-        support_score * span_score});
+        std::sqrt(support_score * span_score) *
+          (0.5F + 0.5F * prominence)});
     }
     return out;
   }
@@ -354,11 +382,15 @@ private:
     int support = 0;
     float min_aspect = std::numeric_limits<float>::infinity();
     float max_aspect = -std::numeric_limits<float>::infinity();
+    Eigen::Vector3f axis_sum = Eigen::Vector3f::Zero();
+    float centre_distance_sum = 0.0F;
     bool pending = false;
     std::uint32_t pending_observation = 0;
     float pending_intensity = 0.0F;
     Eigen::Vector3f pending_position = Eigen::Vector3f::Zero();
     float pending_aspect = 0.0F;
+    Eigen::Vector3f pending_axis = Eigen::Vector3f::Zero();
+    float pending_centre_distance = 0.0F;
   };
 
   static void commit(Cell& c)
@@ -371,14 +403,86 @@ private:
     c.intensity_sum += c.pending_intensity;
     c.min_aspect = std::min(c.min_aspect, c.pending_aspect);
     c.max_aspect = std::max(c.max_aspect, c.pending_aspect);
+    // Only the uncertainty-axis orientation matters for peak suppression;
+    // opposite vehicle headings must not cancel the accumulated direction.
+    c.axis_sum += c.pending_axis.cwiseAbs();
+    c.centre_distance_sum += c.pending_centre_distance;
     ++c.support;
     c.pending = false;
+  }
+
+  bool qualifies(const Cell& c) const
+  {
+    return c.support >= min_observations_ &&
+      c.max_aspect - c.min_aspect + 1e-6F >= min_view_span_rad_;
+  }
+
+  static float evidenceScore(const Cell& c)
+  {
+    // Support is primary, while return strength breaks the broad integer
+    // plateaus created when many aperture ribbons cross adjacent voxels.
+    return 0.25F * static_cast<float>(c.support) +
+      0.75F * c.intensity_sum;
+  }
+
+  static std::uint64_t offsetKey(
+    const std::uint64_t key, const int axis, const int offset)
+  {
+    constexpr std::uint64_t mask = 0x1FFFFFULL;
+    std::uint64_t x = (key >> 42) & mask;
+    std::uint64_t y = (key >> 21) & mask;
+    std::uint64_t z = key & mask;
+    const auto shifted = [offset](const std::uint64_t value) {
+      return static_cast<std::uint64_t>(
+        (static_cast<std::int64_t>(value) + offset) & 0x1FFFFFLL);
+    };
+    if (axis == 0) x = shifted(x);
+    else if (axis == 1) y = shifted(y);
+    else z = shifted(z);
+    return (x << 42) | (y << 21) | z;
+  }
+
+  bool isElevationPeak(
+    const std::uint64_t key, const Cell& c,
+    float& strongest_neighbor) const
+  {
+    strongest_neighbor = 0.0F;
+    if (peak_radius_voxels_ <= 0) return true;
+    const Eigen::Vector3f axis = c.axis_sum.cwiseAbs();
+    int dominant_axis = 0;
+    if (axis.y() > axis.x()) dominant_axis = 1;
+    if (axis.z() > axis[dominant_axis]) dominant_axis = 2;
+    if (!(axis[dominant_axis] > 1e-6F)) return true;
+
+    const float score = evidenceScore(c);
+    const float centre_distance = c.centre_distance_sum /
+      static_cast<float>(c.support);
+    for (int distance = 1; distance <= peak_radius_voxels_; ++distance)
+    {
+      for (const int direction : {-1, 1})
+      {
+        const auto found = cells_.find(offsetKey(
+          key, dominant_axis, direction * distance));
+        if (found == cells_.end() || !qualifies(found->second)) continue;
+        const Cell& neighbor = found->second;
+        const float neighbor_score = evidenceScore(neighbor);
+        strongest_neighbor = std::max(strongest_neighbor, neighbor_score);
+        if (neighbor_score > score + 1e-6F) return false;
+        if (std::fabs(neighbor_score - score) <= 1e-6F &&
+            neighbor.centre_distance_sum /
+              static_cast<float>(neighbor.support) + 1e-6F < centre_distance)
+          return false;
+      }
+    }
+    return true;
   }
 
   float resolution_;
   int min_observations_;
   float min_view_span_rad_;
   int max_samples_;
+  int peak_radius_voxels_;
+  float min_return_intensity_;
   std::unordered_map<std::uint64_t, Cell> cells_;
 };
 

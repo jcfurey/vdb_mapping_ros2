@@ -10,6 +10,7 @@
 #     (the xy/yaw gate used to swallow it).
 # Exits 0 on success; the launch wrapper asserts the exit code.
 import math
+import os
 import struct
 import sys
 import time
@@ -21,6 +22,7 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
 
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import PointCloud2, PointField
+from std_srvs.srv import Trigger
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 T_E = 10.0      # survey evidence stamp
@@ -29,6 +31,7 @@ ODOM_X_E = 1.0  # vehicle odom x at the evidence stamp
 ODOM_X_KF = 2.0
 MAP_KF = (2.0, 0.0, 0.0)   # optimized keyframe pose (translation)
 Z_CORRECTION = -1.0
+NAV_EXPORT = "/tmp/assembler_test_navigation.pcd"
 # survey input point, robot frame at T_E, with distinct metadata everywhere
 P_ROBOT = (1.0, 0.0, 0.0)
 META = dict(intensity=0.5, range=5.0, incidence=0.7, survey_fallback=0.0,
@@ -179,15 +182,22 @@ class Harness(Node):
         self.snapshots = []
         self.tile_snapshots = []
         self.surface_snapshots = []
+        self.navigation_snapshots = []
+        self.latched_qos = latched
         self.create_subscription(
             PointCloud2, "/assembler/survey_pointcloud",
             lambda m: self.snapshots.append(parse_survey(m)), latched)
-        self.create_subscription(
+        self.tile_sub = self.create_subscription(
             PointCloud2, "/assembler/tile_pointcloud",
             lambda m: self.tile_snapshots.append(parse_survey(m)), latched)
         self.create_subscription(
             PointCloud2, "/assembler/surface_pointcloud",
             lambda m: self.surface_snapshots.append(parse_survey(m)), latched)
+        self.create_subscription(
+            PointCloud2, "/assembler/navigation_pointcloud",
+            lambda m: self.navigation_snapshots.append(parse_survey(m)), latched)
+        self.navigation_export = self.create_client(
+            Trigger, "/assembler/export_navigation_surface")
 
         transforms = []
         for angle in TILE_ANGLES:
@@ -288,7 +298,8 @@ def main():
 
     if not spin_until(
             node,
-            lambda: bool(node.tile_snapshots) and bool(node.surface_snapshots),
+            lambda: bool(node.tile_snapshots) and bool(node.surface_snapshots)
+            and bool(node.navigation_snapshots),
             10.0):
         print("FAIL: reconstruction products were not published", flush=True)
         return 1
@@ -308,14 +319,71 @@ def main():
         return 1
     if target.get("support", 0.0) < 3.0 or \
             target.get("view_span_deg", 0.0) < 19.0 or \
-            target.get("confidence", 0.0) < 0.99:
+            not 0.5 < target.get("confidence", 0.0) < 1.0:
         print(f"FAIL: weak/non-diverse surface evidence: {target}", flush=True)
         return 1
-    print("[2] tile mosaic + angular multi-view surface OK", flush=True)
+    navigation_target = next((p for p in node.navigation_snapshots[-1]
+                              if close(p["x"], 6.0, 0.25)
+                              and close(p["y"], 0.0, 0.25)
+                              and close(p["z"], 0.0, 0.25)), None)
+    if navigation_target is None or navigation_target["confidence"] < 0.45:
+        print(f"FAIL: clean navigation surface omitted the strong target: "
+              f"{node.navigation_snapshots[-1]}", flush=True)
+        return 1
+
+    if not node.navigation_export.wait_for_service(timeout_sec=5.0):
+        print("FAIL: navigation export service unavailable", flush=True)
+        return 1
+    future = node.navigation_export.call_async(Trigger.Request())
+    if not spin_until(node, future.done, 10.0) or not future.result().success:
+        result = future.result() if future.done() else None
+        print(f"FAIL: navigation export failed: {result}", flush=True)
+        return 1
+    try:
+        with open(NAV_EXPORT, "rb") as stream:
+            header = stream.read(512).decode("ascii", errors="ignore")
+    except OSError as exc:
+        print(f"FAIL: cannot read navigation export: {exc}", flush=True)
+        return 1
+    if "FIELDS x y z intensity support view_span_deg confidence" not in header:
+        print(f"FAIL: navigation PCD schema is wrong: {header}", flush=True)
+        return 1
+    # Prove the later file is from the shutdown path, not this service call.
+    try:
+        os.unlink(NAV_EXPORT)
+    except OSError as exc:
+        print(f"FAIL: cannot clear service export before shutdown test: {exc}",
+              flush=True)
+        return 1
+
+    # The full tile cache is intentionally released when nobody views it, but
+    # its raw keyframe evidence must remain recoverable. Disconnect, give the
+    # assembler time to release/replace its durable sample, then reconnect and
+    # require the exact product to be rebuilt from spill.
+    node.destroy_subscription(node.tile_sub)
+    node.tile_sub = None
+    node.tile_snapshots.clear()
+    disconnect_deadline = time.monotonic() + 1.5
+    while time.monotonic() < disconnect_deadline:
+        node.broadcast_odom()
+        rclpy.spin_once(node, timeout_sec=0.1)
+    node.tile_sub = node.create_subscription(
+        PointCloud2, "/assembler/tile_pointcloud",
+        lambda m: node.tile_snapshots.append(parse_survey(m)),
+        node.latched_qos)
+    if not spin_until(
+            node, lambda: any(len(snap) >= 3 for snap in node.tile_snapshots),
+            10.0):
+        print("FAIL: tile product was not rebuilt after viewer reconnected",
+              flush=True)
+        return 1
+    print("[2] tile retained on disk + diagnostic/live/export surfaces OK",
+          flush=True)
 
     # z-only correction must re-render the product at the new depth
     n_before = len(node.snapshots)
     n_surface_before = len(node.surface_snapshots)
+    n_navigation_before = len(node.navigation_snapshots)
     node.traj_pub.publish(make_traj((MAP_KF[0], MAP_KF[1],
                                      MAP_KF[2] + Z_CORRECTION)))
 
@@ -343,6 +411,18 @@ def main():
 
     if not spin_until(node, surface_z_moved, 10.0):
         print("FAIL: multi-view surface did not follow graph z correction",
+              flush=True)
+        return 1
+    def navigation_z_moved():
+        node.broadcast_odom()
+        for snap in node.navigation_snapshots[n_navigation_before:]:
+            if any(close(p["x"], 6.0, 0.25) and
+                   close(p["z"], Z_CORRECTION, 0.25) for p in snap):
+                return True
+        return False
+
+    if not spin_until(node, navigation_z_moved, 10.0):
+        print("FAIL: navigation surface did not follow graph z correction",
               flush=True)
         return 1
     print("[3] z-only correction re-rendered every product OK", flush=True)

@@ -117,7 +117,10 @@ const char* cloudMsgError(const sensor_msgs::msg::PointCloud2& msg)
 VDBMappingROS2::VDBMappingROS2(const rclcpp::NodeOptions& options)
   : Node("vdb_mapping_ros2", options)
 {
-  m_tf_buffer   = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+  const double tf_buffer_duration = std::max(
+    0.1, this->declare_parameter<double>("tf_buffer_duration", 10.0));
+  m_tf_buffer = std::make_unique<tf2_ros::Buffer>(
+    this->get_clock(), tf2::durationFromSec(tf_buffer_duration));
   m_tf_listener = std::make_shared<tf2_ros::TransformListener>(*m_tf_buffer);
 
   m_accumulation_cb_group =
