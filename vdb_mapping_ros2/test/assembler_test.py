@@ -21,6 +21,7 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
 
 from geometry_msgs.msg import TransformStamped
+from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import PointCloud2, PointField
 from std_srvs.srv import Trigger
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
@@ -80,13 +81,13 @@ def make_survey_cloud(stamp_s):
     return msg
 
 
-def make_xyz_cloud(stamp_s, xyz):
+def make_xyz_cloud(stamp_s, xyzs):
     msg = PointCloud2()
     msg.header.stamp.sec = int(stamp_s)
     msg.header.stamp.nanosec = int((stamp_s - int(stamp_s)) * 1e9)
     msg.header.frame_id = "base_link"
     msg.height = 1
-    msg.width = 1
+    msg.width = len(xyzs)
     msg.is_bigendian = False
     msg.is_dense = True
     for i, name in enumerate(("x", "y", "z")):
@@ -97,8 +98,8 @@ def make_xyz_cloud(stamp_s, xyz):
         f.count = 1
         msg.fields.append(f)
     msg.point_step = 12
-    msg.row_step = 12
-    msg.data = struct.pack("<3f", *xyz)
+    msg.row_step = msg.point_step * msg.width
+    msg.data = b"".join(struct.pack("<3f", *xyz) for xyz in xyzs)
     return msg
 
 
@@ -108,7 +109,11 @@ def make_tile_cloud(stamp_s, frame):
     msg.header.stamp.nanosec = int((stamp_s - int(stamp_s)) * 1e9)
     msg.header.frame_id = frame
     msg.height = 1
-    msg.width = 1
+    # Two physical targets receive the same three independent elevation views.
+    # The first will be contradicted by a clearing ray; the second remains a
+    # valid navigation surface and proves the mask is selective.
+    optical_targets = ((0.0, 0.0, 5.0), (0.0, 2.0, 5.0))
+    msg.width = len(optical_targets)
     msg.is_bigendian = False
     msg.is_dense = True
     for i, name in enumerate(TILE_FIELDS):
@@ -119,11 +124,15 @@ def make_tile_cloud(stamp_s, frame):
         f.count = 1
         msg.fields.append(f)
     msg.point_step = 4 * len(TILE_FIELDS)
-    msg.row_step = msg.point_step
+    msg.row_step = msg.point_step * msg.width
     half = math.radians(10.0)
-    msg.data = struct.pack(
-        "<7f", 0.0, 0.0, 5.0, 0.6, 5.0, 0.0,
-        5.0 * math.tan(half))
+    rows = []
+    for x, y, z in optical_targets:
+        measured_range = math.sqrt(x * x + y * y + z * z)
+        rows.append(struct.pack(
+            "<7f", x, y, z, 0.6, measured_range,
+            math.atan2(y, z), measured_range * math.tan(half)))
+    msg.data = b"".join(rows)
     return msg
 
 
@@ -175,6 +184,7 @@ class Harness(Node):
         self.tfb = TransformBroadcaster(self)
         self.static_tfb = StaticTransformBroadcaster(self)
         self.hits_pub = self.create_publisher(PointCloud2, "/test/hits", reliable)
+        self.clear_pub = self.create_publisher(PointCloud2, "/test/clear", reliable)
         self.survey_pub = self.create_publisher(PointCloud2, "/test/survey", reliable)
         self.tile_pub = self.create_publisher(PointCloud2, "/test/tile", reliable)
         # the assembler's trajectory subscription is transient_local
@@ -183,6 +193,7 @@ class Harness(Node):
         self.tile_snapshots = []
         self.surface_snapshots = []
         self.navigation_snapshots = []
+        self.occupancy_snapshots = []
         self.latched_qos = latched
         self.create_subscription(
             PointCloud2, "/assembler/survey_pointcloud",
@@ -196,6 +207,9 @@ class Harness(Node):
         self.create_subscription(
             PointCloud2, "/assembler/navigation_pointcloud",
             lambda m: self.navigation_snapshots.append(parse_survey(m)), latched)
+        self.create_subscription(
+            OccupancyGrid, "/assembler/vdb_map_occupancy",
+            lambda m: self.occupancy_snapshots.append(m), latched)
         self.navigation_export = self.create_client(
             Trigger, "/assembler/export_navigation_surface")
 
@@ -241,6 +255,41 @@ def close(a, b, tol=1e-3):
     return abs(a - b) <= tol
 
 
+def occupancy_at(msg, x, y):
+    col = math.floor((x - msg.info.origin.position.x) / msg.info.resolution)
+    row = math.floor((y - msg.info.origin.position.y) / msg.info.resolution)
+    if col < 0 or row < 0 or col >= msg.info.width or row >= msg.info.height:
+        return None
+    return msg.data[row * msg.info.width + col]
+
+
+def read_navigation_pcd(path):
+    """Read the all-float binary PCD emitted by SurfaceExportPoint."""
+    fields = []
+    point_count = 0
+    with open(path, "rb") as stream:
+        while True:
+            line = stream.readline()
+            if not line:
+                raise ValueError("PCD header ended before DATA")
+            text = line.decode("ascii").strip()
+            if text.startswith("FIELDS "):
+                fields = text.split()[1:]
+            elif text.startswith("POINTS "):
+                point_count = int(text.split()[1])
+            elif text == "DATA binary":
+                payload = stream.read()
+                break
+    if not fields or len(payload) < point_count * 4 * len(fields):
+        raise ValueError("malformed navigation PCD")
+    rows = []
+    for index in range(point_count):
+        values = struct.unpack_from(
+            "<" + "f" * len(fields), payload, index * 4 * len(fields))
+        rows.append(dict(zip(fields, values)))
+    return fields, rows
+
+
 def main():
     rclpy.init()
     node = Harness()
@@ -254,7 +303,15 @@ def main():
     for index, angle in enumerate(TILE_ANGLES):
         node.tile_pub.publish(make_tile_cloud(
             T_E + 0.1 * index, f"tile_{int(angle):+d}"))
-    node.hits_pub.publish(make_xyz_cloud(T_KF, (3.0, 0.0, 0.0)))
+    # A three-cell raw-hit line survives the legacy occupancy projection's
+    # isolated-cell filter. confirmed_surface mode must nevertheless remove it
+    # from the persistent planning map and mark the reconstructed target.
+    node.hits_pub.publish(make_xyz_cloud(
+        T_KF, [(2.9, 0.0, 0.0), (3.0, 0.0, 0.0), (3.1, 0.0, 0.0)]))
+    # At the keyframe pose this ray runs from map x=2 to x=7.5 and therefore
+    # marks the reconstructed (6,0,0) hypothesis free. It does not touch the
+    # equally strong (6,2,0) target.
+    node.clear_pub.publish(make_xyz_cloud(T_KF, [(5.5, 0.0, 0.0)]))
     for _ in range(5):
         rclpy.spin_once(node, timeout_sec=0.1)
         node.broadcast_odom()
@@ -322,13 +379,39 @@ def main():
             not 0.5 < target.get("confidence", 0.0) < 1.0:
         print(f"FAIL: weak/non-diverse surface evidence: {target}", flush=True)
         return 1
+    contradicted_navigation_target = next(
+        (p for p in node.navigation_snapshots[-1]
+         if close(p["x"], 6.0, 0.25)
+         and close(p["y"], 0.0, 0.25)
+         and close(p["z"], 0.0, 0.25)), None)
+    if contradicted_navigation_target is not None:
+        print("FAIL: observed-free ribbon hypothesis leaked into the clean "
+              f"navigation surface: {contradicted_navigation_target}",
+              flush=True)
+        return 1
     navigation_target = next((p for p in node.navigation_snapshots[-1]
                               if close(p["x"], 6.0, 0.25)
-                              and close(p["y"], 0.0, 0.25)
+                              and close(p["y"], 2.0, 0.25)
                               and close(p["z"], 0.0, 0.25)), None)
     if navigation_target is None or navigation_target["confidence"] < 0.45:
-        print(f"FAIL: clean navigation surface omitted the strong target: "
+        print(f"FAIL: clean navigation surface omitted the uncontradicted target: "
               f"{node.navigation_snapshots[-1]}", flush=True)
+        return 1
+    if not spin_until(node, lambda: bool(node.occupancy_snapshots), 10.0):
+        print("FAIL: no global occupancy snapshot", flush=True)
+        return 1
+    occupancy = node.occupancy_snapshots[-1]
+    if occupancy_at(occupancy, 6.0, 0.0) == 100:
+        print("FAIL: observed-free surface hypothesis overwrote global "
+              "occupancy at (6,0)", flush=True)
+        return 1
+    if occupancy_at(occupancy, 6.0, 2.0) != 100:
+        print("FAIL: uncontradicted multi-view surface did not mark global "
+              "occupancy at (6,2)", flush=True)
+        return 1
+    if occupancy_at(occupancy, 5.0, 0.0) == 100:
+        print("FAIL: provisional raw hit remained lethal in "
+              "confirmed_surface mode", flush=True)
         return 1
 
     if not node.navigation_export.wait_for_service(timeout_sec=5.0):
@@ -340,13 +423,24 @@ def main():
         print(f"FAIL: navigation export failed: {result}", flush=True)
         return 1
     try:
-        with open(NAV_EXPORT, "rb") as stream:
-            header = stream.read(512).decode("ascii", errors="ignore")
-    except OSError as exc:
+        fields, exported = read_navigation_pcd(NAV_EXPORT)
+    except (OSError, ValueError) as exc:
         print(f"FAIL: cannot read navigation export: {exc}", flush=True)
         return 1
-    if "FIELDS x y z intensity support view_span_deg confidence" not in header:
-        print(f"FAIL: navigation PCD schema is wrong: {header}", flush=True)
+    expected_fields = [
+        "x", "y", "z", "intensity", "support", "view_span_deg", "confidence"]
+    if fields != expected_fields:
+        print(f"FAIL: navigation PCD schema is wrong: {fields}", flush=True)
+        return 1
+    if any(close(p["x"], 6.0, 0.25) and close(p["y"], 0.0, 0.25)
+           and close(p["z"], 0.0, 0.25) for p in exported):
+        print("FAIL: navigation export retained an observed-free hypothesis",
+              flush=True)
+        return 1
+    if not any(close(p["x"], 6.0, 0.25) and close(p["y"], 2.0, 0.25)
+               and close(p["z"], 0.0, 0.25) for p in exported):
+        print("FAIL: navigation export omitted the uncontradicted target",
+              flush=True)
         return 1
     # Prove the later file is from the shutdown path, not this service call.
     try:
@@ -417,6 +511,7 @@ def main():
         node.broadcast_odom()
         for snap in node.navigation_snapshots[n_navigation_before:]:
             if any(close(p["x"], 6.0, 0.25) and
+                   close(p["y"], 2.0, 0.25) and
                    close(p["z"], Z_CORRECTION, 0.25) for p in snap):
                 return True
         return False

@@ -47,6 +47,36 @@ TEST(SonarReconstruction, RibbonStaysOnMeasuredSlantRange)
   EXPECT_TRUE(saw_centre);
 }
 
+TEST(SonarReconstruction, UncappedRibbonHonoursResolutionAtHfAndLfRange)
+{
+  const float half_angle = 10.0F * static_cast<float>(M_PI) / 180.0F;
+  EXPECT_EQ(
+    vdb_mapping_ros2::elevationRibbonSampleCount(
+      5.0F, half_angle, 0.1F, 0),
+    19);
+  EXPECT_EQ(
+    vdb_mapping_ros2::elevationRibbonSampleCount(
+      30.0F, half_angle, 0.1F, 0),
+    107);
+  EXPECT_EQ(
+    vdb_mapping_ros2::elevationRibbonSampleCount(
+      30.0F, half_angle, 0.1F, 31),
+    31);
+
+  auto lf = observation(0.0F, 1);
+  lf.range = 30.0F;
+  lf.x = 30.0F;
+  std::vector<Eigen::Vector3f> samples;
+  vdb_mapping_ros2::forEachElevationRibbonSample(
+    lf, 0.1F, 0,
+    [&samples](const Eigen::Vector3f& q) { samples.push_back(q); });
+  ASSERT_EQ(samples.size(), 107U);
+  for (std::size_t i = 1; i < samples.size(); ++i)
+  {
+    EXPECT_LE((samples[i] - samples[i - 1]).norm(), 0.1F + 1e-5F);
+  }
+}
+
 TEST(SonarReconstruction, TransformMovesPointsAndOriginsButOnlyRotatesAxes)
 {
   const auto p = observation(0.0F, 7);

@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -46,7 +47,9 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <shared_mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -201,6 +204,13 @@ public:
     // available for diagnosis and offline analysis.
     declare_parameter<double>("navigation_min_confidence", 0.45);
     declare_parameter<double>("navigation_min_intensity", 0.20);
+    // Which obstacle evidence owns the graph-corrected 2-D planning map:
+    //   hits              legacy capped-curtain VDB projection
+    //   union             legacy projection plus confirmed surface cells
+    //   confirmed_surface preserve VDB observed/free space, but only the
+    //                     multi-view surface may mark lethal cells
+    // The 3-D navigation_pointcloud always remains the confirmed surface.
+    declare_parameter<std::string>("global_occupancy_mode", "hits");
     declare_parameter<std::string>("odom_frame", "odom");
     // evidence association
     declare_parameter<double>("buffer_seconds", 6.0);
@@ -262,11 +272,45 @@ public:
     get_parameter("surface_min_return_intensity", m_surface_min_return_intensity);
     get_parameter("navigation_min_confidence", m_navigation_min_confidence);
     get_parameter("navigation_min_intensity", m_navigation_min_intensity);
+    {
+      std::string mode;
+      get_parameter("global_occupancy_mode", mode);
+      if (mode == "hits")
+      {
+        m_global_occupancy_mode = GlobalOccupancyMode::Hits;
+      }
+      else if (mode == "union")
+      {
+        m_global_occupancy_mode = GlobalOccupancyMode::Union;
+      }
+      else if (mode == "confirmed_surface")
+      {
+        m_global_occupancy_mode = GlobalOccupancyMode::ConfirmedSurface;
+      }
+      else
+      {
+        throw std::invalid_argument(
+          "global_occupancy_mode must be hits, union, or confirmed_surface; got '" +
+          mode + "'");
+      }
+    }
     m_tile_resolution = std::max(1e-3, m_tile_resolution);
     m_surface_resolution = std::max(1e-3, m_surface_resolution);
     m_surface_min_observations = std::max(1, m_surface_min_observations);
-    m_surface_max_samples_per_return =
-      std::max(3, m_surface_max_samples_per_return);
+    // Zero is the quality-first mode: sample every elevation ribbon densely
+    // enough for surface_resolution at the measured range. A positive cap is
+    // an explicit compute trade, but values 1/2 cannot retain both aperture
+    // edges plus the measured centre and are promoted to 3.
+    if (m_surface_max_samples_per_return < 0)
+    {
+      throw std::invalid_argument(
+        "surface_max_samples_per_return must be non-negative");
+    }
+    if (m_surface_max_samples_per_return > 0)
+    {
+      m_surface_max_samples_per_return =
+        std::max(3, m_surface_max_samples_per_return);
+    }
     m_surface_peak_radius_voxels = std::max(0, m_surface_peak_radius_voxels);
     m_surface_min_return_intensity = std::clamp(
       m_surface_min_return_intensity, 0.0, 1.0);
@@ -384,6 +428,11 @@ public:
       m_navigation_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/navigation_pointcloud", map_qos);
     }
+    else if (m_global_occupancy_mode != GlobalOccupancyMode::Hits)
+    {
+      throw std::invalid_argument(
+        "global_occupancy_mode requires tile_topic unless mode is hits");
+    }
 
     m_export_srv = create_service<std_srvs::srv::Trigger>(
       "~/export_survey",
@@ -408,6 +457,13 @@ public:
   }
 
 private:
+  enum class GlobalOccupancyMode
+  {
+    Hits,
+    Union,
+    ConfirmedSurface,
+  };
+
   struct BufferedCloud
   {
     double stamp;
@@ -1415,10 +1471,52 @@ private:
       p.confidence >= static_cast<float>(m_navigation_min_confidence);
   }
 
+  // A ribbon intersection is only a geometric hypothesis. Keep it in the
+  // operator/navigation product when it passes the multi-view quality gates
+  // AND the occupancy volume has not explicitly observed that 3-D voxel as
+  // free. Unknown (background value 0) remains eligible: absence of a clear
+  // ray is not evidence against a surface. OccupancyVDBMapping stores misses
+  // as inactive negative-log-odds values, so isValueOn() cannot be used for
+  // this test.
+  std::vector<ReconstructionRow> selectNavigationSurface(
+    const std::vector<ReconstructionRow>& reconstructed,
+    std::size_t* free_space_rejected = nullptr) const
+  {
+    std::vector<ReconstructionRow> navigation;
+    navigation.reserve(reconstructed.size());
+    std::size_t rejected = 0;
+
+    // getGrid() locks internally; obtain the handle before taking the shared
+    // map lock, matching every other read-side path in this node.
+    auto grid = m_map->getGrid();
+    std::shared_lock map_lock(*m_map->getMapMutex());
+    auto acc = grid->getConstAccessor();
+    for (const auto& row : reconstructed)
+    {
+      if (!isNavigationPoint(row))
+      {
+        continue;
+      }
+      const openvdb::Coord coord = openvdb::Coord::round(
+        grid->worldToIndex(openvdb::Vec3d(row.x, row.y, row.z)));
+      if (acc.getValue(coord) < 0.0F)
+      {
+        ++rejected;
+        continue;
+      }
+      navigation.push_back(row);
+    }
+    if (free_space_rejected != nullptr)
+    {
+      *free_space_rejected = rejected;
+    }
+    return navigation;
+  }
+
   // Export the exact same clean subset carried by ~/navigation_pointcloud.
-  // Unlike exportSurvey(), this does not require an occupancy render first:
-  // graph pose updates mark the surface accumulator stale immediately, and
-  // rebuilding it from keyframe-local evidence applies the current poses.
+  // Force pending occupancy evidence/graph corrections through first because
+  // the clean subset now includes the free-space contradiction mask as well
+  // as the graph-corrected surface accumulator.
   bool exportNavigationSurface(std::string& message)
   {
     if (m_navigation_export_path.empty())
@@ -1432,17 +1530,20 @@ private:
       return false;
     }
 
+    if (m_dirty || m_have_new)
+    {
+      m_last_product_render = -std::numeric_limits<double>::infinity();
+      renderIfNeeded(/*publish_outputs=*/false);
+    }
     syncSurfaceAccumulator();
     const std::vector<ReconstructionRow> reconstructed =
       m_surface_accumulator->rows();
+    const std::vector<ReconstructionRow> navigation =
+      selectNavigationSurface(reconstructed);
     pcl::PointCloud<SurfaceExportPoint> out;
-    out.reserve(reconstructed.size());
-    for (const auto& row : reconstructed)
+    out.reserve(navigation.size());
+    for (const auto& row : navigation)
     {
-      if (!isNavigationPoint(row))
-      {
-        continue;
-      }
       SurfaceExportPoint p;
       p.x = row.x;
       p.y = row.y;
@@ -1655,7 +1756,11 @@ private:
        publisher->get_intra_process_subscription_count()) > 0;
   }
 
-  void publishReconstructionProducts(const rclcpp::Time& stamp)
+  void publishReconstructionProducts(
+    const rclcpp::Time& stamp,
+    const std::vector<ReconstructionRow>& reconstructed,
+    const std::vector<ReconstructionRow>& navigation,
+    const std::size_t free_space_rejected)
   {
     if (!m_tile_pub)
     {
@@ -1701,9 +1806,6 @@ private:
     // Product B: only ribbon intersections with independent angular support.
     constexpr std::array<const char*, 7> surface_names = {
       "x", "y", "z", "intensity", "support", "view_span_deg", "confidence"};
-    syncSurfaceAccumulator();
-    const std::vector<ReconstructionRow> reconstructed =
-      m_surface_accumulator->rows();
     if (hasSubscribers(m_surface_pub))
     {
       publishFloatRows(
@@ -1721,32 +1823,154 @@ private:
     // Product C: the compact operator-facing surface. Publish this one every
     // render even before RViz starts so transient-local delivery gives a late
     // operator the current graph-corrected map immediately.
-    std::size_t navigation_count = 0;
     publishFloatRows(
-      m_navigation_pub, surface_names, reconstructed.size(),
-      [this, &reconstructed, &navigation_count](const auto& append) {
-        for (const auto& p : reconstructed)
+      m_navigation_pub, surface_names, navigation.size(),
+      [&navigation](const auto& append) {
+        for (const auto& p : navigation)
         {
-          if (!isNavigationPoint(p))
-          {
-            continue;
-          }
           append(std::array<float, 7>{
             p.x, p.y, p.z, p.intensity, p.support,
             p.view_span_deg, p.confidence});
-          ++navigation_count;
         }
       }, stamp);
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 30000,
       "reconstruction products: tile %s (%zu voxels), %zu navigation / "
-      "%zu/%zu surface voxels, "
+      "%zu/%zu surface voxels (%zu rejected by observed free space), "
       "%zu survey + %zu tile pings awaiting keyframe association",
       tile_requested ? "resident" : "on disk", m_tile_vox.size(),
-      navigation_count, reconstructed.size(),
+      navigation.size(), reconstructed.size(),
       m_surface_accumulator->candidateCellCount(),
+      free_space_rejected,
       m_survey_buffer.size(), m_tile_buffer.size());
+  }
+
+  // Merge the quality-controlled multi-view surface into the graph-corrected
+  // planning grid. The VDB projection still supplies observed/free/unknown
+  // state from echo-bounded clearing rays. In ConfirmedSurface mode its
+  // provisional capped-curtain hits are demoted to unknown before confirmed
+  // surface columns are marked lethal; lack of multi-view confirmation is not
+  // evidence of free space. Local STVL retains those immediate conservative
+  // hits independently.
+  void applyNavigationSurfaceToOccupancy(
+    nav_msgs::msg::OccupancyGrid& grid,
+    const std::vector<ReconstructionRow>& navigation) const
+  {
+    if (m_global_occupancy_mode == GlobalOccupancyMode::Hits)
+    {
+      return;
+    }
+
+    const double resolution = grid.info.resolution > 0.0
+      ? static_cast<double>(grid.info.resolution) : m_resolution;
+    if (!(resolution > 0.0) || !std::isfinite(resolution))
+    {
+      return;
+    }
+
+    const bool old_valid = grid.info.width > 0 && grid.info.height > 0 &&
+      grid.data.size() ==
+        static_cast<std::size_t>(grid.info.width) * grid.info.height;
+    int old_min_x = 0;
+    int old_min_y = 0;
+    int old_max_x = -1;
+    int old_max_y = -1;
+    if (old_valid)
+    {
+      // createMappingOutput places the grid corner half a voxel below the
+      // integer VDB cell centre. Recover that absolute cell index exactly.
+      old_min_x = static_cast<int>(std::llround(
+        grid.info.origin.position.x / resolution + 0.5));
+      old_min_y = static_cast<int>(std::llround(
+        grid.info.origin.position.y / resolution + 0.5));
+      old_max_x = old_min_x + static_cast<int>(grid.info.width) - 1;
+      old_max_y = old_min_y + static_cast<int>(grid.info.height) - 1;
+    }
+
+    int min_x = old_min_x;
+    int min_y = old_min_y;
+    int max_x = old_max_x;
+    int max_y = old_max_y;
+    bool have_bounds = old_valid;
+    for (const auto& p : navigation)
+    {
+      const int x = static_cast<int>(std::llround(p.x / resolution));
+      const int y = static_cast<int>(std::llround(p.y / resolution));
+      if (!have_bounds)
+      {
+        min_x = max_x = x;
+        min_y = max_y = y;
+        have_bounds = true;
+      }
+      else
+      {
+        min_x = std::min(min_x, x);
+        min_y = std::min(min_y, y);
+        max_x = std::max(max_x, x);
+        max_y = std::max(max_y, y);
+      }
+    }
+
+    if (!have_bounds)
+    {
+      return;
+    }
+
+    if (!old_valid || min_x != old_min_x || min_y != old_min_y ||
+        max_x != old_max_x || max_y != old_max_y)
+    {
+      const std::uint32_t new_width =
+        static_cast<std::uint32_t>(max_x - min_x + 1);
+      const std::uint32_t new_height =
+        static_cast<std::uint32_t>(max_y - min_y + 1);
+      std::vector<std::int8_t> expanded(
+        static_cast<std::size_t>(new_width) * new_height, -1);
+      if (old_valid)
+      {
+        const int x_offset = old_min_x - min_x;
+        const int y_offset = old_min_y - min_y;
+        for (std::uint32_t y = 0; y < grid.info.height; ++y)
+        {
+          const auto old_offset = static_cast<std::size_t>(y) * grid.info.width;
+          const auto new_offset =
+            static_cast<std::size_t>(y + y_offset) * new_width + x_offset;
+          std::copy_n(
+            grid.data.begin() + old_offset, grid.info.width,
+            expanded.begin() + new_offset);
+        }
+      }
+      grid.info.width = new_width;
+      grid.info.height = new_height;
+      grid.info.resolution = static_cast<float>(resolution);
+      grid.info.origin.position.x = (min_x - 0.5) * resolution;
+      grid.info.origin.position.y = (min_y - 0.5) * resolution;
+      grid.info.origin.orientation.w = 1.0;
+      grid.data.swap(expanded);
+    }
+
+    if (m_global_occupancy_mode == GlobalOccupancyMode::ConfirmedSurface)
+    {
+      for (auto& cell : grid.data)
+      {
+        if (cell == 100)
+        {
+          cell = -1;
+        }
+      }
+    }
+
+    for (const auto& p : navigation)
+    {
+      const int x = static_cast<int>(std::llround(p.x / resolution)) - min_x;
+      const int y = static_cast<int>(std::llround(p.y / resolution)) - min_y;
+      if (x < 0 || y < 0 || x >= static_cast<int>(grid.info.width) ||
+          y >= static_cast<int>(grid.info.height))
+      {
+        continue;
+      }
+      grid.data[static_cast<std::size_t>(y) * grid.info.width + x] = 100;
+    }
   }
 
   void replaceLatchedTileWithEmpty(const rclcpp::Time& stamp)
@@ -1853,6 +2077,13 @@ private:
       return;
     }
 
+    std::vector<ReconstructionRow> reconstructed;
+    if (m_tile_pub)
+    {
+      syncSurfaceAccumulator();
+      reconstructed = m_surface_accumulator->rows();
+    }
+
     visualization_msgs::msg::Marker marker_msg;
     sensor_msgs::msg::PointCloud2 cloud_msg;
     nav_msgs::msg::OccupancyGrid grid_msg;
@@ -1872,6 +2103,10 @@ private:
                                                   static_cast<float>(m_resolution),
                                                   m_two_dim_projection_threshold);
     map_lock.unlock();
+    std::size_t free_space_rejected = 0;
+    const std::vector<ReconstructionRow> navigation =
+      selectNavigationSurface(reconstructed, &free_space_rejected);
+    applyNavigationSurfaceToOccupancy(grid_msg, navigation);
     const auto stamp      = get_clock()->now();
     cloud_msg.header.stamp = stamp;
     grid_msg.header.stamp  = stamp;
@@ -1951,7 +2186,8 @@ private:
       m_survey_pub->publish(survey_msg);
     }
 
-    publishReconstructionProducts(stamp);
+    publishReconstructionProducts(
+      stamp, reconstructed, navigation, free_space_rejected);
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
                          "assembled map: %zu keyframes (%zu without evidence), "
@@ -1990,6 +2226,7 @@ private:
   double m_surface_min_return_intensity = 0.0;
   double m_navigation_min_confidence = 0.45;
   double m_navigation_min_intensity = 0.20;
+  GlobalOccupancyMode m_global_occupancy_mode = GlobalOccupancyMode::Hits;
   double m_last_tile_assoc_stamp = 0.0;
 
   std::unique_ptr<VDBMapT> m_map;

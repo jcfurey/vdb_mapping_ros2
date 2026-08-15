@@ -43,6 +43,7 @@ def generate_test_description():
             'surface_min_return_intensity': 0.2,
             'navigation_min_confidence': 0.45,
             'navigation_min_intensity': 0.2,
+            'global_occupancy_mode': 'confirmed_surface',
             'navigation_export_path': '/tmp/assembler_test_navigation.pcd',
             'navigation_export_on_shutdown': True,
             'prob_thres_min': 0.49,
