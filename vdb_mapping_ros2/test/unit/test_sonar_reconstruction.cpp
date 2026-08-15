@@ -147,6 +147,41 @@ TEST(SonarReconstruction, ElevationPeakFilterRejectsApertureVolume)
     }));
 }
 
+TEST(SonarReconstruction, ElevationPeakFilterFollowsDiagonalUncertaintyAxis)
+{
+  vdb_mapping_ros2::MultiViewSurfaceAccumulator unfiltered(
+    0.10F, 3, 6.0F * static_cast<float>(M_PI) / 180.0F, 0, 0);
+  vdb_mapping_ros2::MultiViewSurfaceAccumulator filtered(
+    0.10F, 3, 6.0F * static_cast<float>(M_PI) / 180.0F, 0, 2);
+  const float diagonal = std::sqrt(0.5F);
+  for (const float angle : {-10.0F, 0.0F, 10.0F})
+  {
+    auto p = observation(
+      angle, static_cast<std::uint32_t>(angle + 11.0F));
+    // Give all three observations the same diagonal aperture ribbon while
+    // retaining distinct boresight aspects. This is an intentionally
+    // unresolved volume: NMS must walk the actual diagonal uncertainty axis,
+    // not whichever Cartesian component happens to be marginally largest.
+    p.x = 5.0F;
+    p.y = 0.0F;
+    p.z = 0.0F;
+    p.elevation_axis_x = 0.0F;
+    p.elevation_axis_y = diagonal;
+    p.elevation_axis_z = diagonal;
+    unfiltered.add(p);
+    filtered.add(p);
+  }
+
+  const auto volume = unfiltered.rows();
+  const auto peaks = filtered.rows();
+  ASSERT_GT(volume.size(), 10U);
+  EXPECT_LT(peaks.size(), volume.size() / 2U);
+  EXPECT_TRUE(std::any_of(peaks.begin(), peaks.end(), [](const auto& row) {
+    return std::fabs(row.x - 5.0F) < 0.11F &&
+      std::hypot(row.y, row.z) < 0.11F;
+  }));
+}
+
 TEST(SonarReconstruction, WeakReturnsCannotVoteForStructure)
 {
   vdb_mapping_ros2::MultiViewSurfaceAccumulator surface(
@@ -167,6 +202,59 @@ TEST(SonarReconstruction, WeakReturnsCannotVoteForStructure)
     surface.add(p);
   }
   EXPECT_FALSE(surface.rows().empty());
+}
+
+TEST(SonarReconstruction, LocalPlaneFitProducesBoundedLidarStyleSurfels)
+{
+  std::vector<vdb_mapping_ros2::ReconstructionRow> patch;
+  for (int iy = -2; iy <= 2; ++iy)
+  {
+    for (int iz = -2; iz <= 2; ++iz)
+    {
+      vdb_mapping_ros2::ReconstructionRow p;
+      // A lightly voxel-stepped wall. Refinement may remove only the normal
+      // error; it must not smear the regular y/z sample locations.
+      p.x = 5.0F + 0.012F * static_cast<float>((iy + iz) % 3 - 1);
+      p.y = 0.1F * static_cast<float>(iy);
+      p.z = 0.1F * static_cast<float>(iz);
+      p.intensity = 0.7F;
+      p.support = 4.0F;
+      p.view_span_deg = 20.0F;
+      p.confidence = 0.8F;
+      p.range_sigma = 0.03F;
+      p.echo_width = 0.08F;
+      p.echo_prominence = 0.4F;
+      p.peak_prominence = 0.5F;
+      patch.push_back(p);
+    }
+  }
+  vdb_mapping_ros2::ReconstructionRow isolated = patch.front();
+  isolated.x = 9.0F;
+  isolated.y = 9.0F;
+  isolated.z = 9.0F;
+  patch.push_back(isolated);
+
+  const auto surfels = vdb_mapping_ros2::fitSurfaceElements(
+    patch, 0.10F, 2, 5, 0.12F, 0.05F);
+  ASSERT_GE(surfels.size(), 20U);
+  EXPECT_TRUE(std::none_of(surfels.begin(), surfels.end(), [](const auto& p) {
+    return p.x > 8.0F;
+  }));
+  const auto centre = std::min_element(
+    surfels.begin(), surfels.end(), [](const auto& a, const auto& b) {
+      return std::hypot(a.y, a.z) < std::hypot(b.y, b.z);
+    });
+  ASSERT_NE(centre, surfels.end());
+  EXPECT_NEAR(std::fabs(centre->normal_x), 1.0F, 0.02F);
+  EXPECT_NEAR(centre->normal_y, 0.0F, 0.10F);
+  EXPECT_NEAR(centre->normal_z, 0.0F, 0.10F);
+  EXPECT_LT(std::fabs(centre->x - 5.0F), 0.02F);
+  EXPECT_NEAR(centre->y, 0.0F, 1e-6F);
+  EXPECT_NEAR(centre->z, 0.0F, 1e-6F);
+  EXPECT_LT(centre->curvature, 0.02F);
+  EXPECT_LT(centre->residual, 0.02F);
+  EXPECT_NEAR(centre->range_sigma, 0.03F, 1e-6F);
+  EXPECT_NEAR(centre->echo_prominence, 0.4F, 1e-6F);
 }
 
 int main(int argc, char** argv)

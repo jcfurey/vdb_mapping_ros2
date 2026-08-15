@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <Eigen/Geometry>
+#include <Eigen/Eigenvalues>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/register_point_struct.h>
@@ -24,11 +25,27 @@ struct SonarTilePoint
   PCL_MAKE_ALIGNED_OPERATOR_NEW
 } EIGEN_ALIGN16;
 
-// A tile return after the exact ping-time sensor pose has been attached. Both
-// the centre point and sensor origin are points; elevation_axis and boresight
-// are vectors. Keeping all four in keyframe-local coordinates is what lets a
-// later graph correction move the measurement without losing the pivot-head
-// geometry needed to reconstruct its vertical-aperture ribbon.
+// sonar_proc's range-consolidated surface input. It shares the physical fan
+// geometry with SonarTilePoint but represents one echo lobe rather than every
+// bright image bin, and carries the measured radial uncertainty/contrast.
+struct SonarReconstructionReturnPoint
+{
+  PCL_ADD_POINT4D;
+  float intensity;
+  float range;
+  float azimuth;
+  float vertical_uncertainty;
+  float range_sigma;
+  float prominence;
+  float echo_width;
+  PCL_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+
+// A tile or lobe-consolidated return after the exact ping-time sensor pose has
+// been attached. Both the centre point and sensor origin are points;
+// elevation_axis and boresight are vectors. Keeping all four in keyframe-local
+// coordinates is what lets a later graph correction move the measurement
+// without losing the pivot-head geometry needed for its aperture ribbon.
 struct SonarReconstructionPoint
 {
   PCL_ADD_POINT4D;
@@ -45,6 +62,9 @@ struct SonarReconstructionPoint
   float boresight_x;
   float boresight_y;
   float boresight_z;
+  float range_sigma;
+  float return_prominence;
+  float echo_width;
   std::uint32_t observation;
   PCL_MAKE_ALIGNED_OPERATOR_NEW
 } EIGEN_ALIGN16;
@@ -56,6 +76,14 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(
     float, vertical_uncertainty, vertical_uncertainty))
 
 POINT_CLOUD_REGISTER_POINT_STRUCT(
+  SonarReconstructionReturnPoint,
+  (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(
+    float, range, range)(float, azimuth, azimuth)(
+    float, vertical_uncertainty, vertical_uncertainty)(
+    float, range_sigma, range_sigma)(float, prominence, prominence)(
+    float, echo_width, echo_width))
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(
   SonarReconstructionPoint,
   (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(
     float, range, range)(float, azimuth, azimuth)(
@@ -65,7 +93,9 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(
     float, elevation_axis_y, elevation_axis_y)(
     float, elevation_axis_z, elevation_axis_z)(
     float, boresight_x, boresight_x)(float, boresight_y, boresight_y)(
-    float, boresight_z, boresight_z)(std::uint32_t, observation, observation))
+    float, boresight_z, boresight_z)(float, range_sigma, range_sigma)(
+    float, return_prominence, return_prominence)(float, echo_width, echo_width)(
+    std::uint32_t, observation, observation))
 
 namespace vdb_mapping_ros2
 {
@@ -251,6 +281,10 @@ struct ReconstructionRow
   float support = 0.0F;
   float view_span_deg = 0.0F;
   float confidence = 0.0F;
+  float range_sigma = 0.0F;
+  float echo_width = 0.0F;
+  float echo_prominence = 0.0F;
+  float peak_prominence = 0.0F;
 };
 
 // Per-voxel, per-ping maximum evidence. Hundreds of neighbouring pixels from
@@ -310,6 +344,9 @@ public:
           c.pending_aspect = aspect;
           c.pending_axis = elevation_axis;
           c.pending_centre_distance = (q - measured_position).squaredNorm();
+          c.pending_range_sigma = std::max(0.0F, p.range_sigma);
+          c.pending_echo_width = std::max(0.0F, p.echo_width);
+          c.pending_return_prominence = std::max(0.0F, p.return_prominence);
         }
         else if (p.intensity > c.pending_intensity)
         {
@@ -318,6 +355,9 @@ public:
           c.pending_aspect = aspect;
           c.pending_axis = elevation_axis;
           c.pending_centre_distance = (q - measured_position).squaredNorm();
+          c.pending_range_sigma = std::max(0.0F, p.range_sigma);
+          c.pending_echo_width = std::max(0.0F, p.echo_width);
+          c.pending_return_prominence = std::max(0.0F, p.return_prominence);
         }
       });
   }
@@ -356,6 +396,12 @@ public:
       const float prominence = score > 1e-6F
         ? std::clamp((score - strongest_neighbor) / score, 0.0F, 1.0F)
         : 0.0F;
+      // A flat ribbon-overlap plateau is still unresolved elevation, even if
+      // it has enormous support. Give zero-prominence cells zero confidence
+      // instead of the historical 0.5 floor that admitted nearly every voxel
+      // into the navigation product. The exponential keeps modest but real
+      // peaks useful without letting support overwhelm ambiguity.
+      const float prominence_score = 1.0F - std::exp(-4.0F * prominence);
       const Eigen::Vector3f centre = c.position_sum /
         static_cast<float>(c.support);
       out.push_back({
@@ -363,8 +409,11 @@ public:
         c.intensity_sum / static_cast<float>(c.support),
         static_cast<float>(c.support),
         span * 180.0F / static_cast<float>(M_PI),
-        std::sqrt(support_score * span_score) *
-          (0.5F + 0.5F * prominence)});
+        std::sqrt(support_score * span_score * prominence_score),
+        c.range_sigma_sum / static_cast<float>(c.support),
+        c.echo_width_sum / static_cast<float>(c.support),
+        c.return_prominence_sum / static_cast<float>(c.support),
+        prominence});
     }
     return out;
   }
@@ -384,6 +433,9 @@ private:
     float max_aspect = -std::numeric_limits<float>::infinity();
     Eigen::Vector3f axis_sum = Eigen::Vector3f::Zero();
     float centre_distance_sum = 0.0F;
+    float range_sigma_sum = 0.0F;
+    float echo_width_sum = 0.0F;
+    float return_prominence_sum = 0.0F;
     bool pending = false;
     std::uint32_t pending_observation = 0;
     float pending_intensity = 0.0F;
@@ -391,6 +443,9 @@ private:
     float pending_aspect = 0.0F;
     Eigen::Vector3f pending_axis = Eigen::Vector3f::Zero();
     float pending_centre_distance = 0.0F;
+    float pending_range_sigma = 0.0F;
+    float pending_echo_width = 0.0F;
+    float pending_return_prominence = 0.0F;
   };
 
   static void commit(Cell& c)
@@ -403,10 +458,20 @@ private:
     c.intensity_sum += c.pending_intensity;
     c.min_aspect = std::min(c.min_aspect, c.pending_aspect);
     c.max_aspect = std::max(c.max_aspect, c.pending_aspect);
-    // Only the uncertainty-axis orientation matters for peak suppression;
-    // opposite vehicle headings must not cancel the accumulated direction.
-    c.axis_sum += c.pending_axis.cwiseAbs();
+    // Only axis orientation matters, not sign. Align every observation to the
+    // accumulated hemisphere so opposite vehicle headings reinforce the same
+    // physical uncertainty line without destroying its diagonal direction.
+    Eigen::Vector3f aligned_axis = c.pending_axis;
+    if (c.axis_sum.squaredNorm() > 1e-12F &&
+        c.axis_sum.dot(aligned_axis) < 0.0F)
+    {
+      aligned_axis = -aligned_axis;
+    }
+    c.axis_sum += aligned_axis;
     c.centre_distance_sum += c.pending_centre_distance;
+    c.range_sigma_sum += c.pending_range_sigma;
+    c.echo_width_sum += c.pending_echo_width;
+    c.return_prominence_sum += c.pending_return_prominence;
     ++c.support;
     c.pending = false;
   }
@@ -426,19 +491,19 @@ private:
   }
 
   static std::uint64_t offsetKey(
-    const std::uint64_t key, const int axis, const int offset)
+    const std::uint64_t key, const int dx, const int dy, const int dz)
   {
     constexpr std::uint64_t mask = 0x1FFFFFULL;
     std::uint64_t x = (key >> 42) & mask;
     std::uint64_t y = (key >> 21) & mask;
     std::uint64_t z = key & mask;
-    const auto shifted = [offset](const std::uint64_t value) {
+    const auto shifted = [](const std::uint64_t value, const int offset) {
       return static_cast<std::uint64_t>(
         (static_cast<std::int64_t>(value) + offset) & 0x1FFFFFLL);
     };
-    if (axis == 0) x = shifted(x);
-    else if (axis == 1) y = shifted(y);
-    else z = shifted(z);
+    x = shifted(x, dx);
+    y = shifted(y, dy);
+    z = shifted(z, dz);
     return (x << 42) | (y << 21) | z;
   }
 
@@ -448,11 +513,10 @@ private:
   {
     strongest_neighbor = 0.0F;
     if (peak_radius_voxels_ <= 0) return true;
-    const Eigen::Vector3f axis = c.axis_sum.cwiseAbs();
-    int dominant_axis = 0;
-    if (axis.y() > axis.x()) dominant_axis = 1;
-    if (axis.z() > axis[dominant_axis]) dominant_axis = 2;
-    if (!(axis[dominant_axis] > 1e-6F)) return true;
+    Eigen::Vector3f axis = c.axis_sum;
+    const float axis_norm = axis.norm();
+    if (!(axis_norm > 1e-6F)) return true;
+    axis /= axis_norm;
 
     const float score = evidenceScore(c);
     const float centre_distance = c.centre_distance_sum /
@@ -461,8 +525,14 @@ private:
     {
       for (const int direction : {-1, 1})
       {
+        const Eigen::Vector3f delta =
+          axis * static_cast<float>(direction * distance);
+        const int dx = static_cast<int>(std::lround(delta.x()));
+        const int dy = static_cast<int>(std::lround(delta.y()));
+        const int dz = static_cast<int>(std::lround(delta.z()));
+        if (dx == 0 && dy == 0 && dz == 0) continue;
         const auto found = cells_.find(offsetKey(
-          key, dominant_axis, direction * distance));
+          key, dx, dy, dz));
         if (found == cells_.end() || !qualifies(found->second)) continue;
         const Cell& neighbor = found->second;
         const float neighbor_score = evidenceScore(neighbor);
@@ -485,5 +555,147 @@ private:
   float min_return_intensity_;
   std::unordered_map<std::uint64_t, Cell> cells_;
 };
+
+// Lidar-style surface element derived from a connected neighborhood of
+// independently confirmed aperture intersections. The unrefined
+// ReconstructionRow remains the conservative evidence product; this record is
+// the thin operator/registration surface and therefore carries an estimated
+// normal and an explicit fit residual.
+struct SurfelRow
+{
+  float x = 0.0F;
+  float y = 0.0F;
+  float z = 0.0F;
+  float intensity = 0.0F;
+  float support = 0.0F;
+  float view_span_deg = 0.0F;
+  float confidence = 0.0F;
+  float normal_x = 0.0F;
+  float normal_y = 0.0F;
+  float normal_z = 1.0F;
+  float curvature = 0.0F;
+  float residual = 0.0F;
+  float range_sigma = 0.0F;
+  float echo_width = 0.0F;
+  float echo_prominence = 0.0F;
+  float peak_prominence = 0.0F;
+};
+
+// Fit one weighted local plane per confirmed voxel and project only that
+// voxel's representative onto the plane. This removes voxel stair steps and
+// isolated flashlight speckle without moving points tangentially, blurring
+// edges, or imposing a global floor/wall model. The projection is explicitly
+// capped because a pretty surface must never outrun the measured resolution.
+inline std::vector<SurfelRow> fitSurfaceElements(
+  const std::vector<ReconstructionRow>& input,
+  const float resolution,
+  const int radius_voxels,
+  const int minimum_neighbors,
+  const float maximum_surface_variation,
+  const float maximum_projection)
+{
+  std::vector<SurfelRow> out;
+  if (input.empty() || !(resolution > 0.0F) || radius_voxels < 0 ||
+      minimum_neighbors < 1 || !(maximum_surface_variation > 0.0F) ||
+      !(maximum_projection >= 0.0F))
+  {
+    return out;
+  }
+
+  std::unordered_map<std::uint64_t, std::size_t> lookup;
+  lookup.reserve(input.size());
+  for (std::size_t i = 0; i < input.size(); ++i)
+  {
+    const auto& p = input[i];
+    if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
+    {
+      lookup[reconstructionVoxelKey(p.x, p.y, p.z, resolution)] = i;
+    }
+  }
+
+  out.reserve(input.size());
+  for (const auto& p : input)
+  {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+      continue;
+
+    Eigen::Vector3f weighted_sum = Eigen::Vector3f::Zero();
+    float weight_sum = 0.0F;
+    int neighbors = 0;
+    std::vector<std::pair<const ReconstructionRow*, float>> local;
+    const int side = 2 * radius_voxels + 1;
+    local.reserve(static_cast<std::size_t>(side * side * side));
+    for (int dx = -radius_voxels; dx <= radius_voxels; ++dx)
+    {
+      for (int dy = -radius_voxels; dy <= radius_voxels; ++dy)
+      {
+        for (int dz = -radius_voxels; dz <= radius_voxels; ++dz)
+        {
+          const auto found = lookup.find(reconstructionVoxelKey(
+            p.x + static_cast<float>(dx) * resolution,
+            p.y + static_cast<float>(dy) * resolution,
+            p.z + static_cast<float>(dz) * resolution,
+            resolution));
+          if (found == lookup.end()) continue;
+          const auto& q = input[found->second];
+          const Eigen::Vector3f position(q.x, q.y, q.z);
+          const float distance = (position - Eigen::Vector3f(p.x, p.y, p.z)).norm();
+          if (distance > (static_cast<float>(radius_voxels) + 0.75F) *
+                           resolution)
+            continue;
+          const float spatial = std::exp(
+            -0.5F * distance * distance /
+            std::max(resolution * resolution, 1e-6F));
+          const float evidence = std::sqrt(std::max(q.support, 1.0F)) *
+            std::max(q.confidence, 0.05F);
+          const float weight = spatial * evidence;
+          weighted_sum += weight * position;
+          weight_sum += weight;
+          local.emplace_back(&q, weight);
+          ++neighbors;
+        }
+      }
+    }
+    if (neighbors < minimum_neighbors || !(weight_sum > 1e-6F)) continue;
+
+    const Eigen::Vector3f centroid = weighted_sum / weight_sum;
+    Eigen::Matrix3f covariance = Eigen::Matrix3f::Zero();
+    for (const auto& [q, weight] : local)
+    {
+      const Eigen::Vector3f delta(q->x - centroid.x(), q->y - centroid.y(),
+                                  q->z - centroid.z());
+      covariance.noalias() += weight * delta * delta.transpose();
+    }
+    covariance /= weight_sum;
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(covariance);
+    if (solver.info() != Eigen::Success) continue;
+    const Eigen::Vector3f eigenvalues = solver.eigenvalues().cwiseMax(0.0F);
+    const float total = eigenvalues.sum();
+    if (!(total > 1e-9F)) continue;
+    const float variation = eigenvalues.x() / total;
+    if (!std::isfinite(variation) ||
+        variation > maximum_surface_variation) continue;
+
+    Eigen::Vector3f normal = solver.eigenvectors().col(0).normalized();
+    Eigen::Index dominant = 0;
+    normal.cwiseAbs().maxCoeff(&dominant);
+    if (normal[dominant] < 0.0F) normal = -normal;
+    const Eigen::Vector3f position(p.x, p.y, p.z);
+    const float signed_distance = normal.dot(position - centroid);
+    const float correction = std::clamp(
+      signed_distance, -maximum_projection, maximum_projection);
+    const Eigen::Vector3f refined = position - correction * normal;
+    const float planarity_score = std::clamp(
+      1.0F - variation / maximum_surface_variation, 0.0F, 1.0F);
+
+    out.push_back({
+      refined.x(), refined.y(), refined.z(), p.intensity, p.support,
+      p.view_span_deg, p.confidence * std::sqrt(planarity_score),
+      normal.x(), normal.y(), normal.z(), variation,
+      std::sqrt(eigenvalues.x()), p.range_sigma, p.echo_width,
+      p.echo_prominence, p.peak_prominence});
+  }
+  return out;
+}
 
 }  // namespace vdb_mapping_ros2

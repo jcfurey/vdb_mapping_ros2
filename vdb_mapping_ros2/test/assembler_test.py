@@ -51,6 +51,8 @@ SURVEY_OFFSETS = [0, 4, 8, 16, 20, 24, 28, 32, 36, 40, 44, 48]
 TILE_FIELDS = [
     "x", "y", "z", "intensity", "range", "azimuth",
     "vertical_uncertainty"]
+RECONSTRUCTION_FIELDS = TILE_FIELDS + [
+    "range_sigma", "prominence", "echo_width"]
 TILE_ANGLES = (-10.0, 0.0, 10.0)
 
 
@@ -103,7 +105,7 @@ def make_xyz_cloud(stamp_s, xyzs):
     return msg
 
 
-def make_tile_cloud(stamp_s, frame):
+def make_tile_cloud(stamp_s, frame, reconstruction=False):
     msg = PointCloud2()
     msg.header.stamp.sec = int(stamp_s)
     msg.header.stamp.nanosec = int((stamp_s - int(stamp_s)) * 1e9)
@@ -112,26 +114,36 @@ def make_tile_cloud(stamp_s, frame):
     # Two physical targets receive the same three independent elevation views.
     # The first will be contradicted by a clearing ray; the second remains a
     # valid navigation surface and proves the mask is selective.
-    optical_targets = ((0.0, 0.0, 5.0), (0.0, 2.0, 5.0))
+    optical_targets = [(0.0, 0.0, 5.0)]
+    # A connected 3x3 patch around the uncontradicted target supplies enough
+    # local geometry for the real surfel plane fit. The contradicted target is
+    # deliberately isolated: occupancy still sees it before the clear-space
+    # mask, while the clean cloud independently refuses isolated speckle.
+    for dy in (-0.2, 0.0, 0.2):
+        for dz in (-0.2, 0.0, 0.2):
+            optical_targets.append((0.0, 2.0 + dy, 5.0 + dz))
     msg.width = len(optical_targets)
     msg.is_bigendian = False
     msg.is_dense = True
-    for i, name in enumerate(TILE_FIELDS):
+    fields = RECONSTRUCTION_FIELDS if reconstruction else TILE_FIELDS
+    for i, name in enumerate(fields):
         f = PointField()
         f.name = name
         f.offset = 4 * i
         f.datatype = PointField.FLOAT32
         f.count = 1
         msg.fields.append(f)
-    msg.point_step = 4 * len(TILE_FIELDS)
+    msg.point_step = 4 * len(fields)
     msg.row_step = msg.point_step * msg.width
     half = math.radians(10.0)
     rows = []
     for x, y, z in optical_targets:
         measured_range = math.sqrt(x * x + y * y + z * z)
-        rows.append(struct.pack(
-            "<7f", x, y, z, 0.6, measured_range,
-            math.atan2(y, z), measured_range * math.tan(half)))
+        values = [x, y, z, 0.6, measured_range,
+                  math.atan2(y, z), measured_range * math.tan(half)]
+        if reconstruction:
+            values += [0.03, 0.4, 0.08]
+        rows.append(struct.pack("<" + "f" * len(values), *values))
     msg.data = b"".join(rows)
     return msg
 
@@ -187,12 +199,15 @@ class Harness(Node):
         self.clear_pub = self.create_publisher(PointCloud2, "/test/clear", reliable)
         self.survey_pub = self.create_publisher(PointCloud2, "/test/survey", reliable)
         self.tile_pub = self.create_publisher(PointCloud2, "/test/tile", reliable)
+        self.reconstruction_pub = self.create_publisher(
+            PointCloud2, "/test/reconstruction", reliable)
         # the assembler's trajectory subscription is transient_local
         self.traj_pub = self.create_publisher(PointCloud2, "/test/traj", latched)
         self.snapshots = []
         self.tile_snapshots = []
         self.surface_snapshots = []
         self.navigation_snapshots = []
+        self.navigation_stamps = []
         self.occupancy_snapshots = []
         self.latched_qos = latched
         self.create_subscription(
@@ -206,7 +221,7 @@ class Harness(Node):
             lambda m: self.surface_snapshots.append(parse_survey(m)), latched)
         self.create_subscription(
             PointCloud2, "/assembler/navigation_pointcloud",
-            lambda m: self.navigation_snapshots.append(parse_survey(m)), latched)
+            self.capture_navigation, latched)
         self.create_subscription(
             OccupancyGrid, "/assembler/vdb_map_occupancy",
             lambda m: self.occupancy_snapshots.append(m), latched)
@@ -225,6 +240,11 @@ class Harness(Node):
             t.transform.rotation.w = math.cos(theta / 2.0)
             transforms.append(t)
         self.static_tfb.sendTransform(transforms)
+
+    def capture_navigation(self, msg):
+        self.navigation_snapshots.append(parse_survey(msg))
+        self.navigation_stamps.append(
+            (msg.header.stamp.sec, msg.header.stamp.nanosec))
 
     def broadcast_odom(self):
         # exact-stamp odom -> base_link samples bracketing both stamps
@@ -301,8 +321,11 @@ def main():
 
     node.survey_pub.publish(make_survey_cloud(T_E))
     for index, angle in enumerate(TILE_ANGLES):
-        node.tile_pub.publish(make_tile_cloud(
-            T_E + 0.1 * index, f"tile_{int(angle):+d}"))
+        stamp = T_E + 0.1 * index
+        frame = f"tile_{int(angle):+d}"
+        node.tile_pub.publish(make_tile_cloud(stamp, frame))
+        node.reconstruction_pub.publish(
+            make_tile_cloud(stamp, frame, reconstruction=True))
     # A three-cell raw-hit line survives the legacy occupancy projection's
     # isolated-cell filter. confirmed_surface mode must nevertheless remove it
     # from the persistent planning map and mark the reconstructed target.
@@ -397,6 +420,18 @@ def main():
         print(f"FAIL: clean navigation surface omitted the uncontradicted target: "
               f"{node.navigation_snapshots[-1]}", flush=True)
         return 1
+    for field in ("normal_x", "normal_y", "normal_z", "curvature",
+                  "residual", "range_sigma", "echo_width",
+                  "echo_prominence", "peak_prominence"):
+        if field not in navigation_target or not math.isfinite(
+                navigation_target[field]):
+            print(f"FAIL: lidar-style surfel field {field} is missing/invalid: "
+                  f"{navigation_target}", flush=True)
+            return 1
+    if node.navigation_stamps[-1] != (0, 0):
+        print("FAIL: retained global navigation surface is time-bound to an "
+              f"expiring TF sample: {node.navigation_stamps[-1]}", flush=True)
+        return 1
     if not spin_until(node, lambda: bool(node.occupancy_snapshots), 10.0):
         print("FAIL: no global occupancy snapshot", flush=True)
         return 1
@@ -428,7 +463,10 @@ def main():
         print(f"FAIL: cannot read navigation export: {exc}", flush=True)
         return 1
     expected_fields = [
-        "x", "y", "z", "intensity", "support", "view_span_deg", "confidence"]
+        "x", "y", "z", "intensity", "support", "view_span_deg",
+        "confidence", "normal_x", "normal_y", "normal_z", "curvature",
+        "residual", "range_sigma", "echo_width", "echo_prominence",
+        "peak_prominence"]
     if fields != expected_fields:
         print(f"FAIL: navigation PCD schema is wrong: {fields}", flush=True)
         return 1

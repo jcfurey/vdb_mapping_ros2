@@ -28,6 +28,7 @@ def generate_test_description():
             'clear_topic': '/test/clear',
             'survey_topic': '/test/survey',
             'tile_topic': '/test/tile',
+            'reconstruction_topic': '/test/reconstruction',
             'traj_topic': '/test/traj',
             'robot_frame': 'base_link',
             'odom_frame': 'odom',
@@ -43,6 +44,10 @@ def generate_test_description():
             'surface_min_return_intensity': 0.2,
             'navigation_min_confidence': 0.45,
             'navigation_min_intensity': 0.2,
+            'surfel_radius_voxels': 2,
+            'surfel_min_neighbors': 5,
+            'surfel_max_surface_variation': 0.2,
+            'surfel_max_projection': 0.1,
             'global_occupancy_mode': 'confirmed_surface',
             'navigation_export_path': '/tmp/assembler_test_navigation.pcd',
             'navigation_export_on_shutdown': True,
@@ -88,6 +93,8 @@ class TestAfterShutdown(unittest.TestCase):
         with open(path, 'rb') as stream:
             header = stream.read(512).decode('ascii', errors='ignore')
         self.assertIn(
-            'FIELDS x y z intensity support view_span_deg confidence',
+            'FIELDS x y z intensity support view_span_deg confidence '
+            'normal_x normal_y normal_z curvature residual range_sigma '
+            'echo_width echo_prominence peak_prominence',
             header,
         )
