@@ -557,10 +557,10 @@ private:
 };
 
 // Lidar-style surface element derived from a connected neighborhood of
-// independently confirmed aperture intersections. The unrefined
-// ReconstructionRow remains the conservative evidence product; this record is
-// the thin operator/registration surface and therefore carries an estimated
-// normal and an explicit fit residual.
+// graph-corrected survey returns. The unrefined ReconstructionRow remains the
+// measured evidence product; this record is the thin operator/registration
+// surface and therefore carries an estimated normal and an explicit fit
+// residual.
 struct SurfelRow
 {
   float x = 0.0F;
@@ -589,30 +589,45 @@ struct SurfelRow
 inline std::vector<SurfelRow> fitSurfaceElements(
   const std::vector<ReconstructionRow>& input,
   const float resolution,
-  const int radius_voxels,
+  const float radius_m,
   const int minimum_neighbors,
   const float maximum_surface_variation,
   const float maximum_projection)
 {
   std::vector<SurfelRow> out;
-  if (input.empty() || !(resolution > 0.0F) || radius_voxels < 0 ||
+  if (input.empty() || !(resolution > 0.0F) || !(radius_m > 0.0F) ||
       minimum_neighbors < 1 || !(maximum_surface_variation > 0.0F) ||
       !(maximum_projection >= 0.0F))
   {
     return out;
   }
 
-  std::unordered_map<std::uint64_t, std::size_t> lookup;
-  lookup.reserve(input.size());
+  // The representation and the geometric neighborhood are deliberately
+  // independent. A 1 cm survey can retain distinct wall detail while a
+  // 10 cm metric neighborhood still supplies enough samples for a stable
+  // normal. Bucket at the metric radius so each query visits at most the 27
+  // adjacent buckets instead of walking (2r/resolution + 1)^3 empty 1 cm
+  // voxels for every point.
+  std::unordered_map<std::uint64_t, std::vector<std::size_t>> lookup;
+  lookup.reserve(std::max<std::size_t>(1, input.size() / 8));
   for (std::size_t i = 0; i < input.size(); ++i)
   {
     const auto& p = input[i];
     if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
     {
-      lookup[reconstructionVoxelKey(p.x, p.y, p.z, resolution)] = i;
+      lookup[reconstructionVoxelKey(p.x, p.y, p.z, radius_m)].push_back(i);
     }
   }
 
+  const float radius_squared = radius_m * radius_m;
+  const float gaussian_sigma = std::max(0.5F * radius_m, resolution);
+  const float gaussian_variance = gaussian_sigma * gaussian_sigma;
+  const float radius_in_cells = radius_m / resolution;
+  std::vector<std::pair<const ReconstructionRow*, float>> local;
+  local.reserve(std::min<std::size_t>(
+    input.size(), static_cast<std::size_t>(std::max(
+      64.0F, 2.0F * static_cast<float>(M_PI) *
+        radius_in_cells * radius_in_cells))));
   out.reserve(input.size());
   for (const auto& p : input)
   {
@@ -622,37 +637,37 @@ inline std::vector<SurfelRow> fitSurfaceElements(
     Eigen::Vector3f weighted_sum = Eigen::Vector3f::Zero();
     float weight_sum = 0.0F;
     int neighbors = 0;
-    std::vector<std::pair<const ReconstructionRow*, float>> local;
-    const int side = 2 * radius_voxels + 1;
-    local.reserve(static_cast<std::size_t>(side * side * side));
-    for (int dx = -radius_voxels; dx <= radius_voxels; ++dx)
+    local.clear();
+    const Eigen::Vector3f centre(p.x, p.y, p.z);
+    for (int dx = -1; dx <= 1; ++dx)
     {
-      for (int dy = -radius_voxels; dy <= radius_voxels; ++dy)
+      for (int dy = -1; dy <= 1; ++dy)
       {
-        for (int dz = -radius_voxels; dz <= radius_voxels; ++dz)
+        for (int dz = -1; dz <= 1; ++dz)
         {
           const auto found = lookup.find(reconstructionVoxelKey(
-            p.x + static_cast<float>(dx) * resolution,
-            p.y + static_cast<float>(dy) * resolution,
-            p.z + static_cast<float>(dz) * resolution,
-            resolution));
+            p.x + static_cast<float>(dx) * radius_m,
+            p.y + static_cast<float>(dy) * radius_m,
+            p.z + static_cast<float>(dz) * radius_m,
+            radius_m));
           if (found == lookup.end()) continue;
-          const auto& q = input[found->second];
-          const Eigen::Vector3f position(q.x, q.y, q.z);
-          const float distance = (position - Eigen::Vector3f(p.x, p.y, p.z)).norm();
-          if (distance > (static_cast<float>(radius_voxels) + 0.75F) *
-                           resolution)
-            continue;
-          const float spatial = std::exp(
-            -0.5F * distance * distance /
-            std::max(resolution * resolution, 1e-6F));
-          const float evidence = std::sqrt(std::max(q.support, 1.0F)) *
-            std::max(q.confidence, 0.05F);
-          const float weight = spatial * evidence;
-          weighted_sum += weight * position;
-          weight_sum += weight;
-          local.emplace_back(&q, weight);
-          ++neighbors;
+          for (const std::size_t index : found->second)
+          {
+            const auto& q = input[index];
+            const Eigen::Vector3f position(q.x, q.y, q.z);
+            const float distance_squared = (position - centre).squaredNorm();
+            if (distance_squared > radius_squared + 1e-9F) continue;
+            const float spatial = std::exp(
+              -0.5F * distance_squared /
+              std::max(gaussian_variance, 1e-6F));
+            const float evidence = std::sqrt(std::max(q.support, 1.0F)) *
+              std::max(q.confidence, 0.05F);
+            const float weight = spatial * evidence;
+            weighted_sum += weight * position;
+            weight_sum += weight;
+            local.emplace_back(&q, weight);
+            ++neighbors;
+          }
         }
       }
     }
@@ -685,12 +700,14 @@ inline std::vector<SurfelRow> fitSurfaceElements(
     const float correction = std::clamp(
       signed_distance, -maximum_projection, maximum_projection);
     const Eigen::Vector3f refined = position - correction * normal;
-    const float planarity_score = std::clamp(
-      1.0F - variation / maximum_surface_variation, 0.0F, 1.0F);
-
     out.push_back({
       refined.x(), refined.y(), refined.z(), p.intensity, p.support,
-      p.view_span_deg, p.confidence * std::sqrt(planarity_score),
+      // Confidence describes independent-view/elevation evidence. Curvature
+      // and residual already describe local fit quality, and variation above
+      // the configured ceiling was rejected just above. Multiplying the two
+      // here and then applying navigation_min_confidence again silently made
+      // the evidence gate much stricter and removed most valid wall surfels.
+      p.view_span_deg, p.confidence,
       normal.x(), normal.y(), normal.z(), variation,
       std::sqrt(eigenvalues.x()), p.range_sigma, p.echo_width,
       p.echo_prominence, p.peak_prominence});

@@ -223,25 +223,30 @@ public:
     declare_parameter<int>("surface_max_samples_per_return", 31);
     declare_parameter<int>("surface_peak_radius_voxels", 0);
     declare_parameter<double>("surface_min_return_intensity", 0.0);
-    // Operator-facing subset of the diagnostic surface: retain only
-    // echo-backed, well-constrained voxels for an uncluttered live navigation
-    // aid. The full surface and full tile products remain separately
-    // available for diagnosis and offline analysis.
+    declare_parameter<double>("surface_min_confidence", 0.45);
+    // Operator-facing subset of the centimetre survey: retain only supported,
+    // sufficiently strong returns for an uncluttered live navigation aid.
+    // Elevation-resolved returns receive full confidence; unresolved returns
+    // must accumulate more independent keyframe support. The broad aperture
+    // surface and full tile products remain separately available for diagnosis
+    // and conservative occupancy.
     declare_parameter<double>("navigation_min_confidence", 0.45);
-    declare_parameter<double>("navigation_min_intensity", 0.20);
-    // Lidar-style surface-element refinement for the operator cloud. The
-    // conservative confirmed voxels still own occupancy; this local plane fit
-    // only removes isolated speckle/voxel stair steps from the 3-D product.
-    declare_parameter<int>("surfel_radius_voxels", 2);
+    declare_parameter<double>("navigation_min_intensity", 0.15);
+    declare_parameter<double>("navigation_unresolved_confidence_scale", 0.50);
+    // Lidar-style surface-element refinement for the operator cloud. The 1 cm
+    // representation preserves sonar detail; an independent metric-radius
+    // neighborhood supplies stable local normals without 10 cm output voxels.
+    declare_parameter<double>("surfel_radius_m", 0.10);
     declare_parameter<int>("surfel_min_neighbors", 5);
     declare_parameter<double>("surfel_max_surface_variation", 0.12);
-    declare_parameter<double>("surfel_max_projection", 0.05);
+    declare_parameter<double>("surfel_max_projection", 0.01);
     // Which obstacle evidence owns the graph-corrected 2-D planning map:
     //   hits              legacy capped-curtain VDB projection
     //   union             legacy projection plus confirmed surface cells
     //   confirmed_surface preserve VDB observed/free space, but only the
     //                     multi-view surface may mark lethal cells
-    // The 3-D navigation_pointcloud always remains the confirmed surface.
+    // The 3-D navigation_pointcloud is built independently from the supported
+    // centimetre survey; these modes only select the 2-D occupancy owner.
     declare_parameter<std::string>("global_occupancy_mode", "hits");
     declare_parameter<std::string>("odom_frame", "odom");
     // evidence association
@@ -304,9 +309,13 @@ public:
     get_parameter("surface_max_samples_per_return", m_surface_max_samples_per_return);
     get_parameter("surface_peak_radius_voxels", m_surface_peak_radius_voxels);
     get_parameter("surface_min_return_intensity", m_surface_min_return_intensity);
+    get_parameter("surface_min_confidence", m_surface_min_confidence);
     get_parameter("navigation_min_confidence", m_navigation_min_confidence);
     get_parameter("navigation_min_intensity", m_navigation_min_intensity);
-    get_parameter("surfel_radius_voxels", m_surfel_radius_voxels);
+    get_parameter(
+      "navigation_unresolved_confidence_scale",
+      m_navigation_unresolved_confidence_scale);
+    get_parameter("surfel_radius_m", m_surfel_radius_m);
     get_parameter("surfel_min_neighbors", m_surfel_min_neighbors);
     get_parameter("surfel_max_surface_variation",
                   m_surfel_max_surface_variation);
@@ -357,11 +366,15 @@ public:
     m_surface_peak_radius_voxels = std::max(0, m_surface_peak_radius_voxels);
     m_surface_min_return_intensity = std::clamp(
       m_surface_min_return_intensity, 0.0, 1.0);
+    m_surface_min_confidence = std::clamp(
+      m_surface_min_confidence, 0.0, 1.0);
     m_navigation_min_confidence = std::clamp(
       m_navigation_min_confidence, 0.0, 1.0);
     m_navigation_min_intensity = std::clamp(
       m_navigation_min_intensity, 0.0, 1.0);
-    m_surfel_radius_voxels = std::max(0, m_surfel_radius_voxels);
+    m_navigation_unresolved_confidence_scale = std::clamp(
+      m_navigation_unresolved_confidence_scale, 0.0, 1.0);
+    m_surfel_radius_m = std::max(1e-3, m_surfel_radius_m);
     m_surfel_min_neighbors = std::max(1, m_surfel_min_neighbors);
     m_surfel_max_surface_variation = std::clamp(
       m_surfel_max_surface_variation, 1e-6, 1.0);
@@ -461,6 +474,8 @@ public:
         "~/survey_pointcloud", map_qos);
       m_supported_survey_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/supported_survey_pointcloud", map_qos);
+      m_navigation_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "~/navigation_pointcloud", map_qos);
     }
 
     std::string tile_topic, reconstruction_topic;
@@ -484,8 +499,6 @@ public:
         });
       m_surface_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/surface_pointcloud", map_qos);
-      m_navigation_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
-        "~/navigation_pointcloud", map_qos);
     }
     else if (m_global_occupancy_mode != GlobalOccupancyMode::Hits)
     {
@@ -1680,22 +1693,22 @@ private:
     return true;
   }
 
-  bool isNavigationPoint(const ReconstructionRow& p) const
+  bool isConfirmedSurfacePoint(const ReconstructionRow& p) const
   {
     return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
       std::isfinite(p.intensity) && std::isfinite(p.confidence) &&
-      p.intensity >= static_cast<float>(m_navigation_min_intensity) &&
-      p.confidence >= static_cast<float>(m_navigation_min_confidence);
+      p.intensity >= static_cast<float>(m_surface_min_return_intensity) &&
+      p.confidence >= static_cast<float>(m_surface_min_confidence);
   }
 
-  // A ribbon intersection is only a geometric hypothesis. Keep it in the
-  // operator/navigation product when it passes the multi-view quality gates
-  // AND the occupancy volume has not explicitly observed that 3-D voxel as
-  // free. Unknown (background value 0) remains eligible: absence of a clear
+  // A ribbon intersection is only a geometric hypothesis. Keep it as
+  // conservative global-occupancy evidence when it passes the multi-view
+  // gates AND the occupancy volume has not explicitly observed that 3-D voxel
+  // as free. Unknown (background value 0) remains eligible: absence of a clear
   // ray is not evidence against a surface. OccupancyVDBMapping stores misses
   // as inactive negative-log-odds values, so isValueOn() cannot be used for
   // this test.
-  std::vector<ReconstructionRow> selectNavigationSurface(
+  std::vector<ReconstructionRow> selectConfirmedSurface(
     const std::vector<ReconstructionRow>& reconstructed,
     std::size_t* free_space_rejected = nullptr) const
   {
@@ -1710,7 +1723,7 @@ private:
     auto acc = grid->getConstAccessor();
     for (const auto& row : reconstructed)
     {
-      if (!isNavigationPoint(row))
+      if (!isConfirmedSurfacePoint(row))
       {
         continue;
       }
@@ -1730,12 +1743,74 @@ private:
     return navigation;
   }
 
+  // Convert the structure-preserving supported survey into navigation
+  // candidates without coarsening its centimetre representation. `support`
+  // is distinct keyframes, not pings or neighboring image bins. Elevation-
+  // resolved returns earn the full support confidence; unresolved returns are
+  // allowed only after substantially more revisits. Explicit free-space
+  // evidence still vetoes either kind, while unknown space remains eligible.
+  std::vector<ReconstructionRow> selectSurveyNavigationSurface(
+    const std::vector<SurveyRow>& supported,
+    std::size_t* free_space_rejected = nullptr) const
+  {
+    std::vector<ReconstructionRow> navigation;
+    navigation.reserve(supported.size());
+    std::size_t rejected = 0;
+
+    auto grid = m_map->getGrid();
+    std::shared_lock map_lock(*m_map->getMapMutex());
+    auto acc = grid->getConstAccessor();
+    for (const auto& row : supported)
+    {
+      const float support = row[6];
+      const float intensity = row[3];
+      if (!std::isfinite(row[0]) || !std::isfinite(row[1]) ||
+          !std::isfinite(row[2]) || !std::isfinite(intensity) ||
+          !std::isfinite(support) ||
+          support < static_cast<float>(m_survey_min_support) ||
+          intensity < static_cast<float>(m_navigation_min_intensity))
+      {
+        continue;
+      }
+      const float resolved = std::isfinite(row[12])
+        ? std::clamp(row[12], 0.0F, 1.0F) : 0.0F;
+      const float support_score = 1.0F - std::exp(
+        -support / static_cast<float>(m_survey_min_support));
+      const float elevation_score = static_cast<float>(
+        m_navigation_unresolved_confidence_scale) +
+        (1.0F - static_cast<float>(
+          m_navigation_unresolved_confidence_scale)) * resolved;
+      const float confidence = support_score * elevation_score;
+      if (confidence < static_cast<float>(m_navigation_min_confidence))
+      {
+        continue;
+      }
+
+      const openvdb::Coord coord = openvdb::Coord::round(
+        grid->worldToIndex(openvdb::Vec3d(row[0], row[1], row[2])));
+      if (acc.getValue(coord) < 0.0F)
+      {
+        ++rejected;
+        continue;
+      }
+      navigation.push_back({
+        row[0], row[1], row[2], intensity, support,
+        0.0F, confidence,
+        0.0F, 0.0F, 0.0F, 0.0F});
+    }
+    if (free_space_rejected != nullptr)
+    {
+      *free_space_rejected = rejected;
+    }
+    return navigation;
+  }
+
   std::vector<SurfelRow> buildNavigationSurfels(
-    const std::vector<ReconstructionRow>& confirmed) const
+    const std::vector<ReconstructionRow>& candidates) const
   {
     std::vector<SurfelRow> surfels = fitSurfaceElements(
-      confirmed, static_cast<float>(m_surface_resolution),
-      m_surfel_radius_voxels, m_surfel_min_neighbors,
+      candidates, static_cast<float>(m_survey_resolution),
+      static_cast<float>(m_surfel_radius_m), m_surfel_min_neighbors,
       static_cast<float>(m_surfel_max_surface_variation),
       static_cast<float>(m_surfel_max_projection));
     surfels.erase(
@@ -1749,10 +1824,10 @@ private:
     return surfels;
   }
 
-  // Export the exact same clean subset carried by ~/navigation_pointcloud.
-  // Force pending occupancy evidence/graph corrections through first because
-  // the clean subset now includes the free-space contradiction mask as well
-  // as the graph-corrected surface accumulator.
+  // Export the exact same supported-survey surfels carried by
+  // ~/navigation_pointcloud. Force pending occupancy evidence/graph
+  // corrections through first because the clean subset includes the
+  // free-space contradiction mask as well as the graph-corrected survey.
   bool exportNavigationSurface(std::string& message)
   {
     if (m_navigation_export_path.empty())
@@ -1762,7 +1837,7 @@ private:
     }
     if (!m_navigation_pub)
     {
-      message = "navigation surface is disabled (reconstruction_topic unset)";
+      message = "navigation surface is disabled (survey_topic unset)";
       return false;
     }
 
@@ -1771,13 +1846,19 @@ private:
       m_last_product_render = -std::numeric_limits<double>::infinity();
       renderIfNeeded(/*publish_outputs=*/false);
     }
-    syncSurfaceAccumulator();
-    const std::vector<ReconstructionRow> reconstructed =
-      m_surface_accumulator->rows();
-    const std::vector<ReconstructionRow> confirmed =
-      selectNavigationSurface(reconstructed);
+    syncSurveyAccumulator();
+    std::vector<SurveyRow> supported;
+    supported.reserve(m_vox.size());
+    forEachSurveyRow([this, &supported](const SurveyRow& row) {
+      if (row[6] >= static_cast<float>(m_survey_min_support))
+      {
+        supported.push_back(row);
+      }
+    });
+    const std::vector<ReconstructionRow> candidates =
+      selectSurveyNavigationSurface(supported);
     const std::vector<SurfelRow> navigation =
-      buildNavigationSurfels(confirmed);
+      buildNavigationSurfels(candidates);
     pcl::PointCloud<SurfaceExportPoint> out;
     out.reserve(navigation.size());
     for (const auto& row : navigation)
@@ -2010,9 +2091,11 @@ private:
     const std::vector<ReconstructionRow>& reconstructed,
     const std::vector<SurfelRow>& navigation,
     const std::size_t confirmed_count,
-    const std::size_t free_space_rejected)
+    const std::size_t surface_free_space_rejected,
+    const std::size_t navigation_candidate_count,
+    const std::size_t navigation_free_space_rejected)
   {
-    if (!m_tile_pub && !m_surface_pub)
+    if (!m_tile_pub && !m_surface_pub && !m_navigation_pub)
     {
       return;
     }
@@ -2085,30 +2168,34 @@ private:
       "x", "y", "z", "intensity", "support", "view_span_deg", "confidence",
       "normal_x", "normal_y", "normal_z", "curvature", "residual",
       "range_sigma", "echo_width", "echo_prominence", "peak_prominence"};
-    publishFloatRows(
-      m_navigation_pub, surfel_names, navigation.size(),
-      [&navigation](const auto& append) {
-        for (const auto& p : navigation)
-        {
-          append(std::array<float, 16>{
-            p.x, p.y, p.z, p.intensity, p.support,
-            p.view_span_deg, p.confidence,
-            p.normal_x, p.normal_y, p.normal_z, p.curvature, p.residual,
-            p.range_sigma, p.echo_width, p.echo_prominence,
-            p.peak_prominence});
-        }
-      }, timeless_stamp);
+    if (m_navigation_pub)
+    {
+      publishFloatRows(
+        m_navigation_pub, surfel_names, navigation.size(),
+        [&navigation](const auto& append) {
+          for (const auto& p : navigation)
+          {
+            append(std::array<float, 16>{
+              p.x, p.y, p.z, p.intensity, p.support,
+              p.view_span_deg, p.confidence,
+              p.normal_x, p.normal_y, p.normal_z, p.curvature, p.residual,
+              p.range_sigma, p.echo_width, p.echo_prominence,
+              p.peak_prominence});
+          }
+        }, timeless_stamp);
+    }
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 30000,
-      "reconstruction products: tile %s (%zu voxels), %zu surfels / %zu "
-      "confirmed / %zu/%zu surface voxels (%zu rejected by observed free "
+      "map products: tile %s (%zu voxels), %zu navigation surfels / %zu "
+      "supported-survey candidates (%zu rejected by observed free space), "
+      "%zu/%zu confirmed ribbon voxels (%zu rejected by observed free "
       "space), %zu survey + %zu tile + %zu reconstruction pings awaiting "
       "keyframe association",
       tile_requested ? "resident" : "on disk", m_tile_vox.size(),
-      navigation.size(), confirmed_count, reconstructed.size(),
-      m_surface_accumulator->candidateCellCount(),
-      free_space_rejected,
+      navigation.size(), navigation_candidate_count,
+      navigation_free_space_rejected, confirmed_count, reconstructed.size(),
+      surface_free_space_rejected,
       m_survey_buffer.size(), m_tile_buffer.size(),
       m_reconstruction_buffer.size());
   }
@@ -2375,16 +2462,14 @@ private:
                                                   static_cast<float>(m_resolution),
                                                   m_two_dim_projection_threshold);
     map_lock.unlock();
-    std::size_t free_space_rejected = 0;
+    std::size_t surface_free_space_rejected = 0;
     const std::vector<ReconstructionRow> confirmed =
-      selectNavigationSurface(reconstructed, &free_space_rejected);
+      selectConfirmedSurface(reconstructed, &surface_free_space_rejected);
     // Planning remains conservative: every confirmed, non-contradicted voxel
     // marks occupancy. Local planarity only controls the operator/registration
     // surfel cloud, so a thin obstacle cannot disappear merely because it has
     // too few neighbors for a stable normal.
     applyNavigationSurfaceToOccupancy(grid_msg, confirmed);
-    const std::vector<SurfelRow> navigation =
-      buildNavigationSurfels(confirmed);
     const auto stamp      = get_clock()->now();
     cloud_msg.header.stamp = stamp;
     grid_msg.header.stamp  = stamp;
@@ -2402,12 +2487,13 @@ private:
     //   x y z intensity range incidence support pose_sigma texture
     //   texture_variance elevation_lo_offset elevation_hi_offset
     //   elevation_resolved_fraction
-    // `support` = points merged into the voxel (observation density —
-    // per-voxel confidence and the coverage measure in one field);
+    // `support` = distinct keyframes occupying the point's independent 5 cm
+    // correspondence cell (repeatability, not neighboring bin density);
     // `pose_sigma` is RESERVED (0) until the trajectory topic carries
     // per-keyframe marginals. `incidence` is averaged over the points that
     // know it (>= 0), -1 when none do — no sentinel dilution.
-    if (survey_requested)
+    std::vector<SurveyRow> supported_survey_rows;
+    if (survey_requested || m_navigation_pub)
     {
       // Fold in only what is new. Re-accumulating every keyframe on every
       // render was affordable while the clouds were resident; with them on
@@ -2455,6 +2541,7 @@ private:
       };
       sensor_msgs::msg::PointCloud2 survey_msg;
       sensor_msgs::msg::PointCloud2 supported_survey_msg;
+      supported_survey_rows.reserve(m_vox.size());
       if (full_survey_requested)
       {
         initialize_survey_message(survey_msg);
@@ -2483,6 +2570,10 @@ private:
         {
           append_row(supported_survey_msg, row);
         }
+        if (row[6] >= static_cast<float>(m_survey_min_support))
+        {
+          supported_survey_rows.push_back(row);
+        }
       });
       const auto finish_and_publish = [](
         const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& pub,
@@ -2503,9 +2594,17 @@ private:
       }
     }
 
+    std::size_t navigation_free_space_rejected = 0;
+    const std::vector<ReconstructionRow> navigation_candidates =
+      selectSurveyNavigationSurface(
+        supported_survey_rows, &navigation_free_space_rejected);
+    const std::vector<SurfelRow> navigation =
+      buildNavigationSurfels(navigation_candidates);
+
     publishReconstructionProducts(
       stamp, reconstructed, navigation, confirmed.size(),
-      free_space_rejected);
+      surface_free_space_rejected, navigation_candidates.size(),
+      navigation_free_space_rejected);
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
                          "assembled map: %zu keyframes (%zu without evidence), "
@@ -2544,12 +2643,14 @@ private:
   int m_surface_max_samples_per_return = 31;
   int m_surface_peak_radius_voxels = 0;
   double m_surface_min_return_intensity = 0.0;
+  double m_surface_min_confidence = 0.45;
   double m_navigation_min_confidence = 0.45;
-  double m_navigation_min_intensity = 0.20;
-  int m_surfel_radius_voxels = 2;
+  double m_navigation_min_intensity = 0.15;
+  double m_navigation_unresolved_confidence_scale = 0.50;
+  double m_surfel_radius_m = 0.10;
   int m_surfel_min_neighbors = 5;
   double m_surfel_max_surface_variation = 0.12;
-  double m_surfel_max_projection = 0.05;
+  double m_surfel_max_projection = 0.01;
   GlobalOccupancyMode m_global_occupancy_mode = GlobalOccupancyMode::Hits;
   double m_last_tile_assoc_stamp = 0.0;
   double m_last_reconstruction_assoc_stamp = 0.0;

@@ -214,9 +214,9 @@ TEST(SonarReconstruction, LocalPlaneFitProducesBoundedLidarStyleSurfels)
       vdb_mapping_ros2::ReconstructionRow p;
       // A lightly voxel-stepped wall. Refinement may remove only the normal
       // error; it must not smear the regular y/z sample locations.
-      p.x = 5.0F + 0.012F * static_cast<float>((iy + iz) % 3 - 1);
-      p.y = 0.1F * static_cast<float>(iy);
-      p.z = 0.1F * static_cast<float>(iz);
+      p.x = 5.0F + 0.004F * static_cast<float>((iy + iz) % 3 - 1);
+      p.y = 0.04F * static_cast<float>(iy);
+      p.z = 0.04F * static_cast<float>(iz);
       p.intensity = 0.7F;
       p.support = 4.0F;
       p.view_span_deg = 20.0F;
@@ -235,7 +235,7 @@ TEST(SonarReconstruction, LocalPlaneFitProducesBoundedLidarStyleSurfels)
   patch.push_back(isolated);
 
   const auto surfels = vdb_mapping_ros2::fitSurfaceElements(
-    patch, 0.10F, 2, 5, 0.12F, 0.05F);
+    patch, 0.01F, 0.10F, 5, 0.12F, 0.01F);
   ASSERT_GE(surfels.size(), 20U);
   EXPECT_TRUE(std::none_of(surfels.begin(), surfels.end(), [](const auto& p) {
     return p.x > 8.0F;
@@ -253,6 +253,7 @@ TEST(SonarReconstruction, LocalPlaneFitProducesBoundedLidarStyleSurfels)
   EXPECT_NEAR(centre->z, 0.0F, 1e-6F);
   EXPECT_LT(centre->curvature, 0.02F);
   EXPECT_LT(centre->residual, 0.02F);
+  EXPECT_NEAR(centre->confidence, 0.8F, 1e-6F);
   EXPECT_NEAR(centre->range_sigma, 0.03F, 1e-6F);
   EXPECT_NEAR(centre->echo_prominence, 0.4F, 1e-6F);
 }

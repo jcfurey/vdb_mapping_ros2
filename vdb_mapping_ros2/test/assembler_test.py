@@ -42,6 +42,11 @@ META = dict(intensity=0.5, range=5.0, incidence=0.7, survey_fallback=0.0,
 # expected map position: T_kf_e = inv([2,0,0]) * [1,0,0] -> p_kf = (0,0,0);
 # survey point lands at MAP_KF (then at MAP_KF + z correction)
 EXPECT_XYZ = MAP_KF
+# A dense, survey-only wall patch proves the live/export navigation product is
+# sourced from the centimetre supported survey, not the independent 20 cm
+# aperture-ribbon reconstruction used by the occupancy test below. The odom
+# delta adds +1 m in map x, so robot-frame (6,3,0) lands at map (7,3,0).
+NAV_SURVEY_XYZ = (7.0, 3.0, 0.0)
 
 SURVEY_FIELDS = [
     "x", "y", "z", "intensity", "range", "incidence", "survey_fallback",
@@ -62,7 +67,11 @@ def make_survey_cloud(stamp_s):
     msg.header.stamp.nanosec = int((stamp_s - int(stamp_s)) * 1e9)
     msg.header.frame_id = "base_link"
     msg.height = 1
-    msg.width = 1
+    points = [P_ROBOT]
+    for dy in (-0.08, -0.04, 0.0, 0.04, 0.08):
+        for dz in (-0.08, -0.04, 0.0, 0.04, 0.08):
+            points.append((6.0, 3.0 + dy, dz))
+    msg.width = len(points)
     msg.is_bigendian = False
     msg.is_dense = True
     for name, off in zip(SURVEY_FIELDS, SURVEY_OFFSETS):
@@ -73,13 +82,16 @@ def make_survey_cloud(stamp_s):
         f.count = 1
         msg.fields.append(f)
     msg.point_step = 52
-    msg.row_step = 52
-    row = bytearray(52)
-    vals = dict(META)
-    vals["x"], vals["y"], vals["z"] = P_ROBOT
-    for name, off in zip(SURVEY_FIELDS, SURVEY_OFFSETS):
-        struct.pack_into("<f", row, off, float(vals[name]))
-    msg.data = bytes(row)
+    msg.row_step = msg.point_step * msg.width
+    rows = []
+    for xyz in points:
+        row = bytearray(52)
+        vals = dict(META)
+        vals["x"], vals["y"], vals["z"] = xyz
+        for name, off in zip(SURVEY_FIELDS, SURVEY_OFFSETS):
+            struct.pack_into("<f", row, off, float(vals[name]))
+        rows.append(bytes(row))
+    msg.data = b"".join(rows)
     return msg
 
 
@@ -353,10 +365,14 @@ def main():
         print("FAIL: no survey snapshot within 30 s", flush=True)
         return 1
     rows = node.snapshots[-1]
-    if len(rows) != 1:
-        print(f"FAIL: expected 1 survey row, got {len(rows)}", flush=True)
+    r = next((p for p in rows
+              if close(p.get("x", math.nan), EXPECT_XYZ[0], 0.03)
+              and close(p.get("y", math.nan), EXPECT_XYZ[1], 0.03)
+              and close(p.get("z", math.nan), EXPECT_XYZ[2], 0.03)), None)
+    if r is None:
+        print(f"FAIL: expected anchored survey row near {EXPECT_XYZ}; "
+              f"got {len(rows)} rows", flush=True)
         return 1
-    r = rows[0]
     checks = [
         ("x", EXPECT_XYZ[0]), ("y", EXPECT_XYZ[1]), ("z", EXPECT_XYZ[2]),
         ("intensity", META["intensity"]), ("range", META["range"]),
@@ -380,8 +396,9 @@ def main():
         print(f"FAIL: support = {r.get('support')}", flush=True)
         return 1
     supported_rows = node.supported_survey_snapshots[-1]
-    if len(supported_rows) != 1 or not close(
-            supported_rows[0].get("x", math.nan), EXPECT_XYZ[0], 0.03):
+    if not any(close(p.get("x", math.nan), EXPECT_XYZ[0], 0.03)
+               and close(p.get("y", math.nan), EXPECT_XYZ[1], 0.03)
+               for p in supported_rows):
         print(f"FAIL: supported survey mismatch: {supported_rows}", flush=True)
         return 1
     print("[1] survey metadata + odom-delta anchoring OK", flush=True)
@@ -423,9 +440,9 @@ def main():
               flush=True)
         return 1
     navigation_target = next((p for p in node.navigation_snapshots[-1]
-                              if close(p["x"], 6.0, 0.25)
-                              and close(p["y"], 2.0, 0.25)
-                              and close(p["z"], 0.0, 0.25)), None)
+                              if close(p["x"], NAV_SURVEY_XYZ[0], 0.15)
+                              and close(p["y"], NAV_SURVEY_XYZ[1], 0.15)
+                              and close(p["z"], NAV_SURVEY_XYZ[2], 0.15)), None)
     if navigation_target is None or navigation_target["confidence"] < 0.45:
         print(f"FAIL: clean navigation surface omitted the uncontradicted target: "
               f"{node.navigation_snapshots[-1]}", flush=True)
@@ -438,6 +455,12 @@ def main():
             print(f"FAIL: lidar-style surfel field {field} is missing/invalid: "
                   f"{navigation_target}", flush=True)
             return 1
+    if not close(navigation_target.get("view_span_deg", math.nan), 0.0) or \
+            not close(navigation_target.get("echo_width", math.nan), 0.0):
+        print("FAIL: navigation surfel still carries ribbon-only metadata; "
+              f"expected supported-survey source: {navigation_target}",
+              flush=True)
+        return 1
     if node.navigation_stamps[-1] != (0, 0):
         print("FAIL: retained global navigation surface is time-bound to an "
               f"expiring TF sample: {node.navigation_stamps[-1]}", flush=True)
@@ -485,9 +508,11 @@ def main():
         print("FAIL: navigation export retained an observed-free hypothesis",
               flush=True)
         return 1
-    if not any(close(p["x"], 6.0, 0.25) and close(p["y"], 2.0, 0.25)
-               and close(p["z"], 0.0, 0.25) for p in exported):
-        print("FAIL: navigation export omitted the uncontradicted target",
+    if not any(close(p["x"], NAV_SURVEY_XYZ[0], 0.15)
+               and close(p["y"], NAV_SURVEY_XYZ[1], 0.15)
+               and close(p["z"], NAV_SURVEY_XYZ[2], 0.15)
+               for p in exported):
+        print("FAIL: navigation export omitted the supported-survey wall",
               flush=True)
         return 1
     # Prove the later file is from the shutdown path, not this service call.
@@ -532,13 +557,17 @@ def main():
     def z_moved():
         node.broadcast_odom()
         for snap in node.snapshots[n_before:]:
-            if len(snap) == 1 and close(snap[0]["z"],
-                                        EXPECT_XYZ[2] + Z_CORRECTION, 0.03):
+            if any(close(p["x"], EXPECT_XYZ[0], 0.03)
+                   and close(p["y"], EXPECT_XYZ[1], 0.03)
+                   and close(p["z"], EXPECT_XYZ[2] + Z_CORRECTION, 0.03)
+                   for p in snap):
                 return True
         return False
 
     if not spin_until(node, z_moved, 30.0):
-        zs = [s[0]["z"] for s in node.snapshots[n_before:] if len(s) == 1]
+        zs = [p["z"] for s in node.snapshots[n_before:] for p in s
+              if close(p["x"], EXPECT_XYZ[0], 0.03)
+              and close(p["y"], EXPECT_XYZ[1], 0.03)]
         print(f"FAIL: no re-rendered snapshot at z ~ {Z_CORRECTION}; "
               f"saw z = {zs} (a stale z means the pose gate ignored depth)",
               flush=True)
@@ -558,8 +587,8 @@ def main():
     def navigation_z_moved():
         node.broadcast_odom()
         for snap in node.navigation_snapshots[n_navigation_before:]:
-            if any(close(p["x"], 6.0, 0.25) and
-                   close(p["y"], 2.0, 0.25) and
+            if any(close(p["x"], NAV_SURVEY_XYZ[0], 0.15) and
+                   close(p["y"], NAV_SURVEY_XYZ[1], 0.15) and
                    close(p["z"], Z_CORRECTION, 0.25) for p in snap):
                 return True
         return False
