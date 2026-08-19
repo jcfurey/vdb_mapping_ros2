@@ -579,6 +579,11 @@ struct SurfelRow
   float echo_width = 0.0F;
   float echo_prominence = 0.0F;
   float peak_prominence = 0.0F;
+  // Index of the measured input representative that produced this fit. This
+  // is internal bookkeeping, not part of the PointCloud2/PCD schema: it lets
+  // callers attach a valid normal to the dense evidence row without dropping
+  // rows whose neighborhoods are not planar enough to become strict surfels.
+  std::size_t source_index = std::numeric_limits<std::size_t>::max();
 };
 
 // Fit one weighted local plane per confirmed voxel and project only that
@@ -629,8 +634,9 @@ inline std::vector<SurfelRow> fitSurfaceElements(
       64.0F, 2.0F * static_cast<float>(M_PI) *
         radius_in_cells * radius_in_cells))));
   out.reserve(input.size());
-  for (const auto& p : input)
+  for (std::size_t source_index = 0; source_index < input.size(); ++source_index)
   {
+    const auto& p = input[source_index];
     if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
       continue;
 
@@ -710,7 +716,7 @@ inline std::vector<SurfelRow> fitSurfaceElements(
       p.view_span_deg, p.confidence,
       normal.x(), normal.y(), normal.z(), variation,
       std::sqrt(eigenvalues.x()), p.range_sigma, p.echo_width,
-      p.echo_prominence, p.peak_prominence});
+      p.echo_prominence, p.peak_prominence, source_index});
   }
   return out;
 }

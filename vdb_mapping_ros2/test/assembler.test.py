@@ -57,6 +57,9 @@ def generate_test_description():
             'global_occupancy_mode': 'confirmed_surface',
             'navigation_export_path': '/tmp/assembler_test_navigation.pcd',
             'navigation_export_on_shutdown': True,
+            'navigation_surfel_export_path': (
+                '/tmp/assembler_test_navigation_surfels.pcd'),
+            'navigation_surfel_export_on_shutdown': True,
             'prob_thres_min': 0.49,
             'prob_thres_max': 0.51,
             # exact-stamp TF only: a fallback to latest would silently
@@ -99,8 +102,20 @@ class TestAfterShutdown(unittest.TestCase):
         with open(path, 'rb') as stream:
             header = stream.read(512).decode('ascii', errors='ignore')
         self.assertIn(
+            'FIELDS x y z intensity range incidence support confidence '
+            'pose_sigma texture texture_variance elevation_lo_offset '
+            'elevation_hi_offset elevation_resolved_fraction normal_x '
+            'normal_y normal_z curvature residual normal_valid',
+            header,
+        )
+
+        surfel_path = '/tmp/assembler_test_navigation_surfels.pcd'
+        self.assertTrue(os.path.exists(surfel_path))
+        with open(surfel_path, 'rb') as stream:
+            surfel_header = stream.read(512).decode('ascii', errors='ignore')
+        self.assertIn(
             'FIELDS x y z intensity support view_span_deg confidence '
             'normal_x normal_y normal_z curvature residual range_sigma '
             'echo_width echo_prominence peak_prominence',
-            header,
+            surfel_header,
         )

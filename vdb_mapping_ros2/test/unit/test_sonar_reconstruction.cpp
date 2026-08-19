@@ -237,6 +237,9 @@ TEST(SonarReconstruction, LocalPlaneFitProducesBoundedLidarStyleSurfels)
   const auto surfels = vdb_mapping_ros2::fitSurfaceElements(
     patch, 0.01F, 0.10F, 5, 0.12F, 0.01F);
   ASSERT_GE(surfels.size(), 20U);
+  EXPECT_TRUE(std::all_of(surfels.begin(), surfels.end(), [&patch](const auto& p) {
+    return p.source_index < patch.size();
+  }));
   EXPECT_TRUE(std::none_of(surfels.begin(), surfels.end(), [](const auto& p) {
     return p.x > 8.0F;
   }));

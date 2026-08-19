@@ -127,10 +127,49 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(
     float, elevation_hi_offset, elevation_hi_offset)(
     float, elevation_resolved_fraction, elevation_resolved_fraction))
 
-// Clean graph-corrected navigation surface written to PCD. This intentionally
-// has the same named fields as the live ~/navigation_pointcloud topic so an
-// operator can use one product live and after the mission without a schema
-// conversion step.
+// Dense graph-corrected navigation returns written to PCD. This intentionally
+// has the same named fields as the live ~/navigation_pointcloud topic: survey
+// ranging/uncertainty remains present on every admitted return, while the
+// normal fields are explicitly optional through normal_valid.
+struct NavigationExportPoint
+{
+  PCL_ADD_POINT4D;
+  float intensity;
+  float range;
+  float incidence;
+  float support;
+  float confidence;
+  float pose_sigma;
+  float texture;
+  float texture_variance;
+  float elevation_lo_offset;
+  float elevation_hi_offset;
+  float elevation_resolved_fraction;
+  float normal_x;
+  float normal_y;
+  float normal_z;
+  float curvature;
+  float residual;
+  float normal_valid;
+  PCL_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(
+  NavigationExportPoint,
+  (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(
+    float, range, range)(float, incidence, incidence)(float, support, support)(
+    float, confidence, confidence)(float, pose_sigma, pose_sigma)(
+    float, texture, texture)(float, texture_variance, texture_variance)(
+    float, elevation_lo_offset, elevation_lo_offset)(
+    float, elevation_hi_offset, elevation_hi_offset)(
+    float, elevation_resolved_fraction, elevation_resolved_fraction)(
+    float, normal_x, normal_x)(float, normal_y, normal_y)(
+    float, normal_z, normal_z)(float, curvature, curvature)(
+    float, residual, residual)(float, normal_valid, normal_valid))
+
+// Strict graph-corrected navigation surfels written to PCD. This keeps the
+// former navigation schema on the new ~/navigation_surfel_pointcloud topic for
+// registration consumers that require every row to have a trustworthy normal.
 struct SurfaceExportPoint
 {
   PCL_ADD_POINT4D;
@@ -165,6 +204,33 @@ namespace vdb_mapping_ros2 {
 
 constexpr std::size_t kSurveyOutputFields = 13;
 using SurveyRow = std::array<float, kSurveyOutputFields>;
+
+struct NavigationRow
+{
+  float x = 0.0F;
+  float y = 0.0F;
+  float z = 0.0F;
+  float intensity = 0.0F;
+  float range = 0.0F;
+  float incidence = -1.0F;
+  float support = 0.0F;
+  float confidence = 0.0F;
+  float pose_sigma = 0.0F;
+  float texture = 0.0F;
+  float texture_variance = 0.0F;
+  float elevation_lo_offset = 0.0F;
+  float elevation_hi_offset = 0.0F;
+  float elevation_resolved_fraction = 0.0F;
+  float normal_x = 0.0F;
+  float normal_y = 0.0F;
+  float normal_z = 0.0F;
+  // Negative curvature/residual plus normal_valid=0 are deliberate, finite
+  // invalid markers. They keep generic PointCloud2 readers from deleting the
+  // measured row under skip_nans while making normal availability explicit.
+  float curvature = -1.0F;
+  float residual = -1.0F;
+  float normal_valid = 0.0F;
+};
 
 class VDBMapAssembler : public rclcpp::Node
 {
@@ -231,7 +297,7 @@ public:
     // surface and full tile products remain separately available for diagnosis
     // and conservative occupancy.
     declare_parameter<double>("navigation_min_confidence", 0.45);
-    declare_parameter<double>("navigation_min_intensity", 0.15);
+    declare_parameter<double>("navigation_min_intensity", 0.10);
     declare_parameter<double>("navigation_unresolved_confidence_scale", 0.50);
     // Lidar-style surface-element refinement for the operator cloud. The 1 cm
     // representation preserves sonar detail; an independent metric-radius
@@ -274,10 +340,13 @@ public:
     // at shutdown. Empty disables.
     declare_parameter<std::string>("export_path", "");
     declare_parameter<bool>("export_on_shutdown", true);
-    // Clean navigation surface, written independently of the broad survey
-    // export. Empty disables.
+    // Dense navigation returns and strict normal-bearing surfels, written
+    // independently of the broad survey export. Empty paths disable their
+    // corresponding products.
     declare_parameter<std::string>("navigation_export_path", "");
     declare_parameter<bool>("navigation_export_on_shutdown", true);
+    declare_parameter<std::string>("navigation_surfel_export_path", "");
+    declare_parameter<bool>("navigation_surfel_export_on_shutdown", true);
 
     get_parameter("resolution", m_resolution);
     get_parameter("map_frame", m_map_frame);
@@ -390,6 +459,11 @@ public:
     get_parameter("navigation_export_path", m_navigation_export_path);
     get_parameter(
       "navigation_export_on_shutdown", m_navigation_export_on_shutdown);
+    get_parameter(
+      "navigation_surfel_export_path", m_navigation_surfel_export_path);
+    get_parameter(
+      "navigation_surfel_export_on_shutdown",
+      m_navigation_surfel_export_on_shutdown);
     setUpSpill();
 
     m_map = std::make_unique<VDBMapT>(m_resolution);
@@ -476,6 +550,8 @@ public:
         "~/supported_survey_pointcloud", map_qos);
       m_navigation_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/navigation_pointcloud", map_qos);
+      m_navigation_surfel_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "~/navigation_surfel_pointcloud", map_qos);
     }
 
     std::string tile_topic, reconstruction_topic;
@@ -517,6 +593,12 @@ public:
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
              std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
         res->success = exportNavigationSurface(res->message);
+      });
+    m_navigation_surfel_export_srv = create_service<std_srvs::srv::Trigger>(
+      "~/export_navigation_surfels",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        res->success = exportNavigationSurfels(res->message);
       });
 
     m_render_timer = create_timer(std::chrono::milliseconds(500),
@@ -1749,11 +1831,11 @@ private:
   // resolved returns earn the full support confidence; unresolved returns are
   // allowed only after substantially more revisits. Explicit free-space
   // evidence still vetoes either kind, while unknown space remains eligible.
-  std::vector<ReconstructionRow> selectSurveyNavigationSurface(
+  std::vector<NavigationRow> selectSurveyNavigationSurface(
     const std::vector<SurveyRow>& supported,
     std::size_t* free_space_rejected = nullptr) const
   {
-    std::vector<ReconstructionRow> navigation;
+    std::vector<NavigationRow> navigation;
     navigation.reserve(supported.size());
     std::size_t rejected = 0;
 
@@ -1794,9 +1876,8 @@ private:
         continue;
       }
       navigation.push_back({
-        row[0], row[1], row[2], intensity, support,
-        0.0F, confidence,
-        0.0F, 0.0F, 0.0F, 0.0F});
+        row[0], row[1], row[2], intensity, row[4], row[5], support,
+        confidence, row[7], row[8], row[9], row[10], row[11], resolved});
     }
     if (free_space_rejected != nullptr)
     {
@@ -1806,8 +1887,17 @@ private:
   }
 
   std::vector<SurfelRow> buildNavigationSurfels(
-    const std::vector<ReconstructionRow>& candidates) const
+    std::vector<NavigationRow>& navigation) const
   {
+    std::vector<ReconstructionRow> candidates;
+    candidates.reserve(navigation.size());
+    for (const auto& row : navigation)
+    {
+      candidates.push_back({
+        row.x, row.y, row.z, row.intensity, row.support,
+        0.0F, row.confidence,
+        0.0F, 0.0F, 0.0F, 0.0F});
+    }
     std::vector<SurfelRow> surfels = fitSurfaceElements(
       candidates, static_cast<float>(m_survey_resolution),
       static_cast<float>(m_surfel_radius_m), m_surfel_min_neighbors,
@@ -1815,32 +1905,36 @@ private:
       static_cast<float>(m_surfel_max_projection));
     surfels.erase(
       std::remove_if(
-        surfels.begin(), surfels.end(), [this](const SurfelRow& p) {
+        surfels.begin(), surfels.end(), [this, &navigation](const SurfelRow& p) {
           return !std::isfinite(p.x) || !std::isfinite(p.y) ||
             !std::isfinite(p.z) || !std::isfinite(p.confidence) ||
-            p.confidence < static_cast<float>(m_navigation_min_confidence);
+            p.confidence < static_cast<float>(m_navigation_min_confidence) ||
+            p.source_index >= navigation.size();
         }),
       surfels.end());
+    for (const auto& surfel : surfels)
+    {
+      auto& row = navigation[surfel.source_index];
+      // Keep the dense navigation return at its measured survey position. The
+      // projected coordinate belongs only to the strict surfel product; the
+      // dense product receives the fitted orientation/quality metadata.
+      row.normal_x = surfel.normal_x;
+      row.normal_y = surfel.normal_y;
+      row.normal_z = surfel.normal_z;
+      row.curvature = surfel.curvature;
+      row.residual = surfel.residual;
+      row.normal_valid = 1.0F;
+    }
     return surfels;
   }
 
-  // Export the exact same supported-survey surfels carried by
-  // ~/navigation_pointcloud. Force pending occupancy evidence/graph
-  // corrections through first because the clean subset includes the
-  // free-space contradiction mask as well as the graph-corrected survey.
-  bool exportNavigationSurface(std::string& message)
+  void collectNavigationProducts(
+    std::vector<NavigationRow>& navigation,
+    std::vector<SurfelRow>& surfels)
   {
-    if (m_navigation_export_path.empty())
-    {
-      message = "navigation_export_path is unset";
-      return false;
-    }
-    if (!m_navigation_pub)
-    {
-      message = "navigation surface is disabled (survey_topic unset)";
-      return false;
-    }
-
+    // Force pending occupancy evidence/graph corrections through first: the
+    // clean subset includes both the graph-corrected survey and the explicit
+    // free-space contradiction mask.
     if (m_dirty || m_have_new)
     {
       m_last_product_render = -std::numeric_limits<double>::infinity();
@@ -1855,13 +1949,116 @@ private:
         supported.push_back(row);
       }
     });
-    const std::vector<ReconstructionRow> candidates =
-      selectSurveyNavigationSurface(supported);
-    const std::vector<SurfelRow> navigation =
-      buildNavigationSurfels(candidates);
-    pcl::PointCloud<SurfaceExportPoint> out;
+    navigation = selectSurveyNavigationSurface(supported);
+    surfels = buildNavigationSurfels(navigation);
+  }
+
+  template<typename PointT>
+  bool writeNavigationExport(
+    pcl::PointCloud<PointT>& out, const std::string& path,
+    const char* product, std::string& message)
+  {
+    if (out.empty())
+    {
+      message = std::string("nothing to export (no ") + product +
+        " passed the gates)";
+      return false;
+    }
+    const std::filesystem::path destination(path);
+    if (destination.has_parent_path())
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(destination.parent_path(), ec);
+    }
+    const std::string tmp = path + ".part";
+    auto cloud = out.makeShared();
+    if (!writeSpill(cloud, tmp))
+    {
+      message = "failed to write " + tmp;
+      return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, destination, ec);
+    if (ec)
+    {
+      message = "failed to move " + tmp + " into place: " + ec.message();
+      return false;
+    }
+    message = "wrote " + std::to_string(out.size()) + " " + product +
+      " to " + path;
+    RCLCPP_INFO(get_logger(), "%s", message.c_str());
+    return true;
+  }
+
+  // Export the exact dense return set carried by ~/navigation_pointcloud.
+  bool exportNavigationSurface(std::string& message)
+  {
+    if (m_navigation_export_path.empty())
+    {
+      message = "navigation_export_path is unset";
+      return false;
+    }
+    if (!m_navigation_pub)
+    {
+      message = "navigation returns are disabled (survey_topic unset)";
+      return false;
+    }
+
+    std::vector<NavigationRow> navigation;
+    std::vector<SurfelRow> surfels;
+    collectNavigationProducts(navigation, surfels);
+    pcl::PointCloud<NavigationExportPoint> out;
     out.reserve(navigation.size());
     for (const auto& row : navigation)
+    {
+      NavigationExportPoint p;
+      p.x = row.x;
+      p.y = row.y;
+      p.z = row.z;
+      p.intensity = row.intensity;
+      p.range = row.range;
+      p.incidence = row.incidence;
+      p.support = row.support;
+      p.confidence = row.confidence;
+      p.pose_sigma = row.pose_sigma;
+      p.texture = row.texture;
+      p.texture_variance = row.texture_variance;
+      p.elevation_lo_offset = row.elevation_lo_offset;
+      p.elevation_hi_offset = row.elevation_hi_offset;
+      p.elevation_resolved_fraction = row.elevation_resolved_fraction;
+      p.normal_x = row.normal_x;
+      p.normal_y = row.normal_y;
+      p.normal_z = row.normal_z;
+      p.curvature = row.curvature;
+      p.residual = row.residual;
+      p.normal_valid = row.normal_valid;
+      out.push_back(p);
+    }
+    return writeNavigationExport(
+      out, m_navigation_export_path, "navigation returns", message);
+  }
+
+  // Export the exact strict subset carried by
+  // ~/navigation_surfel_pointcloud.
+  bool exportNavigationSurfels(std::string& message)
+  {
+    if (m_navigation_surfel_export_path.empty())
+    {
+      message = "navigation_surfel_export_path is unset";
+      return false;
+    }
+    if (!m_navigation_surfel_pub)
+    {
+      message = "navigation surfels are disabled (survey_topic unset)";
+      return false;
+    }
+
+    std::vector<NavigationRow> navigation;
+    std::vector<SurfelRow> surfels;
+    collectNavigationProducts(navigation, surfels);
+    pcl::PointCloud<SurfaceExportPoint> out;
+    out.reserve(surfels.size());
+    for (const auto& row : surfels)
     {
       SurfaceExportPoint p;
       p.x = row.x;
@@ -1882,36 +2079,8 @@ private:
       p.peak_prominence = row.peak_prominence;
       out.push_back(p);
     }
-    if (out.empty())
-    {
-      message = "nothing to export (no navigation surface voxels passed the gates)";
-      return false;
-    }
-
-    const std::filesystem::path path(m_navigation_export_path);
-    if (path.has_parent_path())
-    {
-      std::error_code ec;
-      std::filesystem::create_directories(path.parent_path(), ec);
-    }
-    const std::string tmp = m_navigation_export_path + ".part";
-    auto cloud = out.makeShared();
-    if (!writeSpill(cloud, tmp))
-    {
-      message = "failed to write " + tmp;
-      return false;
-    }
-    std::error_code ec;
-    std::filesystem::rename(tmp, path, ec);
-    if (ec)
-    {
-      message = "failed to move " + tmp + " into place: " + ec.message();
-      return false;
-    }
-    message = "wrote " + std::to_string(out.size()) + " navigation points to " +
-      m_navigation_export_path;
-    RCLCPP_INFO(get_logger(), "%s", message.c_str());
-    return true;
+    return writeNavigationExport(
+      out, m_navigation_surfel_export_path, "navigation surfels", message);
   }
 
   // Bring the survey accumulator up to date with the keyframe list: rebuild
@@ -2089,13 +2258,14 @@ private:
   void publishReconstructionProducts(
     const rclcpp::Time& stamp,
     const std::vector<ReconstructionRow>& reconstructed,
-    const std::vector<SurfelRow>& navigation,
+    const std::vector<NavigationRow>& navigation,
+    const std::vector<SurfelRow>& surfels,
     const std::size_t confirmed_count,
     const std::size_t surface_free_space_rejected,
-    const std::size_t navigation_candidate_count,
     const std::size_t navigation_free_space_rejected)
   {
-    if (!m_tile_pub && !m_surface_pub && !m_navigation_pub)
+    if (!m_tile_pub && !m_surface_pub && !m_navigation_pub &&
+        !m_navigation_surfel_pub)
     {
       return;
     }
@@ -2155,25 +2325,51 @@ private:
         }, stamp);
     }
 
-    // Product C: the compact operator-facing surface. Publish this one every
-    // render even before RViz starts so transient-local delivery gives a late
-    // operator the current graph-corrected map immediately. This is a global
-    // map snapshot, not a sensor acquisition. A zero stamp deliberately asks
-    // cross-frame consumers for the latest transform; otherwise a retained
-    // sample becomes unusable as soon as its render stamp falls out of a
-    // rolling TF cache (RViz defaults to 10 s, while a quality render can take
-    // substantially longer).
+    // Product C: every supported, confidence/intensity-gated, free-space-safe
+    // survey return. Local planarity never controls whether measured evidence
+    // exists. Valid fits attach normals in place; invalid fits retain their
+    // exact graph-corrected coordinates and range/uncertainty metadata with
+    // normal_valid=0, zero normals, and negative curvature/residual sentinels.
+    // Publish every render so transient-local delivery gives late operators
+    // the current map. A zero stamp asks cross-frame consumers for the latest
+    // transform rather than binding a retained global snapshot to an expired
+    // TF sample.
     const rclcpp::Time timeless_stamp(0, 0, stamp.get_clock_type());
+    constexpr std::array<const char*, 20> navigation_names = {
+      "x", "y", "z", "intensity", "range", "incidence", "support",
+      "confidence", "pose_sigma", "texture", "texture_variance",
+      "elevation_lo_offset", "elevation_hi_offset",
+      "elevation_resolved_fraction", "normal_x", "normal_y", "normal_z",
+      "curvature", "residual", "normal_valid"};
+    if (m_navigation_pub)
+    {
+      publishFloatRows(
+        m_navigation_pub, navigation_names, navigation.size(),
+        [&navigation](const auto& append) {
+          for (const auto& p : navigation)
+          {
+            append(std::array<float, 20>{
+              p.x, p.y, p.z, p.intensity, p.range, p.incidence, p.support,
+              p.confidence, p.pose_sigma, p.texture, p.texture_variance,
+              p.elevation_lo_offset, p.elevation_hi_offset,
+              p.elevation_resolved_fraction, p.normal_x, p.normal_y,
+              p.normal_z, p.curvature, p.residual, p.normal_valid});
+          }
+        }, timeless_stamp);
+    }
+
+    // Product D: strict, projected lidar-style surfels for registration
+    // consumers that require every point to have a trustworthy local normal.
     constexpr std::array<const char*, 16> surfel_names = {
       "x", "y", "z", "intensity", "support", "view_span_deg", "confidence",
       "normal_x", "normal_y", "normal_z", "curvature", "residual",
       "range_sigma", "echo_width", "echo_prominence", "peak_prominence"};
-    if (m_navigation_pub)
+    if (m_navigation_surfel_pub)
     {
       publishFloatRows(
-        m_navigation_pub, surfel_names, navigation.size(),
-        [&navigation](const auto& append) {
-          for (const auto& p : navigation)
+        m_navigation_surfel_pub, surfel_names, surfels.size(),
+        [&surfels](const auto& append) {
+          for (const auto& p : surfels)
           {
             append(std::array<float, 16>{
               p.x, p.y, p.z, p.intensity, p.support,
@@ -2187,13 +2383,13 @@ private:
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 30000,
-      "map products: tile %s (%zu voxels), %zu navigation surfels / %zu "
-      "supported-survey candidates (%zu rejected by observed free space), "
+      "map products: tile %s (%zu voxels), %zu dense navigation returns / "
+      "%zu strict surfels (%zu rejected by observed free space), "
       "%zu/%zu confirmed ribbon voxels (%zu rejected by observed free "
       "space), %zu survey + %zu tile + %zu reconstruction pings awaiting "
       "keyframe association",
       tile_requested ? "resident" : "on disk", m_tile_vox.size(),
-      navigation.size(), navigation_candidate_count,
+      navigation.size(), surfels.size(),
       navigation_free_space_rejected, confirmed_count, reconstructed.size(),
       surface_free_space_rejected,
       m_survey_buffer.size(), m_tile_buffer.size(),
@@ -2493,7 +2689,7 @@ private:
     // per-keyframe marginals. `incidence` is averaged over the points that
     // know it (>= 0), -1 when none do — no sentinel dilution.
     std::vector<SurveyRow> supported_survey_rows;
-    if (survey_requested || m_navigation_pub)
+    if (survey_requested || m_navigation_pub || m_navigation_surfel_pub)
     {
       // Fold in only what is new. Re-accumulating every keyframe on every
       // render was affordable while the clouds were resident; with them on
@@ -2595,15 +2791,15 @@ private:
     }
 
     std::size_t navigation_free_space_rejected = 0;
-    const std::vector<ReconstructionRow> navigation_candidates =
+    std::vector<NavigationRow> navigation =
       selectSurveyNavigationSurface(
         supported_survey_rows, &navigation_free_space_rejected);
-    const std::vector<SurfelRow> navigation =
-      buildNavigationSurfels(navigation_candidates);
+    const std::vector<SurfelRow> surfels =
+      buildNavigationSurfels(navigation);
 
     publishReconstructionProducts(
-      stamp, reconstructed, navigation, confirmed.size(),
-      surface_free_space_rejected, navigation_candidates.size(),
+      stamp, reconstructed, navigation, surfels, confirmed.size(),
+      surface_free_space_rejected,
       navigation_free_space_rejected);
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
@@ -2645,7 +2841,7 @@ private:
   double m_surface_min_return_intensity = 0.0;
   double m_surface_min_confidence = 0.45;
   double m_navigation_min_confidence = 0.45;
-  double m_navigation_min_intensity = 0.15;
+  double m_navigation_min_intensity = 0.10;
   double m_navigation_unresolved_confidence_scale = 0.50;
   double m_surfel_radius_m = 0.10;
   int m_surfel_min_neighbors = 5;
@@ -2681,6 +2877,8 @@ private:
   bool m_export_on_shutdown = true;
   std::string m_navigation_export_path;
   bool m_navigation_export_on_shutdown = true;
+  std::string m_navigation_surfel_export_path;
+  bool m_navigation_surfel_export_on_shutdown = true;
 
   // Survey accumulator, persistent across renders. Unlike the keyframe
   // evidence this is bounded by the surveyed VOLUME rather than by elapsed
@@ -2725,8 +2923,12 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_tile_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_surface_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_navigation_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
+    m_navigation_surfel_pub;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr m_export_srv;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr m_navigation_export_srv;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr
+    m_navigation_surfel_export_srv;
   rclcpp::TimerBase::SharedPtr m_render_timer;
 
 public:
@@ -2751,6 +2953,17 @@ public:
       {
         RCLCPP_WARN(
           get_logger(), "shutdown navigation export skipped: %s",
+          message.c_str());
+      }
+    }
+    if (m_navigation_surfel_export_on_shutdown &&
+        !m_navigation_surfel_export_path.empty())
+    {
+      std::string message;
+      if (!exportNavigationSurfels(message))
+      {
+        RCLCPP_WARN(
+          get_logger(), "shutdown navigation surfel export skipped: %s",
           message.c_str());
       }
     }

@@ -33,6 +33,7 @@ ODOM_X_KF = 2.0
 MAP_KF = (2.0, 0.0, 0.0)   # optimized keyframe pose (translation)
 Z_CORRECTION = -1.0
 NAV_EXPORT = "/tmp/assembler_test_navigation.pcd"
+SURFEL_EXPORT = "/tmp/assembler_test_navigation_surfels.pcd"
 # survey input point, robot frame at T_E, with distinct metadata everywhere
 P_ROBOT = (1.0, 0.0, 0.0)
 META = dict(intensity=0.5, range=5.0, incidence=0.7, survey_fallback=0.0,
@@ -47,6 +48,10 @@ EXPECT_XYZ = MAP_KF
 # aperture-ribbon reconstruction used by the occupancy test below. The odom
 # delta adds +1 m in map x, so robot-frame (6,3,0) lands at map (7,3,0).
 NAV_SURVEY_XYZ = (7.0, 3.0, 0.0)
+# A separate supported return outside every clearing ray deliberately has no
+# neighbors. Dense navigation must keep it with normal_valid=0; strict surfels
+# must omit it. The same +1 m odom delta places it at map (9,-3,0).
+ISOLATED_SURVEY_XYZ = (9.0, -3.0, 0.0)
 
 SURVEY_FIELDS = [
     "x", "y", "z", "intensity", "range", "incidence", "survey_fallback",
@@ -67,7 +72,7 @@ def make_survey_cloud(stamp_s):
     msg.header.stamp.nanosec = int((stamp_s - int(stamp_s)) * 1e9)
     msg.header.frame_id = "base_link"
     msg.height = 1
-    points = [P_ROBOT]
+    points = [P_ROBOT, (8.0, -3.0, 0.0)]
     for dy in (-0.08, -0.04, 0.0, 0.04, 0.08):
         for dz in (-0.08, -0.04, 0.0, 0.04, 0.08):
             points.append((6.0, 3.0 + dy, dz))
@@ -221,6 +226,8 @@ class Harness(Node):
         self.surface_snapshots = []
         self.navigation_snapshots = []
         self.navigation_stamps = []
+        self.navigation_surfel_snapshots = []
+        self.navigation_surfel_stamps = []
         self.occupancy_snapshots = []
         self.latched_qos = latched
         self.create_subscription(
@@ -240,10 +247,15 @@ class Harness(Node):
             PointCloud2, "/assembler/navigation_pointcloud",
             self.capture_navigation, latched)
         self.create_subscription(
+            PointCloud2, "/assembler/navigation_surfel_pointcloud",
+            self.capture_navigation_surfels, latched)
+        self.create_subscription(
             OccupancyGrid, "/assembler/vdb_map_occupancy",
             lambda m: self.occupancy_snapshots.append(m), latched)
         self.navigation_export = self.create_client(
             Trigger, "/assembler/export_navigation_surface")
+        self.navigation_surfel_export = self.create_client(
+            Trigger, "/assembler/export_navigation_surfels")
 
         transforms = []
         for angle in TILE_ANGLES:
@@ -261,6 +273,11 @@ class Harness(Node):
     def capture_navigation(self, msg):
         self.navigation_snapshots.append(parse_survey(msg))
         self.navigation_stamps.append(
+            (msg.header.stamp.sec, msg.header.stamp.nanosec))
+
+    def capture_navigation_surfels(self, msg):
+        self.navigation_surfel_snapshots.append(parse_survey(msg))
+        self.navigation_surfel_stamps.append(
             (msg.header.stamp.sec, msg.header.stamp.nanosec))
 
     def broadcast_odom(self):
@@ -406,7 +423,8 @@ def main():
     if not spin_until(
             node,
             lambda: bool(node.tile_snapshots) and bool(node.surface_snapshots)
-            and bool(node.navigation_snapshots),
+            and bool(node.navigation_snapshots)
+            and bool(node.navigation_surfel_snapshots),
             10.0):
         print("FAIL: reconstruction products were not published", flush=True)
         return 1
@@ -435,9 +453,37 @@ def main():
          and close(p["y"], 0.0, 0.25)
          and close(p["z"], 0.0, 0.25)), None)
     if contradicted_navigation_target is not None:
-        print("FAIL: observed-free ribbon hypothesis leaked into the clean "
-              f"navigation surface: {contradicted_navigation_target}",
+        print("FAIL: ribbon-only hypothesis leaked into dense survey-derived "
+              f"navigation returns: {contradicted_navigation_target}",
               flush=True)
+        return 1
+    isolated_navigation_target = next(
+        (p for p in node.navigation_snapshots[-1]
+         if close(p["x"], ISOLATED_SURVEY_XYZ[0], 0.03)
+         and close(p["y"], ISOLATED_SURVEY_XYZ[1], 0.03)
+         and close(p["z"], ISOLATED_SURVEY_XYZ[2], 0.03)), None)
+    if isolated_navigation_target is None:
+        print("FAIL: dense navigation dropped a supported ranged return just "
+              "because it had no planar neighborhood", flush=True)
+        return 1
+    for field, expected in (
+            ("range", META["range"]), ("incidence", META["incidence"]),
+            ("texture", META["texture"]),
+            ("elevation_lo_offset", META["elevation_lo_offset"]),
+            ("elevation_hi_offset", META["elevation_hi_offset"]),
+            ("elevation_resolved_fraction", META["elevation_resolved"])):
+        if not close(isolated_navigation_target.get(field, math.nan),
+                     expected, 0.03):
+            print(f"FAIL: dense navigation lost survey field {field}: "
+                  f"{isolated_navigation_target}", flush=True)
+            return 1
+    if isolated_navigation_target.get("normal_valid") != 0.0 or any(
+            isolated_navigation_target.get(field) != 0.0
+            for field in ("normal_x", "normal_y", "normal_z")) or \
+            isolated_navigation_target.get("curvature") != -1.0 or \
+            isolated_navigation_target.get("residual") != -1.0:
+        print("FAIL: dense navigation did not explicitly mark an unavailable "
+              f"normal: {isolated_navigation_target}", flush=True)
         return 1
     navigation_target = next((p for p in node.navigation_snapshots[-1]
                               if close(p["x"], NAV_SURVEY_XYZ[0], 0.15)
@@ -448,22 +494,39 @@ def main():
               f"{node.navigation_snapshots[-1]}", flush=True)
         return 1
     for field in ("normal_x", "normal_y", "normal_z", "curvature",
-                  "residual", "range_sigma", "echo_width",
-                  "echo_prominence", "peak_prominence"):
+                  "residual", "range", "incidence", "normal_valid"):
         if field not in navigation_target or not math.isfinite(
                 navigation_target[field]):
-            print(f"FAIL: lidar-style surfel field {field} is missing/invalid: "
+            print(f"FAIL: dense navigation field {field} is missing/invalid: "
                   f"{navigation_target}", flush=True)
             return 1
-    if not close(navigation_target.get("view_span_deg", math.nan), 0.0) or \
-            not close(navigation_target.get("echo_width", math.nan), 0.0):
-        print("FAIL: navigation surfel still carries ribbon-only metadata; "
-              f"expected supported-survey source: {navigation_target}",
+    if navigation_target["normal_valid"] != 1.0:
+        print("FAIL: dense wall return did not receive its available normal: "
+              f"{navigation_target}", flush=True)
+        return 1
+    strict_target = next(
+        (p for p in node.navigation_surfel_snapshots[-1]
+         if close(p["x"], NAV_SURVEY_XYZ[0], 0.15)
+         and close(p["y"], NAV_SURVEY_XYZ[1], 0.15)
+         and close(p["z"], NAV_SURVEY_XYZ[2], 0.15)), None)
+    if strict_target is None:
+        print("FAIL: strict surfel product omitted the fitted wall: "
+              f"{node.navigation_surfel_snapshots[-1]}", flush=True)
+        return 1
+    if any(close(p["x"], ISOLATED_SURVEY_XYZ[0], 0.03)
+           and close(p["y"], ISOLATED_SURVEY_XYZ[1], 0.03)
+           and close(p["z"], ISOLATED_SURVEY_XYZ[2], 0.03)
+           for p in node.navigation_surfel_snapshots[-1]):
+        print("FAIL: isolated return leaked into strict surfel product",
               flush=True)
         return 1
     if node.navigation_stamps[-1] != (0, 0):
         print("FAIL: retained global navigation surface is time-bound to an "
               f"expiring TF sample: {node.navigation_stamps[-1]}", flush=True)
+        return 1
+    if node.navigation_surfel_stamps[-1] != (0, 0):
+        print("FAIL: retained strict surfels are time-bound to an expiring TF "
+              f"sample: {node.navigation_surfel_stamps[-1]}", flush=True)
         return 1
     if not spin_until(node, lambda: bool(node.occupancy_snapshots), 10.0):
         print("FAIL: no global occupancy snapshot", flush=True)
@@ -496,10 +559,11 @@ def main():
         print(f"FAIL: cannot read navigation export: {exc}", flush=True)
         return 1
     expected_fields = [
-        "x", "y", "z", "intensity", "support", "view_span_deg",
-        "confidence", "normal_x", "normal_y", "normal_z", "curvature",
-        "residual", "range_sigma", "echo_width", "echo_prominence",
-        "peak_prominence"]
+        "x", "y", "z", "intensity", "range", "incidence", "support",
+        "confidence", "pose_sigma", "texture", "texture_variance",
+        "elevation_lo_offset", "elevation_hi_offset",
+        "elevation_resolved_fraction", "normal_x", "normal_y", "normal_z",
+        "curvature", "residual", "normal_valid"]
     if fields != expected_fields:
         print(f"FAIL: navigation PCD schema is wrong: {fields}", flush=True)
         return 1
@@ -515,13 +579,58 @@ def main():
         print("FAIL: navigation export omitted the supported-survey wall",
               flush=True)
         return 1
-    # Prove the later file is from the shutdown path, not this service call.
+    exported_isolated = next(
+        (p for p in exported
+         if close(p["x"], ISOLATED_SURVEY_XYZ[0], 0.03)
+         and close(p["y"], ISOLATED_SURVEY_XYZ[1], 0.03)
+         and close(p["z"], ISOLATED_SURVEY_XYZ[2], 0.03)), None)
+    if exported_isolated is None or exported_isolated["normal_valid"] != 0.0:
+        print("FAIL: dense export omitted or mislabelled isolated evidence: "
+              f"{exported_isolated}", flush=True)
+        return 1
+
+    if not node.navigation_surfel_export.wait_for_service(timeout_sec=5.0):
+        print("FAIL: navigation surfel export service unavailable", flush=True)
+        return 1
+    future = node.navigation_surfel_export.call_async(Trigger.Request())
+    if not spin_until(node, future.done, 10.0) or not future.result().success:
+        result = future.result() if future.done() else None
+        print(f"FAIL: navigation surfel export failed: {result}", flush=True)
+        return 1
     try:
-        os.unlink(NAV_EXPORT)
-    except OSError as exc:
-        print(f"FAIL: cannot clear service export before shutdown test: {exc}",
+        surfel_fields, exported_surfels = read_navigation_pcd(SURFEL_EXPORT)
+    except (OSError, ValueError) as exc:
+        print(f"FAIL: cannot read navigation surfel export: {exc}", flush=True)
+        return 1
+    expected_surfel_fields = [
+        "x", "y", "z", "intensity", "support", "view_span_deg",
+        "confidence", "normal_x", "normal_y", "normal_z", "curvature",
+        "residual", "range_sigma", "echo_width", "echo_prominence",
+        "peak_prominence"]
+    if surfel_fields != expected_surfel_fields:
+        print(f"FAIL: surfel PCD schema is wrong: {surfel_fields}", flush=True)
+        return 1
+    if any(close(p["x"], ISOLATED_SURVEY_XYZ[0], 0.03)
+           and close(p["y"], ISOLATED_SURVEY_XYZ[1], 0.03)
+           and close(p["z"], ISOLATED_SURVEY_XYZ[2], 0.03)
+           for p in exported_surfels):
+        print("FAIL: strict surfel export retained isolated evidence",
               flush=True)
         return 1
+    if not any(close(p["x"], NAV_SURVEY_XYZ[0], 0.15)
+               and close(p["y"], NAV_SURVEY_XYZ[1], 0.15)
+               and close(p["z"], NAV_SURVEY_XYZ[2], 0.15)
+               for p in exported_surfels):
+        print("FAIL: strict surfel export omitted the fitted wall", flush=True)
+        return 1
+    # Prove the later file is from the shutdown path, not this service call.
+    for path in (NAV_EXPORT, SURFEL_EXPORT):
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            print("FAIL: cannot clear service export before shutdown test: "
+                  f"{exc}", flush=True)
+            return 1
 
     # The full tile cache is intentionally released when nobody views it, but
     # its raw keyframe evidence must remain recoverable. Disconnect, give the
@@ -551,6 +660,7 @@ def main():
     n_before = len(node.snapshots)
     n_surface_before = len(node.surface_snapshots)
     n_navigation_before = len(node.navigation_snapshots)
+    n_surfel_before = len(node.navigation_surfel_snapshots)
     node.traj_pub.publish(make_traj((MAP_KF[0], MAP_KF[1],
                                      MAP_KF[2] + Z_CORRECTION)))
 
@@ -595,6 +705,19 @@ def main():
 
     if not spin_until(node, navigation_z_moved, 10.0):
         print("FAIL: navigation surface did not follow graph z correction",
+              flush=True)
+        return 1
+    def surfel_z_moved():
+        node.broadcast_odom()
+        for snap in node.navigation_surfel_snapshots[n_surfel_before:]:
+            if any(close(p["x"], NAV_SURVEY_XYZ[0], 0.15) and
+                   close(p["y"], NAV_SURVEY_XYZ[1], 0.15) and
+                   close(p["z"], Z_CORRECTION, 0.25) for p in snap):
+                return True
+        return False
+
+    if not spin_until(node, surfel_z_moved, 10.0):
+        print("FAIL: strict surfels did not follow graph z correction",
               flush=True)
         return 1
     print("[3] z-only correction re-rendered every product OK", flush=True)
