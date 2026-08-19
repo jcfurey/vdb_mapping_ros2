@@ -52,6 +52,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <Eigen/Geometry>
@@ -197,6 +198,16 @@ public:
     // optimized poses alongside the occupancy map. Empty disables.
     declare_parameter<std::string>("survey_topic", "");
     declare_parameter<double>("survey_resolution", 0.05);
+    // Keep representation resolution independent from correspondence
+    // tolerance. A centimetre output must not require graph-corrected returns
+    // from separate keyframes to quantize into the identical centimetre cell.
+    declare_parameter<double>("survey_support_resolution", 0.05);
+    // Operator-facing graph survey: publish a second view containing only
+    // voxels supported by this many distinct keyframes. Each keyframe's
+    // inter-ping aggregate is voxel-reduced before global accumulation, so
+    // support cannot be inflated by adjacent bins or repeated pings within
+    // one keyframe interval.
+    declare_parameter<int>("survey_min_support", 2);
     // publish only survey points whose occupancy voxel is occupied — the
     // clearing evidence then scrubs transients out of the survey product too
     declare_parameter<bool>("survey_occupancy_mask", true);
@@ -283,6 +294,8 @@ public:
     get_parameter("pose_epsilon_z", m_pose_eps_z);
     get_parameter("two_dim_projection_threshold", m_two_dim_projection_threshold);
     get_parameter("survey_resolution", m_survey_resolution);
+    get_parameter("survey_support_resolution", m_survey_support_resolution);
+    get_parameter("survey_min_support", m_survey_min_support);
     get_parameter("survey_occupancy_mask", m_survey_occupancy_mask);
     get_parameter("tile_resolution", m_tile_resolution);
     get_parameter("surface_resolution", m_surface_resolution);
@@ -321,6 +334,10 @@ public:
       }
     }
     m_tile_resolution = std::max(1e-3, m_tile_resolution);
+    m_survey_resolution = std::max(1e-3, m_survey_resolution);
+    m_survey_support_resolution =
+      std::max(m_survey_resolution, m_survey_support_resolution);
+    m_survey_min_support = std::max(1, m_survey_min_support);
     m_surface_resolution = std::max(1e-3, m_surface_resolution);
     m_surface_min_observations = std::max(1, m_surface_min_observations);
     // Zero is the quality-first mode: sample every elevation ribbon densely
@@ -442,6 +459,8 @@ public:
         });
       m_survey_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/survey_pointcloud", map_qos);
+      m_supported_survey_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "~/supported_survey_pointcloud", map_qos);
     }
 
     std::string tile_topic, reconstruction_topic;
@@ -1139,6 +1158,7 @@ private:
     m_reconstruction_buffer.clear();
     m_keyframes.clear();
     m_vox.clear();
+    m_survey_support.clear();
     releaseTileAccumulator();
     m_surface_accumulator->clear();
     m_map->resetMap();
@@ -1467,8 +1487,15 @@ private:
     }
     SurveyCloudT in_map;
     pcl::transformPointCloud(*e.survey, in_map, kf.pose.cast<float>());
+    // Count a support cell at most once per keyframe. This preserves the
+    // meaning of support when the fine survey contains many adjacent range
+    // bins or several buffered pings from the same keyframe interval.
+    std::unordered_set<uint64_t> support_this_keyframe;
+    support_this_keyframe.reserve(in_map.size());
     for (const auto& p : in_map.points)
     {
+      support_this_keyframe.insert(
+        voxelKey(p.x, p.y, p.z, m_survey_support_resolution));
       VoxAcc& a = m_vox[voxelKey(p.x, p.y, p.z, m_survey_resolution)];
       a.x += p.x;
       a.y += p.y;
@@ -1501,6 +1528,10 @@ private:
       }
       ++a.n;
     }
+    for (const uint64_t key : support_this_keyframe)
+    {
+      ++m_survey_support[key];
+    }
   }
 
   // Walk the accumulated survey voxels, applying the occupancy mask, and hand
@@ -1522,6 +1553,11 @@ private:
       const float cx = static_cast<float>(a.x / a.n);
       const float cy = static_cast<float>(a.y / a.n);
       const float cz = static_cast<float>(a.z / a.n);
+      const auto support_it = m_survey_support.find(
+        voxelKey(cx, cy, cz, m_survey_support_resolution));
+      const int support = support_it == m_survey_support.end()
+        ? 0
+        : support_it->second;
       if (m_survey_occupancy_mask)
       {
         const openvdb::Coord c =
@@ -1545,7 +1581,7 @@ private:
         static_cast<float>(a.i / a.n),
         static_cast<float>(a.r / a.n),
         a.nci > 0 ? static_cast<float>(a.ci / a.nci) : -1.0f,
-        static_cast<float>(a.n),
+        static_cast<float>(support),
         0.0f,
         texture,
         static_cast<float>(std::max(0.0, texture_variance)),
@@ -1811,6 +1847,7 @@ private:
     if (m_survey_stale)
     {
       m_vox.clear();
+      m_survey_support.clear();
       m_survey_upto  = 0;
       m_survey_stale = false;
     }
@@ -2217,7 +2254,11 @@ private:
     const double now = get_clock()->now().seconds();
     const bool tile_requested = hasSubscribers(m_tile_pub);
     const bool surface_requested = hasSubscribers(m_surface_pub);
-    const bool survey_requested = hasSubscribers(m_survey_pub);
+    const bool full_survey_requested = hasSubscribers(m_survey_pub);
+    const bool supported_survey_requested =
+      hasSubscribers(m_supported_survey_pub);
+    const bool survey_requested =
+      full_survey_requested || supported_survey_requested;
     const bool cloud_requested = hasSubscribers(m_cloud_pub);
     const bool consumer_started =
       (tile_requested && !m_tile_requested_previous) ||
@@ -2377,12 +2418,6 @@ private:
       // always reflects the current optimized poses.
       syncSurveyAccumulator();
 
-      sensor_msgs::msg::PointCloud2 survey_msg;
-      survey_msg.header.stamp    = stamp;
-      survey_msg.header.frame_id = m_map_frame;
-      survey_msg.height          = 1;
-      survey_msg.is_bigendian    = false;
-      survey_msg.is_dense        = true;
       static const char* names[kSurveyOutputFields] = {
         "x",
         "y",
@@ -2397,30 +2432,75 @@ private:
         "elevation_lo_offset",
         "elevation_hi_offset",
         "elevation_resolved_fraction"};
-      for (std::size_t f = 0; f < kSurveyOutputFields; ++f)
+      const auto initialize_survey_message = [&](
+        sensor_msgs::msg::PointCloud2& msg)
       {
-        sensor_msgs::msg::PointField pf;
-        pf.name     = names[f];
-        pf.offset   = static_cast<uint32_t>(f * 4);
-        pf.datatype = sensor_msgs::msg::PointField::FLOAT32;
-        pf.count    = 1;
-        survey_msg.fields.push_back(pf);
+        msg.header.stamp    = stamp;
+        msg.header.frame_id = m_map_frame;
+        msg.height          = 1;
+        msg.is_bigendian    = false;
+        msg.is_dense        = true;
+        for (std::size_t f = 0; f < kSurveyOutputFields; ++f)
+        {
+          sensor_msgs::msg::PointField pf;
+          pf.name     = names[f];
+          pf.offset   = static_cast<uint32_t>(f * 4);
+          pf.datatype = sensor_msgs::msg::PointField::FLOAT32;
+          pf.count    = 1;
+          msg.fields.push_back(pf);
+        }
+        msg.point_step =
+          static_cast<uint32_t>(kSurveyOutputFields * sizeof(float));
+        msg.data.reserve(m_vox.size() * msg.point_step);
+      };
+      sensor_msgs::msg::PointCloud2 survey_msg;
+      sensor_msgs::msg::PointCloud2 supported_survey_msg;
+      if (full_survey_requested)
+      {
+        initialize_survey_message(survey_msg);
       }
-      survey_msg.point_step =
-        static_cast<uint32_t>(kSurveyOutputFields * sizeof(float));
-      survey_msg.data.reserve(m_vox.size() * survey_msg.point_step);
+      if (supported_survey_requested)
+      {
+        initialize_survey_message(supported_survey_msg);
+      }
 
-      forEachSurveyRow([&survey_msg](const SurveyRow& row) {
+      const auto append_row = [](sensor_msgs::msg::PointCloud2& msg,
+                                 const SurveyRow& row)
+      {
         const auto* bytes =
           reinterpret_cast<const uint8_t*>(row.data());
-        survey_msg.data.insert(
-          survey_msg.data.end(), bytes,
+        msg.data.insert(
+          msg.data.end(), bytes,
           bytes + kSurveyOutputFields * sizeof(float));
+      };
+      forEachSurveyRow([&](const SurveyRow& row) {
+        if (full_survey_requested)
+        {
+          append_row(survey_msg, row);
+        }
+        if (supported_survey_requested &&
+            row[6] >= static_cast<float>(m_survey_min_support))
+        {
+          append_row(supported_survey_msg, row);
+        }
       });
-      survey_msg.width    = static_cast<uint32_t>(survey_msg.data.size() /
-                                                  survey_msg.point_step);
-      survey_msg.row_step = survey_msg.point_step * survey_msg.width;
-      m_survey_pub->publish(survey_msg);
+      const auto finish_and_publish = [](
+        const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& pub,
+        sensor_msgs::msg::PointCloud2& msg)
+      {
+        msg.width = static_cast<uint32_t>(
+          msg.data.size() / msg.point_step);
+        msg.row_step = msg.point_step * msg.width;
+        pub->publish(msg);
+      };
+      if (full_survey_requested)
+      {
+        finish_and_publish(m_survey_pub, survey_msg);
+      }
+      if (supported_survey_requested)
+      {
+        finish_and_publish(m_supported_survey_pub, supported_survey_msg);
+      }
     }
 
     publishReconstructionProducts(
@@ -2452,6 +2532,8 @@ private:
   int m_two_dim_projection_threshold = 3;
 
   double m_survey_resolution   = 0.05;
+  double m_survey_support_resolution = 0.05;
+  int m_survey_min_support = 2;
   bool m_survey_occupancy_mask = true;
   std::string m_odom_frame     = "odom";
   double m_last_assoc_stamp    = 0.0;
@@ -2506,6 +2588,7 @@ private:
   // is how many keyframes are already folded in; m_survey_stale forces a
   // rebuild after the graph moves.
   std::unordered_map<uint64_t, VoxAcc> m_vox;
+  std::unordered_map<uint64_t, int> m_survey_support;
   std::unordered_map<uint64_t, TileVoxAcc> m_tile_vox;
   std::unique_ptr<MultiViewSurfaceAccumulator> m_surface_accumulator;
   size_t m_survey_upto = 0;
@@ -2536,6 +2619,8 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_cloud_pub;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr m_grid_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_survey_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
+    m_supported_survey_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_tile_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_surface_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_navigation_pub;

@@ -204,6 +204,7 @@ class Harness(Node):
         # the assembler's trajectory subscription is transient_local
         self.traj_pub = self.create_publisher(PointCloud2, "/test/traj", latched)
         self.snapshots = []
+        self.supported_survey_snapshots = []
         self.tile_snapshots = []
         self.surface_snapshots = []
         self.navigation_snapshots = []
@@ -213,6 +214,10 @@ class Harness(Node):
         self.create_subscription(
             PointCloud2, "/assembler/survey_pointcloud",
             lambda m: self.snapshots.append(parse_survey(m)), latched)
+        self.create_subscription(
+            PointCloud2, "/assembler/supported_survey_pointcloud",
+            lambda m: self.supported_survey_snapshots.append(
+                parse_survey(m)), latched)
         self.tile_sub = self.create_subscription(
             PointCloud2, "/assembler/tile_pointcloud",
             lambda m: self.tile_snapshots.append(parse_survey(m)), latched)
@@ -342,7 +347,7 @@ def main():
 
     def keep_alive():
         node.broadcast_odom()
-        return bool(node.snapshots)
+        return bool(node.snapshots) and bool(node.supported_survey_snapshots)
 
     if not spin_until(node, keep_alive, 30.0):
         print("FAIL: no survey snapshot within 30 s", flush=True)
@@ -373,6 +378,11 @@ def main():
         return 1
     if r.get("support", 0.0) < 0.5:
         print(f"FAIL: support = {r.get('support')}", flush=True)
+        return 1
+    supported_rows = node.supported_survey_snapshots[-1]
+    if len(supported_rows) != 1 or not close(
+            supported_rows[0].get("x", math.nan), EXPECT_XYZ[0], 0.03):
+        print(f"FAIL: supported survey mismatch: {supported_rows}", flush=True)
         return 1
     print("[1] survey metadata + odom-delta anchoring OK", flush=True)
 

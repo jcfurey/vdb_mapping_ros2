@@ -35,6 +35,10 @@ def generate_test_description():
             'map_frame': 'map',
             # one synthetic point per cloud: mask/threshold friction off
             'survey_occupancy_mask': False,
+            # Exercise fine representation with independent support tolerance.
+            'survey_resolution': 0.01,
+            'survey_support_resolution': 0.05,
+            'survey_min_support': 1,
             'tile_resolution': 0.1,
             'surface_resolution': 0.2,
             'surface_min_observations': 3,
