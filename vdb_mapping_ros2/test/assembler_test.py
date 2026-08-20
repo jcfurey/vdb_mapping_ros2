@@ -52,6 +52,20 @@ NAV_SURVEY_XYZ = (7.0, 3.0, 0.0)
 # neighbors. Dense navigation must keep it with normal_valid=0; strict surfels
 # must omit it. The same +1 m odom delta places it at map (9,-3,0).
 ISOLATED_SURVEY_XYZ = (9.0, -3.0, 0.0)
+EXPECTED_NAVIGATION_POINTS = 26
+EXPECTED_SURFELS = 25
+
+NAVIGATION_FIELDS = [
+    "x", "y", "z", "intensity", "range", "incidence", "support",
+    "confidence", "pose_sigma", "texture", "texture_variance",
+    "elevation_lo_offset", "elevation_hi_offset",
+    "elevation_resolved_fraction", "normal_x", "normal_y", "normal_z",
+    "curvature", "residual", "normal_valid"]
+SURFEL_FIELDS = [
+    "x", "y", "z", "intensity", "support", "view_span_deg",
+    "confidence", "normal_x", "normal_y", "normal_z", "curvature",
+    "residual", "range_sigma", "echo_width", "echo_prominence",
+    "peak_prominence"]
 
 SURVEY_FIELDS = [
     "x", "y", "z", "intensity", "range", "incidence", "survey_fallback",
@@ -225,8 +239,10 @@ class Harness(Node):
         self.tile_snapshots = []
         self.surface_snapshots = []
         self.navigation_snapshots = []
+        self.navigation_fields = []
         self.navigation_stamps = []
         self.navigation_surfel_snapshots = []
+        self.navigation_surfel_fields = []
         self.navigation_surfel_stamps = []
         self.occupancy_snapshots = []
         self.latched_qos = latched
@@ -272,11 +288,14 @@ class Harness(Node):
 
     def capture_navigation(self, msg):
         self.navigation_snapshots.append(parse_survey(msg))
+        self.navigation_fields.append([field.name for field in msg.fields])
         self.navigation_stamps.append(
             (msg.header.stamp.sec, msg.header.stamp.nanosec))
 
     def capture_navigation_surfels(self, msg):
         self.navigation_surfel_snapshots.append(parse_survey(msg))
+        self.navigation_surfel_fields.append(
+            [field.name for field in msg.fields])
         self.navigation_surfel_stamps.append(
             (msg.header.stamp.sec, msg.header.stamp.nanosec))
 
@@ -457,6 +476,19 @@ def main():
               f"navigation returns: {contradicted_navigation_target}",
               flush=True)
         return 1
+    if node.navigation_fields[-1] != NAVIGATION_FIELDS or \
+            len(node.navigation_snapshots[-1]) != EXPECTED_NAVIGATION_POINTS:
+        print("FAIL: exact 1 cm navigation cloud schema/count changed: "
+              f"fields={node.navigation_fields[-1]} "
+              f"points={len(node.navigation_snapshots[-1])}", flush=True)
+        return 1
+    if node.navigation_surfel_fields[-1] != SURFEL_FIELDS or \
+            len(node.navigation_surfel_snapshots[-1]) != EXPECTED_SURFELS:
+        print("FAIL: exact surfel schema/count changed: "
+              f"fields={node.navigation_surfel_fields[-1]} "
+              f"points={len(node.navigation_surfel_snapshots[-1])}",
+              flush=True)
+        return 1
     isolated_navigation_target = next(
         (p for p in node.navigation_snapshots[-1]
          if close(p["x"], ISOLATED_SURVEY_XYZ[0], 0.03)
@@ -558,13 +590,7 @@ def main():
     except (OSError, ValueError) as exc:
         print(f"FAIL: cannot read navigation export: {exc}", flush=True)
         return 1
-    expected_fields = [
-        "x", "y", "z", "intensity", "range", "incidence", "support",
-        "confidence", "pose_sigma", "texture", "texture_variance",
-        "elevation_lo_offset", "elevation_hi_offset",
-        "elevation_resolved_fraction", "normal_x", "normal_y", "normal_z",
-        "curvature", "residual", "normal_valid"]
-    if fields != expected_fields:
+    if fields != NAVIGATION_FIELDS:
         print(f"FAIL: navigation PCD schema is wrong: {fields}", flush=True)
         return 1
     if any(close(p["x"], 6.0, 0.25) and close(p["y"], 0.0, 0.25)
@@ -602,12 +628,7 @@ def main():
     except (OSError, ValueError) as exc:
         print(f"FAIL: cannot read navigation surfel export: {exc}", flush=True)
         return 1
-    expected_surfel_fields = [
-        "x", "y", "z", "intensity", "support", "view_span_deg",
-        "confidence", "normal_x", "normal_y", "normal_z", "curvature",
-        "residual", "range_sigma", "echo_width", "echo_prominence",
-        "peak_prominence"]
-    if surfel_fields != expected_surfel_fields:
+    if surfel_fields != SURFEL_FIELDS:
         print(f"FAIL: surfel PCD schema is wrong: {surfel_fields}", flush=True)
         return 1
     if any(close(p["x"], ISOLATED_SURVEY_XYZ[0], 0.03)

@@ -38,7 +38,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -47,10 +49,13 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -73,6 +78,7 @@
 #include <pcl/io/impl/pcd_io.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -494,6 +500,17 @@ public:
       get_clock(), tf2::durationFromSec(m_tf_buffer_duration));
     m_tf_listener = std::make_shared<tf2_ros::TransformListener>(*m_tf_buffer);
 
+    // Ingestion and rendering are each internally serialized, but occupy
+    // different executor lanes. The renderer takes a brief keyframe metadata
+    // snapshot under m_ingest_mutex and then releases it before any disk read,
+    // global rebuild, message construction, or normal fitting.
+    m_ingest_callback_group =
+      create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    m_render_callback_group =
+      create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions ingest_options;
+    ingest_options.callback_group = m_ingest_callback_group;
+
     std::string hits_topic, clear_topic, traj_topic;
     get_parameter("hits_topic", hits_topic);
     get_parameter("clear_topic", clear_topic);
@@ -515,18 +532,23 @@ public:
     }
     m_hits_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
       hits_topic, qos, [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+        std::lock_guard<std::mutex> lock(m_ingest_mutex);
         bufferCloud(*msg, m_hits_buffer, true);
-      });
+      }, ingest_options);
     m_clear_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
       clear_topic, qos, [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+        std::lock_guard<std::mutex> lock(m_ingest_mutex);
         bufferCloud(*msg, m_clear_buffer, false);
-    });
+      }, ingest_options);
     // trajectory is latched by the SLAM node
     m_traj_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
       traj_topic,
       rclcpp::QoS(rclcpp::KeepLast(static_cast<std::size_t>(m_input_queue_depth)))
         .reliable().transient_local(),
-      [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { onTrajectory(*msg); });
+      [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+        std::lock_guard<std::mutex> lock(m_ingest_mutex);
+        onTrajectory(*msg);
+      }, ingest_options);
 
     // These are complete map snapshots, not observations. Latch the latest
     // render so Nav2/RViz consumers that start later receive current state.
@@ -542,8 +564,9 @@ public:
     {
       m_survey_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
         survey_topic, qos, [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+          std::lock_guard<std::mutex> lock(m_ingest_mutex);
           bufferSurvey(*msg);
-        });
+        }, ingest_options);
       m_survey_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/survey_pointcloud", map_qos);
       m_supported_survey_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -561,8 +584,9 @@ public:
     {
       m_tile_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
         tile_topic, qos, [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+          std::lock_guard<std::mutex> lock(m_ingest_mutex);
           bufferTile(*msg);
-        });
+        }, ingest_options);
       m_tile_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/tile_pointcloud", map_qos);
     }
@@ -571,8 +595,9 @@ public:
       m_reconstruction_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
         reconstruction_topic, qos,
         [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+          std::lock_guard<std::mutex> lock(m_ingest_mutex);
           bufferReconstructionReturns(*msg);
-        });
+        }, ingest_options);
       m_surface_pub = create_publisher<sensor_msgs::msg::PointCloud2>(
         "~/surface_pointcloud", map_qos);
     }
@@ -587,30 +612,38 @@ public:
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
              std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
         res->success = exportSurvey(res->message);
-      });
+      }, rclcpp::ServicesQoS(), m_render_callback_group);
     m_navigation_export_srv = create_service<std_srvs::srv::Trigger>(
       "~/export_navigation_surface",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
              std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
         res->success = exportNavigationSurface(res->message);
-      });
+      }, rclcpp::ServicesQoS(), m_render_callback_group);
     m_navigation_surfel_export_srv = create_service<std_srvs::srv::Trigger>(
       "~/export_navigation_surfels",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
              std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
         res->success = exportNavigationSurfels(res->message);
-      });
+      }, rclcpp::ServicesQoS(), m_render_callback_group);
 
     m_render_timer = create_timer(std::chrono::milliseconds(500),
-                                  [this] { renderIfNeeded(); });
+                                  [this] { renderIfNeeded(); },
+                                  m_render_callback_group);
+    m_navigation_fit_thread =
+      std::thread([this] { navigationFitWorker(); });
 
     RCLCPP_INFO(get_logger(),
                 "Map assembler up: hits=%s clear=%s traj=%s tile=%s "
                 "reconstruction=%s res=%.2f",
                 hits_topic.c_str(), clear_topic.c_str(), traj_topic.c_str(),
                 tile_topic.empty() ? "disabled" : tile_topic.c_str(),
-                reconstruction_topic.empty() ? "disabled" :
+                  reconstruction_topic.empty() ? "disabled" :
                   reconstruction_topic.c_str(), m_resolution);
+  }
+
+  ~VDBMapAssembler() override
+  {
+    stopNavigationFitWorker();
   }
 
 private:
@@ -620,6 +653,59 @@ private:
     Union,
     ConfirmedSurface,
   };
+
+  // Snapshot subscriber demand once at the beginning of a render. Complete
+  // products are expensive and transient-local publishers exist even when no
+  // consumer is connected, so publisher existence is not a work request.
+  struct RenderDemand
+  {
+    bool tile = false;
+    bool surface = false;
+    bool full_survey = false;
+    bool supported_survey = false;
+    bool navigation = false;
+    bool navigation_surfels = false;
+    bool vdb_cloud = false;
+
+    bool surveyProducts() const
+    {
+      return full_survey || supported_survey || navigation ||
+        navigation_surfels;
+    }
+
+    bool navigationProducts() const
+    {
+      return navigation || navigation_surfels;
+    }
+  };
+
+  struct ProductPublishMetrics
+  {
+    double tile_ms = 0.0;
+    double surface_ms = 0.0;
+    double navigation_ms = 0.0;
+    double surfel_ms = 0.0;
+  };
+
+  using SteadyClock = std::chrono::steady_clock;
+
+  struct NavigationFitJob
+  {
+    std::uint64_t generation = 0;
+    std::uint64_t epoch = 0;
+    rclcpp::Time stamp;
+    bool publish_navigation = false;
+    bool publish_surfels = false;
+    std::size_t free_space_rejected = 0;
+    std::vector<NavigationRow> navigation;
+    SteadyClock::time_point queued_at;
+  };
+
+  static double elapsedWallMs(const SteadyClock::time_point& start)
+  {
+    return std::chrono::duration<double, std::milli>(
+      SteadyClock::now() - start).count();
+  }
 
   struct BufferedCloud
   {
@@ -649,9 +735,13 @@ private:
     ReconstructionCloudPtrT reconstruction;
     Eigen::Vector3d hits_origin  = Eigen::Vector3d::Zero();
     Eigen::Vector3d clear_origin = Eigen::Vector3d::Zero();
-    bool integrated = false;
     bool has_evidence = false;
     bool spilled = false;
+    // Persist the namespace with the keyframe. A render snapshot may outlive
+    // an input-time rewind, which starts a new spill segment on the ingestion
+    // thread; looking old evidence up through the mutable current directory
+    // would otherwise splice or lose a generation.
+    std::string spill_dir;
     size_t n_hits = 0;
     size_t n_clear = 0;
     size_t n_survey = 0;
@@ -738,12 +828,18 @@ private:
                 m_spill_dir.c_str());
   }
 
-  std::string spillPath(const size_t idx, const char* kind) const
+  static std::string spillPath(
+    const std::string& directory, const size_t idx, const char* kind)
   {
     std::ostringstream p;
-    p << m_spill_dir << "/kf_" << std::setw(6) << std::setfill('0') << idx
+    p << directory << "/kf_" << std::setw(6) << std::setfill('0') << idx
       << '_' << kind << ".pcd";
     return p.str();
+  }
+
+  std::string spillPath(const size_t idx, const char* kind) const
+  {
+    return spillPath(m_spill_dir, idx, kind);
   }
 
   template <typename CloudPtr>
@@ -856,6 +952,7 @@ private:
                            idx, m_spill_failures);
       return;
     }
+    kf.spill_dir = m_spill_dir;
     kf.hits.reset();
     kf.clear.reset();
     kf.survey.reset();
@@ -897,25 +994,27 @@ private:
     {
       if (kf.n_hits > 0)
       {
-        e.hits = readSpill<CloudT>(spillPath(idx, "hits"));
+        e.hits = readSpill<CloudT>(spillPath(kf.spill_dir, idx, "hits"));
       }
       if (kf.n_clear > 0)
       {
-        e.clear = readSpill<CloudT>(spillPath(idx, "clear"));
+        e.clear = readSpill<CloudT>(spillPath(kf.spill_dir, idx, "clear"));
       }
     }
     if (want_survey && kf.n_survey > 0)
     {
-      e.survey = readSpill<SurveyCloudT>(spillPath(idx, "survey"));
+      e.survey = readSpill<SurveyCloudT>(
+        spillPath(kf.spill_dir, idx, "survey"));
     }
     if (want_reconstruction && kf.n_reconstruction > 0)
     {
       e.reconstruction = readSpill<ReconstructionCloudT>(
-        spillPath(idx, "reconstruction"));
+        spillPath(kf.spill_dir, idx, "reconstruction"));
     }
     if (want_tile && kf.n_tile > 0)
     {
-      e.tile = readSpill<ReconstructionCloudT>(spillPath(idx, "tile"));
+      e.tile = readSpill<ReconstructionCloudT>(
+        spillPath(kf.spill_dir, idx, "tile"));
     }
     return e;
   }
@@ -1246,32 +1345,30 @@ private:
 
   void resetReplaySession()
   {
+    {
+      std::lock_guard<std::mutex> lock(m_navigation_fit_mutex);
+      ++m_navigation_fit_epoch;
+      m_pending_navigation_fit.reset();
+    }
+    ++m_replay_epoch;
     m_hits_buffer.clear();
     m_clear_buffer.clear();
     m_survey_buffer.clear();
     m_tile_buffer.clear();
     m_reconstruction_buffer.clear();
     m_keyframes.clear();
-    m_vox.clear();
-    m_survey_support.clear();
-    releaseTileAccumulator();
-    m_surface_accumulator->clear();
-    m_map->resetMap();
 
     m_keyframes_without_evidence = 0;
-    m_full_renders = 0;
     m_dirty = false;
     m_have_new = false;
-    m_last_product_render = 0.0;
+    // Render-owned VDB/derived state may currently be rebuilding on another
+    // executor lane. Do not mutate it here. The active render carries the old
+    // epoch and will refuse to publish after the rewind; the first render of
+    // the new segment performs a complete reset from its keyframe snapshot.
+    m_force_full_render = true;
     m_last_assoc_stamp = 0.0;
     m_last_tile_assoc_stamp = 0.0;
     m_last_reconstruction_assoc_stamp = 0.0;
-    m_survey_upto = 0;
-    m_survey_stale = false;
-    m_surface_upto = 0;
-    m_surface_stale = false;
-    m_tile_upto = 0;
-    m_tile_stale = true;
     m_last_hits_stamp = 0.0;
     m_last_clear_stamp = 0.0;
     m_last_survey_stamp = 0.0;
@@ -1286,6 +1383,12 @@ private:
     ++m_replay_segment;
     m_spill_dir.clear();
     setUpSpill();
+  }
+
+  bool replayEpochCurrent(const std::uint64_t epoch)
+  {
+    std::lock_guard<std::mutex> lock(m_ingest_mutex);
+    return epoch == m_replay_epoch;
   }
 
   void onTrajectory(const sensor_msgs::msg::PointCloud2& msg)
@@ -1338,13 +1441,9 @@ private:
         {
           kf.pose = pose;
           m_dirty = true;
-          // This keyframe's points were folded into the survey accumulator at
-          // the OLD pose and there is no way to subtract one keyframe's
-          // contribution back out of a voxel mean, so the accumulator has to
-          // be rebuilt from scratch on the next render.
-          m_survey_stale = true;
-          m_surface_stale = true;
-          m_tile_stale = true;
+          // Render-owned accumulators are invalidated after the renderer has
+          // copied this complete pose generation. Do not touch them from the
+          // concurrent ingestion callback.
         }
         continue;
       }
@@ -1546,7 +1645,7 @@ private:
     return (q(x) << 42) | (q(y) << 21) | q(z);
   }
 
-  void integrateKeyframe(KeyframeEvidence& kf, const size_t idx)
+  void integrateKeyframe(const KeyframeEvidence& kf, const size_t idx)
   {
     // Scoped: the loaded clouds are released when this returns, so a full
     // re-render holds one keyframe at a time rather than all of them.
@@ -1569,7 +1668,6 @@ private:
       pcl::transformPointCloud(*e.clear, *in_map, kf.pose.cast<float>());
       m_map->insertPointCloud(in_map, origin, "clear");
     }
-    kf.integrated = true;
   }
 
   void accumulateSurvey(const KeyframeEvidence& kf, const size_t idx)
@@ -1712,15 +1810,11 @@ private:
     // otherwise leave the occupancy mask and the accumulator at the old
     // poses, with nothing logged. Force the render path, then fold anything
     // the accumulator has not seen.
-    if (m_dirty || m_have_new)
-    {
-      m_last_product_render = -std::numeric_limits<double>::infinity();
-      // The service only needs the latest occupancy state for masking; avoid
-      // serializing every live product as a side effect. This is also safe
-      // during SIGINT shutdown, when the ROS context may already be invalid
-      // even though file I/O and the node object are still usable.
-      renderIfNeeded(/*publish_outputs=*/false);
-    }
+    m_last_product_render = -std::numeric_limits<double>::infinity();
+    // renderIfNeeded snapshots the ingestion state under its mutex. Calling
+    // it unconditionally avoids racing an unlocked dirty-flag probe with the
+    // ingestion executor lane; it returns immediately when already current.
+    renderIfNeeded(/*publish_outputs=*/false);
     syncSurveyAccumulator();
 
     pcl::PointCloud<SurveyExportPoint> out;
@@ -1928,6 +2022,106 @@ private:
     return surfels;
   }
 
+  void queueNavigationFit(
+    const rclcpp::Time& stamp, const RenderDemand& demand,
+    const std::size_t free_space_rejected,
+    std::vector<NavigationRow>&& navigation)
+  {
+    NavigationFitJob job;
+    job.generation = ++m_navigation_fit_generation;
+    job.stamp = stamp;
+    job.publish_navigation = demand.navigation;
+    job.publish_surfels = demand.navigation_surfels;
+    job.free_space_rejected = free_space_rejected;
+    job.navigation = std::move(navigation);
+    job.queued_at = SteadyClock::now();
+    {
+      std::lock_guard<std::mutex> lock(m_navigation_fit_mutex);
+      if (m_navigation_fit_stop)
+      {
+        return;
+      }
+      job.epoch = m_navigation_fit_epoch;
+      if (m_pending_navigation_fit.has_value())
+      {
+        ++m_navigation_fits_coalesced;
+      }
+      // At most one future fit is retained. If the renderer advances several
+      // generations while an exact fit is running, only the newest complete
+      // navigation snapshot is useful after the active one finishes.
+      m_pending_navigation_fit = std::move(job);
+    }
+    m_navigation_fit_cv.notify_one();
+  }
+
+  void navigationFitWorker()
+  {
+    while (true)
+    {
+      NavigationFitJob job;
+      {
+        std::unique_lock<std::mutex> lock(m_navigation_fit_mutex);
+        m_navigation_fit_cv.wait(lock, [this] {
+          return m_navigation_fit_stop || m_pending_navigation_fit.has_value();
+        });
+        if (m_navigation_fit_stop)
+        {
+          return;
+        }
+        job = std::move(*m_pending_navigation_fit);
+        m_pending_navigation_fit.reset();
+      }
+
+      const double queue_ms = elapsedWallMs(job.queued_at);
+      const auto fit_started = SteadyClock::now();
+      std::vector<SurfelRow> surfels =
+        buildNavigationSurfels(job.navigation);
+      const double fit_ms = elapsedWallMs(fit_started);
+
+      std::uint64_t coalesced = 0;
+      bool newer_pending = false;
+      bool stale = false;
+      {
+        std::lock_guard<std::mutex> lock(m_navigation_fit_mutex);
+        coalesced = m_navigation_fits_coalesced;
+        newer_pending = m_pending_navigation_fit.has_value();
+        stale = m_navigation_fit_stop || job.epoch != m_navigation_fit_epoch;
+      }
+      ProductPublishMetrics publish_metrics;
+      if (!stale)
+      {
+        publish_metrics = publishNavigationProducts(
+          job.stamp, job.publish_navigation, job.publish_surfels,
+          job.navigation, surfels);
+      }
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 30000,
+        "navigation fit: generation=%llu queue=%.1f ms fit=%.1f ms "
+        "publish=%.1f/%.1f ms rows=%zu surfels=%zu rejected_free=%zu "
+        "coalesced=%llu newer_pending=%d stale=%d",
+        static_cast<unsigned long long>(job.generation), queue_ms, fit_ms,
+        publish_metrics.navigation_ms, publish_metrics.surfel_ms,
+        job.navigation.size(), surfels.size(), job.free_space_rejected,
+        static_cast<unsigned long long>(coalesced),
+        static_cast<int>(newer_pending), static_cast<int>(stale));
+    }
+  }
+
+  void stopNavigationFitWorker()
+  {
+    {
+      std::lock_guard<std::mutex> lock(m_navigation_fit_mutex);
+      if (!m_navigation_fit_thread.joinable())
+      {
+        return;
+      }
+      m_navigation_fit_stop = true;
+      m_pending_navigation_fit.reset();
+    }
+    m_navigation_fit_cv.notify_one();
+    m_navigation_fit_thread.join();
+  }
+
   void collectNavigationProducts(
     std::vector<NavigationRow>& navigation,
     std::vector<SurfelRow>& surfels)
@@ -1935,11 +2129,8 @@ private:
     // Force pending occupancy evidence/graph corrections through first: the
     // clean subset includes both the graph-corrected survey and the explicit
     // free-space contradiction mask.
-    if (m_dirty || m_have_new)
-    {
-      m_last_product_render = -std::numeric_limits<double>::infinity();
-      renderIfNeeded(/*publish_outputs=*/false);
-    }
+    m_last_product_render = -std::numeric_limits<double>::infinity();
+    renderIfNeeded(/*publish_outputs=*/false);
     syncSurveyAccumulator();
     std::vector<SurveyRow> supported;
     supported.reserve(m_vox.size());
@@ -2101,11 +2292,11 @@ private:
       m_survey_upto  = 0;
       m_survey_stale = false;
     }
-    for (size_t i = m_survey_upto; i < m_keyframes.size(); ++i)
+    for (size_t i = m_survey_upto; i < m_render_keyframes.size(); ++i)
     {
-      accumulateSurvey(m_keyframes[i], i);
+      accumulateSurvey(m_render_keyframes[i], i);
     }
-    m_survey_upto = m_keyframes.size();
+    m_survey_upto = m_render_keyframes.size();
   }
 
   void accumulateTile(const KeyframeEvidence& kf, const size_t idx)
@@ -2160,11 +2351,11 @@ private:
       m_surface_upto = 0;
       m_surface_stale = false;
     }
-    for (size_t i = m_surface_upto; i < m_keyframes.size(); ++i)
+    for (size_t i = m_surface_upto; i < m_render_keyframes.size(); ++i)
     {
-      accumulateSurface(m_keyframes[i], i);
+      accumulateSurface(m_render_keyframes[i], i);
     }
-    m_surface_upto = m_keyframes.size();
+    m_surface_upto = m_render_keyframes.size();
   }
 
   void syncTileAccumulator()
@@ -2180,11 +2371,11 @@ private:
       m_tile_upto = 0;
       m_tile_stale = false;
     }
-    for (size_t i = m_tile_upto; i < m_keyframes.size(); ++i)
+    for (size_t i = m_tile_upto; i < m_render_keyframes.size(); ++i)
     {
-      accumulateTile(m_keyframes[i], i);
+      accumulateTile(m_render_keyframes[i], i);
     }
-    m_tile_upto = m_keyframes.size();
+    m_tile_upto = m_render_keyframes.size();
   }
 
   void releaseTileAccumulator()
@@ -2255,22 +2446,23 @@ private:
        publisher->get_intra_process_subscription_count()) > 0;
   }
 
-  void publishReconstructionProducts(
+  ProductPublishMetrics publishReconstructionProducts(
     const rclcpp::Time& stamp,
+    const RenderDemand& demand,
     const std::vector<ReconstructionRow>& reconstructed,
-    const std::vector<NavigationRow>& navigation,
-    const std::vector<SurfelRow>& surfels,
     const std::size_t confirmed_count,
     const std::size_t surface_free_space_rejected,
-    const std::size_t navigation_free_space_rejected)
+    const std::size_t survey_buffer_size,
+    const std::size_t tile_buffer_size,
+    const std::size_t reconstruction_buffer_size)
   {
-    if (!m_tile_pub && !m_surface_pub && !m_navigation_pub &&
-        !m_navigation_surfel_pub)
+    ProductPublishMetrics metrics;
+    if (!m_tile_pub && !m_surface_pub)
     {
-      return;
+      return metrics;
     }
-    const bool tile_requested = hasSubscribers(m_tile_pub);
-    if (tile_requested)
+    auto stage_started = SteadyClock::now();
+    if (demand.tile)
     {
       syncTileAccumulator();
 
@@ -2305,12 +2497,14 @@ private:
     {
       releaseTileAccumulator();
     }
+    metrics.tile_ms = elapsedWallMs(stage_started);
 
     // Product B: only ribbon intersections with independent angular support.
     constexpr std::array<const char*, 11> surface_names = {
       "x", "y", "z", "intensity", "support", "view_span_deg", "confidence",
       "range_sigma", "echo_width", "echo_prominence", "peak_prominence"};
-    if (hasSubscribers(m_surface_pub))
+    stage_started = SteadyClock::now();
+    if (demand.surface)
     {
       publishFloatRows(
         m_surface_pub, surface_names, reconstructed.size(),
@@ -2324,16 +2518,31 @@ private:
           }
         }, stamp);
     }
+    metrics.surface_ms = elapsedWallMs(stage_started);
 
-    // Product C: every supported, confidence/intensity-gated, free-space-safe
-    // survey return. Local planarity never controls whether measured evidence
-    // exists. Valid fits attach normals in place; invalid fits retain their
-    // exact graph-corrected coordinates and range/uncertainty metadata with
-    // normal_valid=0, zero normals, and negative curvature/residual sentinels.
-    // Publish every render so transient-local delivery gives late operators
-    // the current map. A zero stamp asks cross-frame consumers for the latest
-    // transform rather than binding a retained global snapshot to an expired
-    // TF sample.
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 30000,
+      "reconstruction products: tile %s (%zu voxels), "
+      "%zu/%zu confirmed ribbon voxels (%zu rejected by observed free "
+      "space), %zu survey + %zu tile + %zu reconstruction pings awaiting "
+      "keyframe association",
+      demand.tile ? "resident" : "on disk", m_tile_vox.size(),
+      confirmed_count, reconstructed.size(), surface_free_space_rejected,
+      survey_buffer_size, tile_buffer_size, reconstruction_buffer_size);
+    return metrics;
+  }
+
+  ProductPublishMetrics publishNavigationProducts(
+    const rclcpp::Time& stamp,
+    const bool publish_navigation,
+    const bool publish_surfels,
+    const std::vector<NavigationRow>& navigation,
+    const std::vector<SurfelRow>& surfels)
+  {
+    ProductPublishMetrics metrics;
+    // These are retained global snapshots. A zero stamp asks cross-frame
+    // consumers for the latest transform instead of binding the durable
+    // sample to an expired TF entry.
     const rclcpp::Time timeless_stamp(0, 0, stamp.get_clock_type());
     constexpr std::array<const char*, 20> navigation_names = {
       "x", "y", "z", "intensity", "range", "incidence", "support",
@@ -2341,7 +2550,8 @@ private:
       "elevation_lo_offset", "elevation_hi_offset",
       "elevation_resolved_fraction", "normal_x", "normal_y", "normal_z",
       "curvature", "residual", "normal_valid"};
-    if (m_navigation_pub)
+    auto stage_started = SteadyClock::now();
+    if (publish_navigation)
     {
       publishFloatRows(
         m_navigation_pub, navigation_names, navigation.size(),
@@ -2357,14 +2567,14 @@ private:
           }
         }, timeless_stamp);
     }
+    metrics.navigation_ms = elapsedWallMs(stage_started);
 
-    // Product D: strict, projected lidar-style surfels for registration
-    // consumers that require every point to have a trustworthy local normal.
     constexpr std::array<const char*, 16> surfel_names = {
       "x", "y", "z", "intensity", "support", "view_span_deg", "confidence",
       "normal_x", "normal_y", "normal_z", "curvature", "residual",
       "range_sigma", "echo_width", "echo_prominence", "peak_prominence"};
-    if (m_navigation_surfel_pub)
+    stage_started = SteadyClock::now();
+    if (publish_surfels)
     {
       publishFloatRows(
         m_navigation_surfel_pub, surfel_names, surfels.size(),
@@ -2380,20 +2590,8 @@ private:
           }
         }, timeless_stamp);
     }
-
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 30000,
-      "map products: tile %s (%zu voxels), %zu dense navigation returns / "
-      "%zu strict surfels (%zu rejected by observed free space), "
-      "%zu/%zu confirmed ribbon voxels (%zu rejected by observed free "
-      "space), %zu survey + %zu tile + %zu reconstruction pings awaiting "
-      "keyframe association",
-      tile_requested ? "resident" : "on disk", m_tile_vox.size(),
-      navigation.size(), surfels.size(),
-      navigation_free_space_rejected, confirmed_count, reconstructed.size(),
-      surface_free_space_rejected,
-      m_survey_buffer.size(), m_tile_buffer.size(),
-      m_reconstruction_buffer.size());
+    metrics.surfel_ms = elapsedWallMs(stage_started);
+    return metrics;
   }
 
   // Merge the quality-controlled multi-view surface into the graph-corrected
@@ -2534,26 +2732,32 @@ private:
 
   void renderIfNeeded(const bool publish_outputs = true)
   {
+    const auto render_started = SteadyClock::now();
     const double now = get_clock()->now().seconds();
-    const bool tile_requested = hasSubscribers(m_tile_pub);
-    const bool surface_requested = hasSubscribers(m_surface_pub);
-    const bool full_survey_requested = hasSubscribers(m_survey_pub);
-    const bool supported_survey_requested =
-      hasSubscribers(m_supported_survey_pub);
-    const bool survey_requested =
-      full_survey_requested || supported_survey_requested;
-    const bool cloud_requested = hasSubscribers(m_cloud_pub);
+    const RenderDemand demand{
+      hasSubscribers(m_tile_pub),
+      hasSubscribers(m_surface_pub),
+      hasSubscribers(m_survey_pub),
+      hasSubscribers(m_supported_survey_pub),
+      hasSubscribers(m_navigation_pub),
+      hasSubscribers(m_navigation_surfel_pub),
+      hasSubscribers(m_cloud_pub)};
     const bool consumer_started =
-      (tile_requested && !m_tile_requested_previous) ||
-      (surface_requested && !m_surface_requested_previous) ||
-      (survey_requested && !m_survey_requested_previous) ||
-      (cloud_requested && !m_cloud_requested_previous);
+      (demand.tile && !m_tile_requested_previous) ||
+      (demand.surface && !m_surface_requested_previous) ||
+      (demand.full_survey && !m_full_survey_requested_previous) ||
+      (demand.supported_survey &&
+       !m_supported_survey_requested_previous) ||
+      (demand.navigation && !m_navigation_requested_previous) ||
+      (demand.navigation_surfels &&
+       !m_navigation_surfel_requested_previous) ||
+      (demand.vdb_cloud && !m_cloud_requested_previous);
 
     // A durable full tile sample can itself hold more than 100 MB in DDS.
     // Once the inspector disconnects, replace it with an empty schema-bearing
     // sample and return the derived hash-table allocation. A later subscriber
     // is detected above and triggers an exact rebuild from the disk evidence.
-    if (!tile_requested)
+    if (!demand.tile)
     {
       if (m_tile_requested_previous)
       {
@@ -2561,68 +2765,144 @@ private:
       }
       releaseTileAccumulator();
     }
-    m_tile_requested_previous = tile_requested;
-    m_surface_requested_previous = surface_requested;
-    m_survey_requested_previous = survey_requested;
-    m_cloud_requested_previous = cloud_requested;
+    m_tile_requested_previous = demand.tile;
+    m_surface_requested_previous = demand.surface;
+    m_full_survey_requested_previous = demand.full_survey;
+    m_supported_survey_requested_previous = demand.supported_survey;
+    m_navigation_requested_previous = demand.navigation;
+    m_navigation_surfel_requested_previous = demand.navigation_surfels;
+    m_cloud_requested_previous = demand.vdb_cloud;
 
-    // Discovery normally completes before the first keyframe. Do not latch a
-    // synthetic empty snapshot merely because a viewer connected during that
-    // startup window; the first real keyframe will publish it normally.
-    bool changed = consumer_started && !m_keyframes.empty();
+    // Snapshot only compact keyframe metadata and immutable cloud handles.
+    // Disk reads, VDB integration, complete accumulator rebuilds, message
+    // construction, and publication all happen after releasing the ingestion
+    // lock, so source callbacks continue draining their DDS queues.
+    bool changed = false;
     bool evidence_rendered = false;
+    const char* render_kind = consumer_started ? "consumer" : "none";
+    std::uint64_t render_epoch = m_render_epoch;
+    std::size_t keyframes_without_evidence = 0;
+    std::size_t hits_buffer_size = 0;
+    std::size_t clear_buffer_size = 0;
+    std::size_t survey_buffer_size = 0;
+    std::size_t tile_buffer_size = 0;
+    std::size_t reconstruction_buffer_size = 0;
+    double survey_lag = 0.0;
+    double tile_lag = 0.0;
+    double reconstruction_lag = 0.0;
+    bool full_render = false;
+    bool append_render = false;
+    {
+      std::lock_guard<std::mutex> lock(m_ingest_mutex);
+      const bool due =
+        now - m_last_product_render >= m_render_min_period;
+      const bool have_keyframes = !m_keyframes.empty();
+      if ((m_force_full_render || m_dirty) && due && have_keyframes)
+      {
+        full_render = true;
+        changed = true;
+        evidence_rendered = true;
+        render_kind = "full";
+        m_force_full_render = false;
+        m_dirty = false;
+        m_have_new = false;
+      }
+      else if (m_have_new && due)
+      {
+        append_render = true;
+        changed = true;
+        evidence_rendered = true;
+        render_kind = "append";
+        m_have_new = false;
+      }
+      else if (consumer_started && have_keyframes &&
+               !m_force_full_render && !m_dirty && !m_have_new &&
+               !m_render_keyframes.empty())
+      {
+        // Republish the last complete internally consistent generation. If
+        // ingestion has newer unrendered work, wait for its normal render
+        // instead of mixing new keyframes with the previous occupancy state.
+        changed = true;
+      }
 
-    if (m_dirty && now - m_last_product_render >= m_render_min_period)
+      if (!changed)
+      {
+        return;
+      }
+      if (full_render || append_render)
+      {
+        m_render_keyframes = m_keyframes;
+        render_epoch = m_replay_epoch;
+      }
+      keyframes_without_evidence = m_keyframes_without_evidence;
+      hits_buffer_size = m_hits_buffer.size();
+      clear_buffer_size = m_clear_buffer.size();
+      survey_buffer_size = m_survey_buffer.size();
+      tile_buffer_size = m_tile_buffer.size();
+      reconstruction_buffer_size = m_reconstruction_buffer.size();
+      survey_lag = std::max(0.0, m_last_survey_stamp - m_last_assoc_stamp);
+      tile_lag = std::max(0.0, m_last_tile_stamp - m_last_tile_assoc_stamp);
+      reconstruction_lag = std::max(
+        0.0, m_last_reconstruction_stamp -
+        m_last_reconstruction_assoc_stamp);
+    }
+
+    auto stage_started = SteadyClock::now();
+
+    if (full_render)
     {
       // the graph moved: re-render everything at the current poses
       m_map->resetMap();
-      for (auto& kf : m_keyframes)
+      m_occupancy_upto = 0;
+      m_survey_stale = true;
+      m_surface_stale = true;
+      m_tile_stale = true;
+      for (size_t i = 0; i < m_render_keyframes.size(); ++i)
       {
-        kf.integrated = false;
-      }
-      for (size_t i = 0; i < m_keyframes.size(); ++i)
-      {
-        if (m_keyframes[i].has_evidence)
+        if (m_render_keyframes[i].has_evidence)
         {
-          integrateKeyframe(m_keyframes[i], i);
+          integrateKeyframe(m_render_keyframes[i], i);
         }
       }
-      m_dirty            = false;
-      m_have_new         = false;
+      m_occupancy_upto = m_render_keyframes.size();
+      m_render_epoch = render_epoch;
       ++m_full_renders;
-      changed = true;
-      evidence_rendered = true;
     }
-    else if (m_have_new &&
-             now - m_last_product_render >= m_render_min_period)
+    else if (append_render)
     {
       // append-only: integrate keyframes that haven't been rendered yet
-      const bool have_reconstruction_product =
-        static_cast<bool>(m_tile_pub) || static_cast<bool>(m_surface_pub);
-      for (size_t i = 0; i < m_keyframes.size(); ++i)
+      if (m_occupancy_upto > m_render_keyframes.size())
       {
-        if (m_keyframes[i].has_evidence && !m_keyframes[i].integrated)
+        // Defensive recovery for an unexpected segment-size regression.
+        m_map->resetMap();
+        m_occupancy_upto = 0;
+        m_survey_stale = true;
+        m_surface_stale = true;
+        m_tile_stale = true;
+      }
+      for (size_t i = m_occupancy_upto;
+           i < m_render_keyframes.size(); ++i)
+      {
+        if (m_render_keyframes[i].has_evidence)
         {
-          integrateKeyframe(m_keyframes[i], i);
-          changed = true;
+          integrateKeyframe(m_render_keyframes[i], i);
         }
       }
-      // Reconstruction and survey evidence are useful products even when a
-      // keyframe has no nearest occupancy snapshot. Do not let the occupancy
-      // integration flag suppress their render.
-      changed = changed || have_reconstruction_product ||
-        static_cast<bool>(m_survey_pub);
-      m_have_new = false;
-      evidence_rendered = true;
+      m_occupancy_upto = m_render_keyframes.size();
+      m_render_epoch = render_epoch;
     }
 
-    if (!changed)
+    // An input-time rewind can occur while this independent executor lane is
+    // rebuilding. Never publish the old segment after the rewind; the new
+    // segment's force-full flag remains set for the next timer invocation.
     {
-      return;
+      std::lock_guard<std::mutex> lock(m_ingest_mutex);
+      if (render_epoch != m_replay_epoch)
+      {
+        return;
+      }
     }
-    // This gates every complete-map publication. Previously only graph-move
-    // rebuilds updated the timestamp, so append-only replay serialized the
-    // entire multi-million-point tile/surface products every 500 ms.
+    const double integration_ms = elapsedWallMs(stage_started);
     if (evidence_rendered)
     {
       m_last_product_render = now;
@@ -2632,13 +2912,18 @@ private:
       return;
     }
 
+    stage_started = SteadyClock::now();
     std::vector<ReconstructionRow> reconstructed;
-    if (m_surface_pub)
+    const bool reconstruction_needed = demand.surface ||
+      m_global_occupancy_mode != GlobalOccupancyMode::Hits;
+    if (reconstruction_needed)
     {
       syncSurfaceAccumulator();
       reconstructed = m_surface_accumulator->rows();
     }
+    const double surface_build_ms = elapsedWallMs(stage_started);
 
+    stage_started = SteadyClock::now();
     visualization_msgs::msg::Marker marker_msg;
     sensor_msgs::msg::PointCloud2 cloud_msg;
     nav_msgs::msg::OccupancyGrid grid_msg;
@@ -2651,7 +2936,7 @@ private:
                                                   cloud_msg,
                                                   grid_msg,
                                                   /*create_marker=*/false,
-                                                  /*create_pointcloud=*/cloud_requested,
+                                                  /*create_pointcloud=*/demand.vdb_cloud,
                                                   /*create_occupancy_grid=*/true,
                                                   /*lower_z_limit=*/0.0,
                                                   /*upper_z_limit=*/0.0,
@@ -2659,21 +2944,30 @@ private:
                                                   m_two_dim_projection_threshold);
     map_lock.unlock();
     std::size_t surface_free_space_rejected = 0;
-    const std::vector<ReconstructionRow> confirmed =
-      selectConfirmedSurface(reconstructed, &surface_free_space_rejected);
+    std::vector<ReconstructionRow> confirmed;
+    if (m_global_occupancy_mode != GlobalOccupancyMode::Hits)
+    {
+      confirmed =
+        selectConfirmedSurface(reconstructed, &surface_free_space_rejected);
+    }
     // Planning remains conservative: every confirmed, non-contradicted voxel
     // marks occupancy. Local planarity only controls the operator/registration
     // surfel cloud, so a thin obstacle cannot disappear merely because it has
     // too few neighbors for a stable normal.
     applyNavigationSurfaceToOccupancy(grid_msg, confirmed);
+    if (!replayEpochCurrent(render_epoch))
+    {
+      return;
+    }
     const auto stamp      = get_clock()->now();
     cloud_msg.header.stamp = stamp;
     grid_msg.header.stamp  = stamp;
-    if (cloud_requested)
+    if (demand.vdb_cloud)
     {
       m_cloud_pub->publish(cloud_msg);
     }
     m_grid_pub->publish(grid_msg);
+    const double occupancy_output_ms = elapsedWallMs(stage_started);
 
     // Graph-anchored dense SURVEY render: keyframe-local rich survey clouds at
     // the CURRENT optimized poses, aggregated by a support-counting voxel
@@ -2688,8 +2982,9 @@ private:
     // `pose_sigma` is RESERVED (0) until the trajectory topic carries
     // per-keyframe marginals. `incidence` is averaged over the points that
     // know it (>= 0), -1 when none do — no sentinel dilution.
+    stage_started = SteadyClock::now();
     std::vector<SurveyRow> supported_survey_rows;
-    if (survey_requested || m_navigation_pub || m_navigation_surfel_pub)
+    if (demand.surveyProducts())
     {
       // Fold in only what is new. Re-accumulating every keyframe on every
       // render was affordable while the clouds were resident; with them on
@@ -2738,11 +3033,11 @@ private:
       sensor_msgs::msg::PointCloud2 survey_msg;
       sensor_msgs::msg::PointCloud2 supported_survey_msg;
       supported_survey_rows.reserve(m_vox.size());
-      if (full_survey_requested)
+      if (demand.full_survey)
       {
         initialize_survey_message(survey_msg);
       }
-      if (supported_survey_requested)
+      if (demand.supported_survey)
       {
         initialize_survey_message(supported_survey_msg);
       }
@@ -2757,16 +3052,17 @@ private:
           bytes + kSurveyOutputFields * sizeof(float));
       };
       forEachSurveyRow([&](const SurveyRow& row) {
-        if (full_survey_requested)
+        if (demand.full_survey)
         {
           append_row(survey_msg, row);
         }
-        if (supported_survey_requested &&
+        if (demand.supported_survey &&
             row[6] >= static_cast<float>(m_survey_min_support))
         {
           append_row(supported_survey_msg, row);
         }
-        if (row[6] >= static_cast<float>(m_survey_min_support))
+        if (demand.navigationProducts() &&
+            row[6] >= static_cast<float>(m_survey_min_support))
         {
           supported_survey_rows.push_back(row);
         }
@@ -2780,32 +3076,88 @@ private:
         msg.row_step = msg.point_step * msg.width;
         pub->publish(msg);
       };
-      if (full_survey_requested)
+      if (demand.full_survey)
       {
+        if (!replayEpochCurrent(render_epoch))
+        {
+          return;
+        }
         finish_and_publish(m_survey_pub, survey_msg);
       }
-      if (supported_survey_requested)
+      if (demand.supported_survey)
       {
+        if (!replayEpochCurrent(render_epoch))
+        {
+          return;
+        }
         finish_and_publish(m_supported_survey_pub, supported_survey_msg);
       }
     }
+    const double survey_build_ms = elapsedWallMs(stage_started);
 
+    stage_started = SteadyClock::now();
     std::size_t navigation_free_space_rejected = 0;
-    std::vector<NavigationRow> navigation =
-      selectSurveyNavigationSurface(
+    std::vector<NavigationRow> navigation;
+    if (demand.navigationProducts())
+    {
+      navigation = selectSurveyNavigationSurface(
         supported_survey_rows, &navigation_free_space_rejected);
-    const std::vector<SurfelRow> surfels =
-      buildNavigationSurfels(navigation);
+    }
+    const double navigation_select_ms = elapsedWallMs(stage_started);
 
-    publishReconstructionProducts(
-      stamp, reconstructed, navigation, surfels, confirmed.size(),
-      surface_free_space_rejected,
-      navigation_free_space_rejected);
+    if (!replayEpochCurrent(render_epoch))
+    {
+      return;
+    }
+    const ProductPublishMetrics publish_metrics =
+      publishReconstructionProducts(
+        stamp, demand, reconstructed, confirmed.size(),
+        surface_free_space_rejected, survey_buffer_size, tile_buffer_size,
+        reconstruction_buffer_size);
+
+    stage_started = SteadyClock::now();
+    const std::size_t navigation_count = navigation.size();
+    // Preserve the exact 1 cm, normal-bearing cloud while removing its
+    // all-point fit from the subscription executor. The worker owns at most
+    // one active and one newest pending generation; it never publishes a
+    // reduced-fidelity intermediate cloud.
+    if (demand.navigationProducts())
+    {
+      queueNavigationFit(
+        stamp, demand, navigation_free_space_rejected,
+        std::move(navigation));
+    }
+    const double navigation_dispatch_ms = elapsedWallMs(stage_started);
+
+    const double total_ms = elapsedWallMs(render_started);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 30000,
+      "render profile: kind=%s total=%.1f ms integrate=%.1f occupancy=%.1f "
+      "surface=%.1f survey=%.1f navigation=%.1f dispatch=%.1f "
+      "publish[tile=%.1f surface=%.1f]; "
+      "demand[t=%d s=%d fs=%d ss=%d n=%d ns=%d vdb=%d]; "
+      "state[kf=%zu survey_vox=%zu surface_cells=%zu nav_queued=%zu "
+      "buffers=%zu/%zu/%zu/%zu/%zu lag=%.2f/%.2f/%.2f s]",
+      render_kind, total_ms, integration_ms, occupancy_output_ms,
+      surface_build_ms, survey_build_ms, navigation_select_ms,
+      navigation_dispatch_ms, publish_metrics.tile_ms,
+      publish_metrics.surface_ms,
+      static_cast<int>(demand.tile), static_cast<int>(demand.surface),
+      static_cast<int>(demand.full_survey),
+      static_cast<int>(demand.supported_survey),
+      static_cast<int>(demand.navigation),
+      static_cast<int>(demand.navigation_surfels),
+      static_cast<int>(demand.vdb_cloud), m_render_keyframes.size(), m_vox.size(),
+      m_surface_accumulator->candidateCellCount(), navigation_count,
+      hits_buffer_size, clear_buffer_size, survey_buffer_size,
+      tile_buffer_size, reconstruction_buffer_size,
+      survey_lag, tile_lag, reconstruction_lag);
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
                          "assembled map: %zu keyframes (%zu without evidence), "
                          "%zu full re-renders",
-                         m_keyframes.size(), m_keyframes_without_evidence,
+                         m_render_keyframes.size(), keyframes_without_evidence,
                          m_full_renders);
   }
 
@@ -2860,11 +3212,24 @@ private:
   std::deque<BufferedSurvey> m_survey_buffer;
   std::deque<BufferedReconstruction> m_tile_buffer;
   std::deque<BufferedReconstruction> m_reconstruction_buffer;
+  // Every field above through the authoritative keyframe vector below is
+  // owned by the ingestion callback group. The render group only holds this
+  // mutex long enough to copy compact keyframe metadata and diagnostics.
+  std::mutex m_ingest_mutex;
   std::vector<KeyframeEvidence> m_keyframes;
   size_t m_keyframes_without_evidence = 0;
-  size_t m_full_renders               = 0;
   bool m_dirty    = false;
   bool m_have_new = false;
+  bool m_force_full_render = false;
+  std::uint64_t m_replay_epoch = 0;
+
+  // Render-group-owned state. Immutable evidence handles in this snapshot
+  // keep a complete generation alive while ingestion appends or corrects the
+  // authoritative vector concurrently.
+  std::vector<KeyframeEvidence> m_render_keyframes;
+  size_t m_occupancy_upto = 0;
+  size_t m_full_renders = 0;
+  std::uint64_t m_render_epoch = 0;
   double m_last_product_render = 0.0;
 
   // Evidence spill / export. Empty spill dir = disabled (clouds stay
@@ -2898,8 +3263,19 @@ private:
   bool m_tile_stale = true;
   bool m_tile_requested_previous = false;
   bool m_surface_requested_previous = false;
-  bool m_survey_requested_previous = false;
+  bool m_full_survey_requested_previous = false;
+  bool m_supported_survey_requested_previous = false;
+  bool m_navigation_requested_previous = false;
+  bool m_navigation_surfel_requested_previous = false;
   bool m_cloud_requested_previous = false;
+  std::mutex m_navigation_fit_mutex;
+  std::condition_variable m_navigation_fit_cv;
+  std::optional<NavigationFitJob> m_pending_navigation_fit;
+  std::thread m_navigation_fit_thread;
+  bool m_navigation_fit_stop = false;
+  std::uint64_t m_navigation_fit_generation = 0;
+  std::uint64_t m_navigation_fit_epoch = 0;
+  std::uint64_t m_navigation_fits_coalesced = 0;
   double m_last_hits_stamp = 0.0;
   double m_last_clear_stamp = 0.0;
   double m_last_survey_stamp = 0.0;
@@ -2915,6 +3291,8 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_tile_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr
     m_reconstruction_sub;
+  rclcpp::CallbackGroup::SharedPtr m_ingest_callback_group;
+  rclcpp::CallbackGroup::SharedPtr m_render_callback_group;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_cloud_pub;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr m_grid_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_survey_pub;
@@ -2937,6 +3315,11 @@ public:
   // rclcpp::shutdown() has torn the context down.
   void exportOnShutdown()
   {
+    // No publisher may outlive the ROS context, and the exact export path
+    // below performs its own synchronous fit from the latest authoritative
+    // state. Finish the active worker and discard any superseded pending fit
+    // before writing final products.
+    stopNavigationFitWorker();
     if (m_export_on_shutdown && !m_export_path.empty())
     {
       std::string message;
@@ -2976,7 +3359,13 @@ int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<vdb_mapping_ros2::VDBMapAssembler>();
-  rclcpp::spin(node);
+  // One lane drains serialized sensor/trajectory callbacks while another
+  // performs complete-map renders. A third keeps parameter/control services
+  // responsive; exact normal fitting has its own bounded worker above.
+  rclcpp::executors::MultiThreadedExecutor executor(
+    rclcpp::ExecutorOptions(), 3);
+  executor.add_node(node);
+  executor.spin();
   node->exportOnShutdown();
   rclcpp::shutdown();
   return 0;
