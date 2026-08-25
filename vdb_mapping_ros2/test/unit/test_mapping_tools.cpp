@@ -42,3 +42,23 @@ TEST(MappingTools, ProjectionThresholdIsInclusive)
   EXPECT_EQ(occupancy.data[0], 100);
   EXPECT_EQ(occupancy.data[1], 100);
 }
+
+TEST(MappingTools, SmoothingDoesNotDuplicateEdgeCells) {
+  using MapT = vdb_mapping::OccupancyVDBMapping;
+
+  nav_msgs::msg::OccupancyGrid isolated;
+  isolated.info.width = 1;
+  isolated.info.height = 1;
+  isolated.data.assign(1, -1);
+  std::vector<int> isolated_projection{100};
+  VDBMappingTools<MapT>::smoothOccGrid(isolated, isolated_projection);
+  EXPECT_EQ(isolated.data[0], -1);
+
+  nav_msgs::msg::OccupancyGrid corner;
+  corner.info.width = 2;
+  corner.info.height = 2;
+  corner.data.assign(4, -1);
+  std::vector<int> corner_projection{-1, 0, 0, 100};
+  VDBMappingTools<MapT>::smoothOccGrid(corner, corner_projection);
+  EXPECT_EQ(corner.data[0], 0);
+}

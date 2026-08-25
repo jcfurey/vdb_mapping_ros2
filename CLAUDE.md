@@ -36,7 +36,7 @@ vdb_mapping_ros2/                     # Repository root
 │       ├── smoke.test.py / raytrace.test.py  # launch_testing end-to-end tests (+ sibling *_test.py modules)
 │       ├── assembler.test.py               # metadata survival, odom-delta anchoring, z re-render, spill round-trip
 │       ├── section_sync.test.py            # end-to-end remote section sync
-│       └── unit/test_survey_voxel.cpp      # gtest for the survey voxel reduction
+│       └── unit/                           # gtests for voxel reduction, reconstruction, mapping tools
 └── vdb_mapping_interfaces/           # Interface definitions package
     ├── CMakeLists.txt
     ├── package.xml
@@ -138,7 +138,7 @@ Pipeline is inherited from an external `continuous_integration/ci_scripts` proje
 A local test suite exists under `vdb_mapping_ros2/test/` (run with `colcon test --packages-select vdb_mapping_ros2`):
 
 - **launch_testing end-to-end tests** — each `*.test.py` launch harness pairs with a `*_test.py` module: `smoke` (node comes up and maps), `raytrace` (service semantics), `assembler` (survey metadata survives assembly, odom-delta keyframe anchoring, z-triggered re-render, evidence-spill round-trip) and `section_sync` (remote section sync end to end).
-- **`test/unit/test_survey_voxel.cpp`** — gtest (`ament_add_gtest`) for the SurveyPoint voxel reduction and its sentinel rules.
+- **Unit gtests** — `test_survey_voxel.cpp` covers all-field survey reduction and sentinel rules, `test_sonar_reconstruction.cpp` covers bounded ribbon sampling and surface reconstruction, and `test_mapping_tools.cpp` covers occupancy projection/smoothing edge semantics.
 
 ## Code Conventions
 

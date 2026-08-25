@@ -20,9 +20,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <sstream>
+#include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 #if __has_include(<tf2/exceptions.hpp>)
@@ -79,6 +83,27 @@ void trySetLogCallback(MapT&, const rclcpp::Logger&, long)
 // otherwise a description of the defect.
 const char* cloudMsgError(const sensor_msgs::msg::PointCloud2& msg)
 {
+  if (msg.point_step == 0) {
+    return "point_step must be nonzero";
+  }
+  const std::uint64_t row_bytes =
+      static_cast<std::uint64_t>(msg.width) * msg.point_step;
+  if (row_bytes > msg.row_step) {
+    return "row_step is smaller than width * point_step";
+  }
+  if (msg.height > 1 &&
+      static_cast<std::uint64_t>(msg.height - 1) >
+          (std::numeric_limits<std::uint64_t>::max() - row_bytes) /
+              msg.row_step) {
+    return "declared cloud byte extent overflows";
+  }
+  const std::uint64_t required_bytes =
+      static_cast<std::uint64_t>(msg.height - 1) * msg.row_step + row_bytes;
+  if (required_bytes > msg.data.size()) {
+    return "data buffer smaller than the declared width/height/point_step "
+           "extent";
+  }
+
   bool has_x = false;
   bool has_y = false;
   bool has_z = false;
@@ -88,37 +113,170 @@ const char* cloudMsgError(const sensor_msgs::msg::PointCloud2& msg)
     {
       continue;
     }
+    bool *seen =
+        field.name == "x" ? &has_x : (field.name == "y" ? &has_y : &has_z);
+    if (*seen) {
+      return "duplicate x/y/z field";
+    }
     if (field.datatype != sensor_msgs::msg::PointField::FLOAT32 ||
-        field.offset + sizeof(float) > msg.point_step)
-    {
+        field.count < 1 ||
+        static_cast<std::uint64_t>(field.offset) + sizeof(float) >
+            msg.point_step) {
       return "x/y/z field is not a FLOAT32 lying within point_step";
     }
-    has_x |= field.name == "x";
-    has_y |= field.name == "y";
-    has_z |= field.name == "z";
+    *seen = true;
   }
   if (!(has_x && has_y && has_z))
   {
     return "missing x/y/z FLOAT32 fields";
   }
-  if (msg.width != 0 && msg.height != 0)
-  {
-    const size_t required = static_cast<size_t>(msg.height - 1) * msg.row_step +
-                            static_cast<size_t>(msg.width) * msg.point_step;
-    if (msg.data.size() < required)
-    {
-      return "data buffer smaller than the declared width/height/point_step extent";
+  return nullptr;
+}
+
+bool validateSectionBounds(
+    const vdb_mapping_interfaces::msg::BoundingBox &bounds,
+    const double resolution, const std::size_t max_voxels, std::string &error) {
+  const double min_values[] = {bounds.min_corner.x, bounds.min_corner.y,
+                               bounds.min_corner.z};
+  const double max_values[] = {bounds.max_corner.x, bounds.max_corner.y,
+                               bounds.max_corner.z};
+  long double voxel_count = 1.0L;
+  for (std::size_t axis = 0; axis < 3; ++axis) {
+    if (!std::isfinite(min_values[axis]) || !std::isfinite(max_values[axis])) {
+      error = "bounding-box coordinates must be finite";
+      return false;
+    }
+    if (min_values[axis] > max_values[axis]) {
+      error = "bounding-box min_corner must not exceed max_corner";
+      return false;
+    }
+    voxel_count *= std::floor(static_cast<long double>(max_values[axis] -
+                                                       min_values[axis]) /
+                              resolution) +
+                   1.0L;
+    if (!std::isfinite(voxel_count) ||
+        voxel_count > static_cast<long double>(max_voxels)) {
+      std::ostringstream message;
+      message << "requested section exceeds max_section_voxels (" << max_voxels
+              << ')';
+      error = message.str();
+      return false;
     }
   }
-  return nullptr;
+  return true;
+}
+
+template <typename GridT>
+bool validateIncomingSection(const typename GridT::Ptr &section,
+                             const double expected_resolution,
+                             const std::size_t max_voxels, std::string &error) {
+  const openvdb::Vec3d voxel_size = section->voxelSize();
+  const double resolution_tolerance =
+      std::max(1.0e-9, expected_resolution * 1.0e-6);
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!std::isfinite(voxel_size[axis]) ||
+        std::fabs(voxel_size[axis] - expected_resolution) >
+            resolution_tolerance) {
+      error =
+          "section voxel size does not match the destination map resolution";
+      return false;
+    }
+  }
+  const openvdb::Vec3d grid_origin = section->indexToWorld(openvdb::Vec3d(0.0));
+  if (!grid_origin.eq(openvdb::Vec3d(0.0), resolution_tolerance)) {
+    error = "section grid transform must not contain an embedded translation";
+    return false;
+  }
+  for (int axis = 0; axis < 3; ++axis) {
+    openvdb::Vec3d unit_index(0.0);
+    unit_index[axis] = 1.0;
+    openvdb::Vec3d expected_world(0.0);
+    expected_world[axis] = expected_resolution;
+    if (!section->indexToWorld(unit_index)
+             .eq(expected_world, resolution_tolerance)) {
+      error = "section grid transform must be axis-aligned with the "
+              "destination map";
+      return false;
+    }
+  }
+
+  const auto min_meta =
+      section->template getMetadata<openvdb::Vec3DMetadata>("bb_min");
+  const auto max_meta =
+      section->template getMetadata<openvdb::Vec3DMetadata>("bb_max");
+  if (!min_meta || !max_meta) {
+    error = "section is missing required bb_min/bb_max metadata";
+    return false;
+  }
+  const openvdb::Vec3d min_value = min_meta->value();
+  const openvdb::Vec3d max_value = max_meta->value();
+  openvdb::Coord min_coord;
+  openvdb::Coord max_coord;
+  long double voxel_count = 1.0L;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!std::isfinite(min_value[axis]) || !std::isfinite(max_value[axis]) ||
+        std::floor(min_value[axis]) != min_value[axis] ||
+        std::floor(max_value[axis]) != max_value[axis] ||
+        min_value[axis] > max_value[axis] ||
+        min_value[axis] < std::numeric_limits<std::int32_t>::min() ||
+        max_value[axis] > std::numeric_limits<std::int32_t>::max()) {
+      error =
+          "section bounding-box metadata is not a finite ordered integer box";
+      return false;
+    }
+    min_coord[axis] = static_cast<std::int32_t>(min_value[axis]);
+    max_coord[axis] = static_cast<std::int32_t>(max_value[axis]);
+    voxel_count *=
+        static_cast<long double>(max_coord[axis]) - min_coord[axis] + 1.0L;
+    if (!std::isfinite(voxel_count) ||
+        voxel_count > static_cast<long double>(max_voxels)) {
+      error = "section bounding box exceeds max_section_voxels";
+      return false;
+    }
+  }
+  const openvdb::CoordBBox declared_bbox(min_coord, max_coord);
+  for (auto iter = section->cbeginValueAll(); iter; ++iter) {
+    if (!iter.isValueOn() && iter.getValue() == section->background()) {
+      continue;
+    }
+    openvdb::CoordBBox value_bbox;
+    iter.getBoundingBox(value_bbox);
+    if (!declared_bbox.isInside(value_bbox.min()) ||
+        !declared_bbox.isInside(value_bbox.max())) {
+      error = "section contains values outside its declared bounding box";
+      return false;
+    }
+  }
+  return true;
+}
+
+std::chrono::milliseconds periodFromRate(const double rate,
+                                         const char *parameter_name) {
+  if (!std::isfinite(rate) || rate <= 0.0) {
+    throw std::invalid_argument(std::string(parameter_name) +
+                                " must be finite and positive");
+  }
+  const long double period_ms =
+      std::ceil(1000.0L / static_cast<long double>(rate));
+  if (period_ms >
+      static_cast<long double>(std::chrono::milliseconds::max().count())) {
+    throw std::invalid_argument(std::string(parameter_name) +
+                                " is too small to schedule");
+  }
+  return std::chrono::milliseconds(
+      std::max<int64_t>(1, static_cast<int64_t>(period_ms)));
 }
 }  // namespace
 
 VDBMappingROS2::VDBMappingROS2(const rclcpp::NodeOptions& options)
   : Node("vdb_mapping_ros2", options)
 {
-  const double tf_buffer_duration = std::max(
-    0.1, this->declare_parameter<double>("tf_buffer_duration", 10.0));
+  const double tf_buffer_duration =
+      this->declare_parameter<double>("tf_buffer_duration", 10.0);
+  if (!std::isfinite(tf_buffer_duration) || tf_buffer_duration < 0.1) {
+    throw std::invalid_argument(
+        "tf_buffer_duration must be finite and at least 0.1 seconds");
+  }
   m_tf_buffer = std::make_unique<tf2_ros::Buffer>(
     this->get_clock(), tf2::durationFromSec(tf_buffer_duration));
   m_tf_listener = std::make_shared<tf2_ros::TransformListener>(*m_tf_buffer);
@@ -153,7 +311,10 @@ void VDBMappingROS2::resetMap()
 {
   RCLCPP_INFO(this->get_logger(), "Resetting Map");
   m_vdb_map->resetMap();
-  publishMap();
+  // Visualization topics are transient-local. Publish the empty state even
+  // without a live subscriber so a later subscriber cannot receive the
+  // durable pre-reset map.
+  publishMap(true);
 }
 
 bool VDBMappingROS2::saveMap(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
@@ -185,8 +346,8 @@ bool VDBMappingROS2::loadMap(
   // resolution — a 0.1 m map served with 0.05 m metadata is nav-consumed at
   // 2x wrong scale while the pointcloud/marker outputs stay correct and
   // mask the fault.
-  m_resolution = m_vdb_map->getResolution();
-  publishMap();
+  m_resolution.store(m_vdb_map->getResolution(), std::memory_order_release);
+  publishMap(true);
   res->success = success;
   return success;
 }
@@ -198,8 +359,8 @@ bool VDBMappingROS2::loadMapFromPCD(
   RCLCPP_INFO(this->get_logger(), "Loading Map from PCD file");
   bool success = m_vdb_map->loadMapFromPCD(req->path, req->set_background, req->clear_map);
   // Same resolution refresh as loadMap above.
-  m_resolution = m_vdb_map->getResolution();
-  publishMap();
+  m_resolution.store(m_vdb_map->getResolution(), std::memory_order_release);
+  publishMap(true);
   res->success = success;
   return success;
 }
@@ -207,8 +368,7 @@ bool VDBMappingROS2::loadMapFromPCD(
 void VDBMappingROS2::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg,
                                    const SensorSource& sensor_source)
 {
-  if (cloud_msg->width * cloud_msg->height == 0)
-  {
+  if (cloud_msg->width == 0 || cloud_msg->height == 0) {
     return;
   }
   if (const char* error = cloudMsgError(*cloud_msg))
@@ -237,6 +397,7 @@ void VDBMappingROS2::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPt
                 static_cast<double>(previous_stamp_ns - stamp_ns) * 1.0e-9);
     m_vdb_map->resetMap();
     m_last_input_stamp_ns.clear();
+    publishMap(true);
   }
   auto& source_stamp_ns = m_last_input_stamp_ns[sensor_source.source_id];
   source_stamp_ns = std::max(source_stamp_ns, stamp_ns);
@@ -260,10 +421,8 @@ void VDBMappingROS2::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPt
   catch (tf2::TransformException& ex)
   {
     RCLCPP_ERROR(this->get_logger(),
-                 "MapToSensor: Could not transform %s to %s: %s",
-                 m_map_frame.c_str(),
-                 sensor_frame.c_str(),
-                 ex.what());
+                 "SensorToMap: Could not transform %s to %s: %s",
+                 sensor_frame.c_str(), m_map_frame.c_str(), ex.what());
     return;
   }
   if (m_map_frame != cloud_msg->header.frame_id)
@@ -286,9 +445,8 @@ void VDBMappingROS2::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPt
       catch (tf2::TransformException& ex)
       {
         RCLCPP_ERROR(this->get_logger(),
-                     "MapToMessage: Could not transform %s to %s: %s",
-                     m_map_frame.c_str(),
-                     cloud_msg->header.frame_id.c_str(),
+                     "MessageToMap: Could not transform %s to %s: %s",
+                     cloud_msg->header.frame_id.c_str(), m_map_frame.c_str(),
                      ex.what());
         return;
       }
@@ -297,27 +455,22 @@ void VDBMappingROS2::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPt
     cloud->header.frame_id = m_map_frame;
   }
   const Eigen::Vector3d sensor_origin = tf2::transformToEigen(cloud_origin_tf).translation();
-  if (m_deterministic_input)
-  {
+  if (m_deterministic_input || !m_accumulate_updates) {
     // The live accumulator deliberately keeps only the newest pending sample
     // to minimize latency. That is the wrong contract for recorded data:
     // integrate the complete delivered sequence before accepting the next
     // callback so host load and playback rate cannot select the map inputs.
-    m_vdb_map->accumulateUpdate(cloud, sensor_origin, sensor_source.source_id);
-    m_vdb_map->integrateUpdate();
-  }
-  else
-  {
-    m_vdb_map->addDataToAccumulate(cloud, sensor_origin, sensor_source.source_id);
-    if (!m_accumulate_updates)
-    {
+    if (m_vdb_map->accumulateUpdate(cloud, sensor_origin,
+                                    sensor_source.source_id)) {
       m_vdb_map->integrateUpdate();
     }
+  } else {
+    m_vdb_map->addDataToAccumulate(cloud, sensor_origin,
+                                   sensor_source.source_id);
   }
 }
 
-void VDBMappingROS2::publishMap() const
-{
+void VDBMappingROS2::publishMap(const bool force) const {
   if (!(m_publish_pointcloud || m_publish_vis_marker || m_publish_occupancy_grid))
   {
     return;
@@ -325,12 +478,19 @@ void VDBMappingROS2::publishMap() const
   // Ask the publisher handles rather than count_subscribers(name): the latter
   // expands the node-relative name but does NOT apply remap rules, so it would
   // report 0 forever if the topic is remapped at launch.
+  const auto has_subscribers = [](const auto &publisher) {
+    return publisher->get_subscription_count() +
+               publisher->get_intra_process_subscription_count() >
+           0;
+  };
   bool publish_vis_marker =
-    (m_publish_vis_marker && m_visualization_marker_pub->get_subscription_count() > 0);
+      m_publish_vis_marker &&
+      (force || has_subscribers(m_visualization_marker_pub));
   bool publish_pointcloud =
-    (m_publish_pointcloud && m_pointcloud_pub->get_subscription_count() > 0);
+      m_publish_pointcloud && (force || has_subscribers(m_pointcloud_pub));
   bool publish_occupancy_grid =
-    (m_publish_occupancy_grid && m_occupancy_grid_pub->get_subscription_count() > 0);
+      m_publish_occupancy_grid &&
+      (force || has_subscribers(m_occupancy_grid_pub));
 
   if (!(publish_vis_marker || publish_pointcloud || publish_occupancy_grid))
   {
@@ -352,8 +512,9 @@ void VDBMappingROS2::publishMap() const
     if (!m_tf_buffer->canTransform(m_map_frame, m_robot_frame, tf2::TimePointZero))
     {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
-                           "VisMapToRobot: Waiting for TF %s -> %s (localization not yet active)",
-                           m_map_frame.c_str(), m_robot_frame.c_str());
+                           "VisRobotToMap: Waiting for TF %s -> %s "
+                           "(localization not yet active)",
+                           m_robot_frame.c_str(), m_map_frame.c_str());
       return;
     }
     try
@@ -364,9 +525,8 @@ void VDBMappingROS2::publishMap() const
     catch (tf2::TransformException& ex)
     {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "VisMapToRobot: Could not transform %s to %s: %s",
-                           m_map_frame.c_str(),
-                           m_robot_frame.c_str(),
+                           "VisRobotToMap: Could not transform %s to %s: %s",
+                           m_robot_frame.c_str(), m_map_frame.c_str(),
                            ex.what());
       return;
     }
@@ -382,18 +542,11 @@ void VDBMappingROS2::publishMap() const
   auto grid = m_vdb_map->getGrid();
   std::shared_lock map_lock(*m_vdb_map->getMapMutex());
   VDBMappingTools<VDBMapT>::createMappingOutput(
-    grid,
-    m_map_frame,
-    visualization_marker_msg,
-    cloud_msg,
-    occupancy_grid_msg,
-    publish_vis_marker,
-    publish_pointcloud,
-    publish_occupancy_grid,
-    robot_z + lower_z_limit,
-    robot_z + upper_z_limit,
-    m_resolution,
-    m_two_dim_projection_threshold);
+      grid, m_map_frame, visualization_marker_msg, cloud_msg,
+      occupancy_grid_msg, publish_vis_marker, publish_pointcloud,
+      publish_occupancy_grid, robot_z + lower_z_limit, robot_z + upper_z_limit,
+      m_resolution.load(std::memory_order_acquire),
+      m_two_dim_projection_threshold);
   map_lock.unlock();
   if (publish_vis_marker)
   {
@@ -409,7 +562,8 @@ void VDBMappingROS2::publishMap() const
   {
     occupancy_grid_msg.header.stamp    = this->now();
     occupancy_grid_msg.header.frame_id = m_map_frame;
-    occupancy_grid_msg.info.resolution = m_resolution;
+    occupancy_grid_msg.info.resolution =
+        m_resolution.load(std::memory_order_acquire);
     m_occupancy_grid_pub->publish(occupancy_grid_msg);
   }
 }
@@ -443,6 +597,15 @@ void VDBMappingROS2::mapSectionCallback(
                           "MapSection: dropping section: payload is not an update grid");
     return;
   }
+  std::string validation_error;
+  if (!validateIncomingSection<VDBMapT::UpdateGridT>(
+          section, m_resolution.load(std::memory_order_acquire),
+          m_max_section_voxels, validation_error)) {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                          "MapSection: dropping invalid section: %s",
+                          validation_error.c_str());
+    return;
+  }
   if (m_map_frame == update_msg->header.frame_id)
   {
     m_vdb_map->applyMapSectionUpdateGrid(
@@ -461,11 +624,9 @@ void VDBMappingROS2::mapSectionCallback(
     }
     catch (tf2::TransformException& ex)
     {
-      RCLCPP_ERROR(this->get_logger(),
-                   "MapSection: Could not transform %s to %s: %s",
-                   m_map_frame.c_str(),
-                   update_msg->header.frame_id.c_str(),
-                   ex.what());
+      RCLCPP_ERROR(
+          this->get_logger(), "MapSection: Could not transform %s to %s: %s",
+          update_msg->header.frame_id.c_str(), m_map_frame.c_str(), ex.what());
       return;
     }
     m_vdb_map->transformAndApplyMapSectionUpdateGrid(
@@ -503,6 +664,15 @@ void VDBMappingROS2::mapFullSectionCallback(
                           "MapFullSection: dropping section: payload is not a map grid");
     return;
   }
+  std::string validation_error;
+  if (!validateIncomingSection<VDBMapT::GridT>(
+          section, m_resolution.load(std::memory_order_acquire),
+          m_max_section_voxels, validation_error)) {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                          "MapFullSection: dropping invalid section: %s",
+                          validation_error.c_str());
+    return;
+  }
   if (m_map_frame == update_msg->header.frame_id)
   {
     m_vdb_map->applyMapSectionGrid(
@@ -523,8 +693,7 @@ void VDBMappingROS2::mapFullSectionCallback(
     {
       RCLCPP_ERROR(this->get_logger(),
                    "MapFullSection: Could not transform %s to %s: %s",
-                   m_map_frame.c_str(),
-                   update_msg->header.frame_id.c_str(),
+                   update_msg->header.frame_id.c_str(), m_map_frame.c_str(),
                    ex.what());
       return;
     }
@@ -551,6 +720,15 @@ bool VDBMappingROS2::getMapSectionCallback(
   const std::shared_ptr<vdb_mapping_interfaces::srv::GetMapSection::Request> req,
   const std::shared_ptr<vdb_mapping_interfaces::srv::GetMapSection::Response> res)
 {
+  std::string bounds_error;
+  if (!validateSectionBounds(req->bounding_box,
+                             m_resolution.load(std::memory_order_acquire),
+                             m_max_section_voxels, bounds_error)) {
+    RCLCPP_ERROR(this->get_logger(), "GetMapSection: rejecting request: %s",
+                 bounds_error.c_str());
+    res->success = false;
+    return true;
+  }
   geometry_msgs::msg::TransformStamped source_to_map_tf;
   try
   {
@@ -567,21 +745,32 @@ bool VDBMappingROS2::getMapSectionCallback(
   {
     RCLCPP_ERROR(this->get_logger(),
                  "GetMapSection: Could not transform %s to %s: %s",
-                 m_map_frame.c_str(),
-                 req->header.frame_id.c_str(),
+                 req->header.frame_id.c_str(), m_map_frame.c_str(), ex.what());
+    res->success = false;
+    return true;
+  }
+  try {
+    res->section.map = m_vdb_map->gridToByteArray<VDBMapT::UpdateGridT>(
+        m_vdb_map->getMapSectionUpdateGrid(
+            Eigen::Matrix<double, 3, 1>(req->bounding_box.min_corner.x,
+                                        req->bounding_box.min_corner.y,
+                                        req->bounding_box.min_corner.z),
+            Eigen::Matrix<double, 3, 1>(req->bounding_box.max_corner.x,
+                                        req->bounding_box.max_corner.y,
+                                        req->bounding_box.max_corner.z),
+            tf2::transformToEigen(source_to_map_tf).matrix()));
+  } catch (const std::exception &ex) {
+    RCLCPP_ERROR(this->get_logger(), "GetMapSection: extraction failed: %s",
                  ex.what());
     res->success = false;
     return true;
   }
-  res->section.map = m_vdb_map->gridToByteArray<VDBMapT::UpdateGridT>(
-    m_vdb_map->getMapSectionUpdateGrid(
-      Eigen::Matrix<double, 3, 1>(req->bounding_box.min_corner.x,
-                                  req->bounding_box.min_corner.y,
-                                  req->bounding_box.min_corner.z),
-      Eigen::Matrix<double, 3, 1>(req->bounding_box.max_corner.x,
-                                  req->bounding_box.max_corner.y,
-                                  req->bounding_box.max_corner.z),
-      tf2::transformToEigen(source_to_map_tf).matrix()));
+  if (res->section.map.empty()) {
+    RCLCPP_ERROR(this->get_logger(), "GetMapSection: serialization failed or "
+                                     "exceeded max_serialized_grid_bytes");
+    res->success = false;
+    return true;
+  }
   res->section.header.frame_id = m_map_frame;
   res->section.header.stamp    = this->now();
   res->success                 = true;
@@ -592,6 +781,15 @@ bool VDBMappingROS2::getMapFullSectionCallback(
   const std::shared_ptr<vdb_mapping_interfaces::srv::GetMapSection::Request> req,
   const std::shared_ptr<vdb_mapping_interfaces::srv::GetMapSection::Response> res)
 {
+  std::string bounds_error;
+  if (!validateSectionBounds(req->bounding_box,
+                             m_resolution.load(std::memory_order_acquire),
+                             m_max_section_voxels, bounds_error)) {
+    RCLCPP_ERROR(this->get_logger(), "GetMapFullSection: rejecting request: %s",
+                 bounds_error.c_str());
+    res->success = false;
+    return true;
+  }
   geometry_msgs::msg::TransformStamped source_to_map_tf;
   try
   {
@@ -605,24 +803,36 @@ bool VDBMappingROS2::getMapFullSectionCallback(
   {
     RCLCPP_ERROR(this->get_logger(),
                  "GetMapFullSection: Could not transform %s to %s: %s",
-                 m_map_frame.c_str(),
-                 req->header.frame_id.c_str(),
-                 ex.what());
+                 req->header.frame_id.c_str(), m_map_frame.c_str(), ex.what());
     res->success = false;
     return true;
   }
   // Full sections carry the probabilistic GridT (not the binary UpdateGridT
   // returned by get_map_section), matching what mapFullSectionCallback /
   // applyMapSectionGrid expect on the receiving side.
-  res->section.map = m_vdb_map->gridToByteArray<VDBMapT::GridT>(
-    m_vdb_map->getMapSectionGrid(
-      Eigen::Matrix<double, 3, 1>(req->bounding_box.min_corner.x,
-                                  req->bounding_box.min_corner.y,
-                                  req->bounding_box.min_corner.z),
-      Eigen::Matrix<double, 3, 1>(req->bounding_box.max_corner.x,
-                                  req->bounding_box.max_corner.y,
-                                  req->bounding_box.max_corner.z),
-      tf2::transformToEigen(source_to_map_tf).matrix()));
+  try {
+    res->section.map =
+        m_vdb_map->gridToByteArray<VDBMapT::GridT>(m_vdb_map->getMapSectionGrid(
+            Eigen::Matrix<double, 3, 1>(req->bounding_box.min_corner.x,
+                                        req->bounding_box.min_corner.y,
+                                        req->bounding_box.min_corner.z),
+            Eigen::Matrix<double, 3, 1>(req->bounding_box.max_corner.x,
+                                        req->bounding_box.max_corner.y,
+                                        req->bounding_box.max_corner.z),
+            tf2::transformToEigen(source_to_map_tf).matrix()));
+  } catch (const std::exception &ex) {
+    RCLCPP_ERROR(this->get_logger(), "GetMapFullSection: extraction failed: %s",
+                 ex.what());
+    res->success = false;
+    return true;
+  }
+  if (res->section.map.empty()) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "GetMapFullSection: serialization failed or exceeded "
+                 "max_serialized_grid_bytes");
+    res->success = false;
+    return true;
+  }
   res->section.header.frame_id = m_map_frame;
   res->section.header.stamp    = this->now();
   res->success                 = true;
@@ -906,7 +1116,8 @@ bool VDBMappingROS2::batchRaytraceCallback(
       // dda.voxel() yields proper cell-centered indices.
       const openvdb::Vec3d origin_index =
         grid->worldToIndex(origin_world) + openvdb::Vec3d(0.5);
-      const openvdb::Vec3d dir_index = grid->worldToIndex(dir_world);
+      const openvdb::Vec3d dir_index =
+          grid->transform().baseMap()->applyInverseJacobian(dir_world);
 
       RayT ray(origin_index, dir_index, 0.0, 1.0);
       DDAT dda(ray);
@@ -946,41 +1157,58 @@ bool VDBMappingROS2::addArtificialAreasCallback(
   const std::shared_ptr<vdb_mapping_interfaces::srv::AddArtificialAreas::Response> res)
 {
   std::vector<std::vector<Eigen::Matrix<double, 4, 1>>> artificial_areas;
-  if (req->artificial_areas.size() > 0)
-  {
-    geometry_msgs::msg::TransformStamped source_to_map_tf;
+  if (req->artificial_areas.empty()) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "ArtificialArea: request contains no polygons");
+    res->success = false;
+    return true;
+  }
+
+  artificial_areas.reserve(req->artificial_areas.size());
+  for (const auto &artificial_area : req->artificial_areas) {
+    if (artificial_area.polygon.points.size() < 3) {
+      RCLCPP_ERROR(
+          this->get_logger(),
+          "ArtificialArea: every polygon must contain at least three points");
+      res->success = false;
+      return true;
+    }
+
+    Eigen::Matrix<double, 4, 4> transform =
+        Eigen::Matrix<double, 4, 4>::Identity();
     try
     {
-      // The request's own stamp is used for the lookup; callers that want the
-      // latest transform send a zero stamp, which tf2 treats as "latest
-      // available".
-      source_to_map_tf =
-        m_tf_buffer->lookupTransform(m_map_frame,
-                                     req->artificial_areas[0].header.frame_id,
-                                     rclcpp::Time(req->artificial_areas[0].header.stamp),
-                                     rclcpp::Duration::from_seconds(m_tf_lookup_timeout));
+      if (artificial_area.header.frame_id != m_map_frame) {
+        const auto source_to_map_tf = m_tf_buffer->lookupTransform(
+            m_map_frame, artificial_area.header.frame_id,
+            rclcpp::Time(artificial_area.header.stamp),
+            rclcpp::Duration::from_seconds(m_tf_lookup_timeout));
+        transform = tf2::transformToEigen(source_to_map_tf).matrix();
+      }
     }
     catch (tf2::TransformException& ex)
     {
       RCLCPP_ERROR(this->get_logger(),
                    "ArtificialArea: Could not transform %s to %s: %s",
-                   m_map_frame.c_str(),
-                   req->artificial_areas[0].header.frame_id.c_str(),
+                   artificial_area.header.frame_id.c_str(), m_map_frame.c_str(),
                    ex.what());
       res->success = false;
       return true;
     }
-    Eigen::Matrix<double, 4, 4> transform = tf2::transformToEigen(source_to_map_tf).matrix();
 
-    for (auto& artificial_area : req->artificial_areas)
-    {
-      std::vector<Eigen::Matrix<double, 4, 1>> area;
-      for (auto& p : artificial_area.polygon.points)
-      {
-        area.push_back(transform * Eigen::Matrix<double, 4, 1>(p.x, p.y, p.z, 1.0));
+    std::vector<Eigen::Matrix<double, 4, 1>> area;
+    area.reserve(artificial_area.polygon.points.size());
+    for (const auto &p : artificial_area.polygon.points) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+        RCLCPP_ERROR(this->get_logger(),
+                     "ArtificialArea: polygon point is not finite");
+        res->success = false;
+        return true;
       }
-      artificial_areas.push_back(area);
+      area.push_back(transform *
+                     Eigen::Matrix<double, 4, 1>(p.x, p.y, p.z, 1.0));
     }
+    artificial_areas.push_back(std::move(area));
   }
   m_vdb_map->addArtificialAreas(
     artificial_areas, m_artificial_negative_height, m_artificial_positive_height);
@@ -1038,19 +1266,30 @@ void VDBMappingROS2::sectionTimerCallback()
   }
   catch (tf2::TransformException& ex)
   {
-    RCLCPP_ERROR(this->get_logger(),
-                 "SectionTimer: Could not transform %s to %s: %s",
-                 m_map_frame.c_str(),
-                 m_section_update_frame.c_str(),
-                 ex.what());
+    RCLCPP_ERROR(
+        this->get_logger(), "SectionTimer: Could not transform %s to %s: %s",
+        m_section_update_frame.c_str(), m_map_frame.c_str(), ex.what());
     return;
   }
-  VDBMapT::UpdateGridT::Ptr section = m_vdb_map->getMapSectionUpdateGrid(
-    m_section_min_coord, m_section_max_coord, tf2::transformToEigen(map_to_robot_tf).matrix());
   vdb_mapping_interfaces::msg::UpdateGrid msg;
+  try {
+    VDBMapT::UpdateGridT::Ptr section = m_vdb_map->getMapSectionUpdateGrid(
+        m_section_min_coord, m_section_max_coord,
+        tf2::transformToEigen(map_to_robot_tf).matrix());
+    msg.map = m_vdb_map->gridToByteArray<VDBMapT::UpdateGridT>(section);
+  } catch (const std::exception &ex) {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                          "SectionTimer: extraction failed: %s", ex.what());
+    return;
+  }
+  if (msg.map.empty()) {
+    RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "SectionTimer: serialization failed or exceeded size limit");
+    return;
+  }
   msg.header.frame_id = m_map_frame;
-  msg.header.stamp    = map_to_robot_tf.header.stamp;
-  msg.map             = m_vdb_map->gridToByteArray<VDBMapT::UpdateGridT>(section);
+  msg.header.stamp = map_to_robot_tf.header.stamp;
   m_map_section_pub->publish(msg);
 }
 
@@ -1069,18 +1308,30 @@ void VDBMappingROS2::fullSectionTimerCallback()
   {
     RCLCPP_ERROR(this->get_logger(),
                  "FullSectionTimer: Could not transform %s to %s: %s",
-                 m_map_frame.c_str(),
-                 m_section_update_frame.c_str(),
+                 m_section_update_frame.c_str(), m_map_frame.c_str(),
                  ex.what());
     return;
   }
 
-  VDBMapT::GridT::Ptr section = m_vdb_map->getMapSectionGrid(
-    m_section_min_coord, m_section_max_coord, tf2::transformToEigen(map_to_robot_tf).matrix());
   vdb_mapping_interfaces::msg::UpdateGrid msg;
+  try {
+    VDBMapT::GridT::Ptr section = m_vdb_map->getMapSectionGrid(
+        m_section_min_coord, m_section_max_coord,
+        tf2::transformToEigen(map_to_robot_tf).matrix());
+    msg.map = m_vdb_map->gridToByteArray<VDBMapT::GridT>(section);
+  } catch (const std::exception &ex) {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                          "FullSectionTimer: extraction failed: %s", ex.what());
+    return;
+  }
+  if (msg.map.empty()) {
+    RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "FullSectionTimer: serialization failed or exceeded size limit");
+    return;
+  }
   msg.header.frame_id = m_map_frame;
-  msg.header.stamp    = map_to_robot_tf.header.stamp;
-  msg.map             = m_vdb_map->gridToByteArray<VDBMapT::GridT>(section);
+  msg.header.stamp = map_to_robot_tf.header.stamp;
   m_map_full_section_pub->publish(msg);
 }
 
@@ -1091,8 +1342,13 @@ void VDBMappingROS2::setUpVDBMap()
   this->declare_parameter<double>("accumulation_period", 1);
   this->get_parameter("accumulation_period", m_config.accumulation_period);
   this->declare_parameter<double>("resolution", 0.05);
-  this->get_parameter("resolution", m_resolution);
-  m_vdb_map = std::make_shared<VDBMapT>(m_resolution);
+  double resolution = 0.05;
+  this->get_parameter("resolution", resolution);
+  if (!std::isfinite(resolution) || resolution <= 0.0) {
+    throw std::invalid_argument("resolution must be finite and positive");
+  }
+  m_resolution.store(resolution, std::memory_order_release);
+  m_vdb_map = std::make_shared<VDBMapT>(resolution);
   trySetLogCallback(*m_vdb_map, this->get_logger(), 0);
   // The generic library deliberately has no ROS dependency. Supply the node
   // clock here so its deadlines follow /clock during replay and ordinary ROS
@@ -1126,6 +1382,19 @@ void VDBMappingROS2::setUpVDBMap()
   this->get_parameter("prob_clamp_max", m_config.prob_clamp_max);
   this->declare_parameter<std::string>("map_directory_path", "");
   this->get_parameter("map_directory_path", m_config.map_directory_path);
+  const int64_t max_serialized_grid_bytes = this->declare_parameter<int64_t>(
+      "max_serialized_grid_bytes", 512LL * 1024LL * 1024LL);
+  if (max_serialized_grid_bytes <= 0) {
+    throw std::invalid_argument("max_serialized_grid_bytes must be positive");
+  }
+  m_config.max_serialized_grid_bytes =
+      static_cast<std::size_t>(max_serialized_grid_bytes);
+  const int64_t max_section_voxels =
+      this->declare_parameter<int64_t>("max_section_voxels", 50'000'000);
+  if (max_section_voxels <= 0) {
+    throw std::invalid_argument("max_section_voxels must be positive");
+  }
+  m_max_section_voxels = static_cast<std::size_t>(max_section_voxels);
   this->declare_parameter<int>("two_dim_projection_threshold", 5);
   this->get_parameter("two_dim_projection_threshold", m_two_dim_projection_threshold);
   this->declare_parameter<double>("tf_lookup_timeout", 0.1);
@@ -1140,12 +1409,17 @@ void VDBMappingROS2::setUpVDBMap()
   this->get_parameter("input_queue_depth", m_input_queue_depth);
   this->declare_parameter<bool>("force_reliable_input", false);
   this->get_parameter("force_reliable_input", m_force_reliable_input);
-  m_time_rewind_tolerance = std::max(0.0, m_time_rewind_tolerance);
-  m_input_queue_depth = std::max(1, m_input_queue_depth);
+  if (!std::isfinite(m_time_rewind_tolerance) ||
+      m_time_rewind_tolerance < 0.0) {
+    throw std::invalid_argument(
+        "time_rewind_tolerance must be finite and nonnegative");
+  }
+  if (m_input_queue_depth <= 0) {
+    throw std::invalid_argument("input_queue_depth must be positive");
+  }
   this->declare_parameter<double>("max_raytrace_length", 1000.0);
   this->get_parameter("max_raytrace_length", m_max_raytrace_length);
-  if (m_max_raytrace_length <= 0.0)
-  {
+  if (!std::isfinite(m_max_raytrace_length) || m_max_raytrace_length <= 0.0) {
     RCLCPP_WARN(this->get_logger(),
                 "max_raytrace_length must be positive; falling back to 1000 m");
     m_max_raytrace_length = 1000.0;
@@ -1159,23 +1433,35 @@ void VDBMappingROS2::setUpVDBMap()
   this->get_parameter("artificial_negative_height", m_artificial_negative_height);
   this->declare_parameter<double>("artificial_positive_height", 1.5);
   this->get_parameter("artificial_positive_height", m_artificial_positive_height);
+  if (!std::isfinite(m_tf_lookup_timeout) || m_tf_lookup_timeout < 0.0) {
+    throw std::invalid_argument(
+        "tf_lookup_timeout must be finite and nonnegative");
+  }
+  if (m_remote_section_smoothing_iterations < 0) {
+    throw std::invalid_argument(
+        "remote_section_smoothing_iterations must be nonnegative");
+  }
+  if (!std::isfinite(m_artificial_negative_height) ||
+      !std::isfinite(m_artificial_positive_height) ||
+      m_artificial_negative_height >= m_artificial_positive_height) {
+    throw std::invalid_argument(
+        "artificial height limits must be finite and negative < positive");
+  }
 
   if (!m_vdb_map->setConfig(m_config))
   {
     // A rejected config means the map integrates NOTHING (one error per
     // cloud). Say so once, loudly, at the moment the yaml can still be
     // correlated with the failure.
-    RCLCPP_FATAL(this->get_logger(),
-                 "vdb_mapping config REJECTED (see library log above) — the "
-                 "node will run but integrate no clouds until the parameters "
-                 "are fixed");
+    throw std::invalid_argument(
+        "vdb_mapping rejected its parameter configuration");
   }
 
   this->declare_parameter<std::string>("map_frame", "");
   this->get_parameter("map_frame", m_map_frame);
   if (m_map_frame.empty())
   {
-    RCLCPP_WARN(this->get_logger(), "No map frame specified");
+    throw std::invalid_argument("map_frame must not be empty");
   }
   // getGrid() takes the map mutex internally — fetch the handle BEFORE
   // locking (locking first recursively acquires the non-recursive
@@ -1189,7 +1475,7 @@ void VDBMappingROS2::setUpVDBMap()
   this->get_parameter("robot_frame", m_robot_frame);
   if (m_robot_frame.empty())
   {
-    RCLCPP_WARN(this->get_logger(), "No robot frame specified");
+    throw std::invalid_argument("robot_frame must not be empty");
   }
 }
 
@@ -1212,6 +1498,13 @@ void VDBMappingROS2::setUpLocalSources()
   std::vector<std::string> source_ids;
   this->declare_parameter<std::vector<std::string>>("sources", std::vector<std::string>());
   this->get_parameter("sources", source_ids);
+
+  std::unordered_set<std::string> unique_source_ids;
+  for (const auto &source_id : source_ids) {
+    if (source_id.empty() || !unique_source_ids.insert(source_id).second) {
+      throw std::invalid_argument("sources must contain unique, non-empty IDs");
+    }
+  }
 
   // The subscriptions created in pass 2 capture references to elements of
   // m_sensor_sources, so the vector must not be modified after that point.
@@ -1246,9 +1539,30 @@ void VDBMappingROS2::setUpLocalSources()
 
     if (sensor_source.topic.empty())
     {
-      RCLCPP_ERROR_STREAM(this->get_logger(),
-                          "No input topic specified for source: " << source_id);
-      continue;
+      throw std::invalid_argument("no input topic specified for source " +
+                                  source_id);
+    }
+    if (!std::isfinite(sensor_source.max_range) ||
+        sensor_source.max_range < 0.0) {
+      throw std::invalid_argument(source_id +
+                                  ".max_range must be finite and nonnegative");
+    }
+    if (!std::isfinite(sensor_source.max_rate) ||
+        sensor_source.max_rate < 0.0) {
+      throw std::invalid_argument(source_id +
+                                  ".max_rate must be finite and nonnegative");
+    }
+    if (!std::isfinite(sensor_source.prob_hit) ||
+        (sensor_source.prob_hit > 0.0 &&
+         (sensor_source.prob_hit < 0.5 || sensor_source.prob_hit >= 1.0))) {
+      throw std::invalid_argument(
+          source_id + ".prob_hit must be nonpositive (inherit) or in [0.5, 1)");
+    }
+    if (!std::isfinite(sensor_source.prob_miss) ||
+        (sensor_source.prob_miss > 0.0 && sensor_source.prob_miss > 0.5)) {
+      throw std::invalid_argument(
+          source_id +
+          ".prob_miss must be nonpositive (inherit) or in (0, 0.5]");
     }
     RCLCPP_INFO_STREAM(this->get_logger(), "Topic: " << sensor_source.topic);
     if (sensor_source.sensor_origin_frame.empty())
@@ -1310,6 +1624,16 @@ void VDBMappingROS2::setUpRemoteSources()
   this->declare_parameter<std::vector<std::string>>("remote_sources", std::vector<std::string>());
   this->get_parameter("remote_sources", source_ids);
 
+  std::unordered_set<std::string> unique_source_ids;
+  for (const auto &source_id : source_ids) {
+    if (source_id.empty() || !unique_source_ids.insert(source_id).second) {
+      throw std::invalid_argument(
+          "remote_sources must contain unique, non-empty IDs");
+    }
+  }
+
+  rclcpp::SubscriptionOptions subscription_options;
+  subscription_options.callback_group = m_remote_cb_group;
   for (auto& source_id : source_ids)
   {
     RCLCPP_INFO_STREAM(this->get_logger(), "Setting up remote source: " << source_id);
@@ -1340,26 +1664,26 @@ void VDBMappingROS2::setUpRemoteSources()
     if (remote_source->apply_remote_sections)
     {
       remote_source->map_section_sub =
-        this->create_subscription<vdb_mapping_interfaces::msg::UpdateGrid>(
-          remote_namespace + "/vdb_map_sections",
-          rclcpp::QoS(10).durability_volatile().best_effort(),
-          [this, remote_source](
-            const vdb_mapping_interfaces::msg::UpdateGrid::SharedPtr msg) {
-            mapSectionCallback(msg, remote_source);
-          });
+          this->create_subscription<vdb_mapping_interfaces::msg::UpdateGrid>(
+              remote_namespace + "/vdb_map_sections",
+              rclcpp::QoS(10).durability_volatile().best_effort(),
+              [this, remote_source](
+                  const vdb_mapping_interfaces::msg::UpdateGrid::SharedPtr
+                      msg) { mapSectionCallback(msg, remote_source); },
+              subscription_options);
       RCLCPP_INFO_STREAM(this->get_logger(),
                          "Subscribing to Section: " << remote_namespace + "/vdb_map_sections");
     }
     if (remote_source->apply_remote_full_sections)
     {
       remote_source->map_full_section_sub =
-        this->create_subscription<vdb_mapping_interfaces::msg::UpdateGrid>(
-          remote_namespace + "/vdb_map_full_sections",
-          rclcpp::QoS(10).durability_volatile().best_effort(),
-          [this, remote_source](
-            const vdb_mapping_interfaces::msg::UpdateGrid::SharedPtr msg) {
-            mapFullSectionCallback(msg, remote_source);
-          });
+          this->create_subscription<vdb_mapping_interfaces::msg::UpdateGrid>(
+              remote_namespace + "/vdb_map_full_sections",
+              rclcpp::QoS(10).durability_volatile().best_effort(),
+              [this, remote_source](
+                  const vdb_mapping_interfaces::msg::UpdateGrid::SharedPtr
+                      msg) { mapFullSectionCallback(msg, remote_source); },
+              subscription_options);
       RCLCPP_INFO_STREAM(this->get_logger(),
                          "Subscribing to Full Section: " << remote_namespace +
                                                               "/vdb_map_full_sections");
@@ -1367,14 +1691,16 @@ void VDBMappingROS2::setUpRemoteSources()
     if (remote_source->apply_remote_sections)
     {
       remote_source->get_map_section_client =
-        this->create_client<vdb_mapping_interfaces::srv::GetMapSection>(remote_namespace +
-                                                                        "/get_map_section");
+          this->create_client<vdb_mapping_interfaces::srv::GetMapSection>(
+              remote_namespace + "/get_map_section", rclcpp::ServicesQoS(),
+              m_remote_cb_group);
     }
     if (remote_source->apply_remote_full_sections)
     {
       remote_source->get_map_full_section_client =
-        this->create_client<vdb_mapping_interfaces::srv::GetMapSection>(remote_namespace +
-                                                                        "/get_map_full_section");
+          this->create_client<vdb_mapping_interfaces::srv::GetMapSection>(
+              remote_namespace + "/get_map_full_section", rclcpp::ServicesQoS(),
+              m_remote_cb_group);
     }
     m_remote_sources.insert(std::make_pair(source_id, remote_source));
   }
@@ -1406,12 +1732,15 @@ void VDBMappingROS2::setUpVisualization()
   double visualization_rate;
   this->declare_parameter<double>("visualization_rate", 1.0);
   this->get_parameter("visualization_rate", visualization_rate);
+  if (!std::isfinite(visualization_rate)) {
+    throw std::invalid_argument("visualization_rate must be finite");
+  }
   if (visualization_rate > 0.0)
   {
     m_visualization_timer = this->create_timer(
-      std::chrono::milliseconds(std::max(1, (int)(1000.0 / visualization_rate))),
-      std::bind(&VDBMappingROS2::visualizationTimerCallback, this),
-      m_visualization_cb_group);
+        periodFromRate(visualization_rate, "visualization_rate"),
+        std::bind(&VDBMappingROS2::visualizationTimerCallback, this),
+        m_visualization_cb_group);
   }
 }
 
@@ -1478,18 +1807,20 @@ void VDBMappingROS2::setUpPublishers()
 
   if (m_publish_pointcloud)
   {
-    m_pointcloud_pub =
-      this->create_publisher<sensor_msgs::msg::PointCloud2>("~/vdb_map_pointcloud", 1);
+    m_pointcloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "~/vdb_map_pointcloud", rclcpp::QoS(1).reliable().transient_local());
   }
   if (m_publish_vis_marker)
   {
     m_visualization_marker_pub =
-      this->create_publisher<visualization_msgs::msg::Marker>("~/vdb_map_visualization", 1);
+        this->create_publisher<visualization_msgs::msg::Marker>(
+            "~/vdb_map_visualization",
+            rclcpp::QoS(1).reliable().transient_local());
   }
   if (m_publish_occupancy_grid)
   {
-    m_occupancy_grid_pub =
-      this->create_publisher<nav_msgs::msg::OccupancyGrid>("~/vdb_map_occupancy", 1);
+    m_occupancy_grid_pub = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
+        "~/vdb_map_occupancy", rclcpp::QoS(1).reliable().transient_local());
   }
 
   // section_update.* params are shared between the sparse and full section
@@ -1515,15 +1846,31 @@ void VDBMappingROS2::setUpPublishers()
     this->get_parameter("section_update.frame", m_section_update_frame);
   }
 
-  if ((m_publish_sections || m_publish_full_sections) && section_update_rate <= 0.0)
-  {
-    RCLCPP_WARN(this->get_logger(),
-                "section_update.rate must be positive; section publishing disabled");
-    m_publish_sections      = false;
-    m_publish_full_sections = false;
+  if ((m_publish_sections || m_publish_full_sections) &&
+      (!std::isfinite(section_update_rate) || section_update_rate <= 0.0)) {
+    throw std::invalid_argument(
+        "section_update.rate must be finite and positive");
   }
-  auto section_update_period = std::chrono::milliseconds(
-    section_update_rate > 0.0 ? std::max(1, (int)(1000.0 / section_update_rate)) : 1);
+  if (m_publish_sections || m_publish_full_sections) {
+    vdb_mapping_interfaces::msg::BoundingBox bounds;
+    bounds.min_corner.x = m_section_min_coord.x();
+    bounds.min_corner.y = m_section_min_coord.y();
+    bounds.min_corner.z = m_section_min_coord.z();
+    bounds.max_corner.x = m_section_max_coord.x();
+    bounds.max_corner.y = m_section_max_coord.y();
+    bounds.max_corner.z = m_section_max_coord.z();
+    std::string bounds_error;
+    if (!validateSectionBounds(bounds,
+                               m_resolution.load(std::memory_order_acquire),
+                               m_max_section_voxels, bounds_error)) {
+      throw std::invalid_argument("section_update bounds invalid: " +
+                                  bounds_error);
+    }
+  }
+  const auto section_update_period =
+      (m_publish_sections || m_publish_full_sections)
+          ? periodFromRate(section_update_rate, "section_update.rate")
+          : std::chrono::milliseconds(1);
 
   if (m_publish_sections)
   {
@@ -1559,8 +1906,12 @@ void VDBMappingROS2::setUpMapServer()
   if (!initial_map_file.empty())
   {
     RCLCPP_INFO_STREAM(this->get_logger(), "Loading initial Map " << initial_map_file);
-    m_vdb_map->loadMapFromPCD(initial_map_file, set_background, clear_map);
-    publishMap();
+    if (!m_vdb_map->loadMapFromPCD(initial_map_file, set_background,
+                                   clear_map)) {
+      throw std::runtime_error("failed to load initial map from " +
+                               initial_map_file);
+    }
+    publishMap(true);
   }
 }
 

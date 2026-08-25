@@ -102,7 +102,7 @@ public:
 
   void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg,
                      const SensorSource& sensor_source);
-  void publishMap() const;
+  void publishMap(bool force = false) const;
 
   void mapSectionCallback(const vdb_mapping_interfaces::msg::UpdateGrid::SharedPtr update_msg,
                           const std::shared_ptr<RemoteSource>& remote_source);
@@ -197,7 +197,9 @@ private:
   std::unique_ptr<tf2_ros::Buffer> m_tf_buffer;
   std::shared_ptr<tf2_ros::TransformListener> m_tf_listener{nullptr};
 
-  double m_resolution;
+  // load_map may adopt the serialized grid's resolution while the
+  // visualization callback is running in a different callback group.
+  std::atomic<double> m_resolution{0.05};
   std::string m_map_frame;
   std::string m_robot_frame;
   std::shared_ptr<VDBMapT> m_vdb_map;
@@ -225,6 +227,7 @@ private:
   // guaranteed to be delivered in lockstep, especially during replay.
   std::map<std::string, int64_t> m_last_input_stamp_ns;
   int m_remote_section_smoothing_iterations;
+  std::size_t m_max_section_voxels{50'000'000};
 
   std::map<std::string, std::shared_ptr<RemoteSource>> m_remote_sources;
 

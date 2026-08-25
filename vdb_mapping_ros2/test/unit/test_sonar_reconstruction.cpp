@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include <vdb_mapping_ros2/sonar_reconstruction.hpp>
 
@@ -75,6 +76,21 @@ TEST(SonarReconstruction, UncappedRibbonHonoursResolutionAtHfAndLfRange)
   {
     EXPECT_LE((samples[i] - samples[i - 1]).norm(), 0.1F + 1e-5F);
   }
+}
+
+TEST(SonarReconstruction, RibbonSampleCountRejectsNonFiniteAndCapsWork) {
+  const float inf = std::numeric_limits<float>::infinity();
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_EQ(vdb_mapping_ros2::elevationRibbonSampleCount(inf, 0.1F, 0.1F, 0),
+            1);
+  EXPECT_EQ(vdb_mapping_ros2::elevationRibbonSampleCount(1.0F, nan, 0.1F, 0),
+            1);
+  EXPECT_EQ(vdb_mapping_ros2::elevationRibbonSampleCount(1.0F, 0.1F, nan, 0),
+            1);
+  const int bounded =
+      vdb_mapping_ros2::elevationRibbonSampleCount(1.0e20F, 1.0F, 1.0e-20F, 0);
+  EXPECT_EQ(bounded, 100001);
+  EXPECT_EQ(bounded % 2, 1);
 }
 
 TEST(SonarReconstruction, TransformMovesPointsAndOriginsButOnlyRotatesAxes)

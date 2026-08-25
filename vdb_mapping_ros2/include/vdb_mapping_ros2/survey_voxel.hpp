@@ -73,8 +73,7 @@ inline uint64_t surveyVoxelKey(const float x, const float y, const float z, cons
 inline pcl::PointCloud<SurveyPoint>::Ptr
 voxelReduceSurvey(const pcl::PointCloud<SurveyPoint>::Ptr& in, const float leaf)
 {
-  if (!in || in->empty() || leaf <= 0.0F)
-  {
+  if (!in || in->empty() || !std::isfinite(leaf) || leaf <= 0.0F) {
     return in;
   }
   struct Acc
@@ -88,8 +87,8 @@ voxelReduceSurvey(const pcl::PointCloud<SurveyPoint>::Ptr& in, const float leaf)
   cells.reserve(in->size());
   for (const auto& p : in->points)
   {
-    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
-    {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+        !std::isfinite(p.intensity) || !std::isfinite(p.range)) {
       continue;
     }
     Acc& a = cells[surveyVoxelKey(p.x, p.y, p.z, leaf)];

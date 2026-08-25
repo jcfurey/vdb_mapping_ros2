@@ -46,6 +46,7 @@
 #include <ctime>
 #include <deque>
 #include <filesystem>
+#include <initializer_list>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -211,6 +212,68 @@ namespace vdb_mapping_ros2 {
 constexpr std::size_t kSurveyOutputFields = 13;
 using SurveyRow = std::array<float, kSurveyOutputFields>;
 
+bool pointCloudLayoutValid(
+    const sensor_msgs::msg::PointCloud2 &msg,
+    const std::initializer_list<const char *> required_fields,
+    std::string &error) {
+  if (msg.width == 0) {
+    // sensor_msgs conventionally represents an empty unorganized cloud as
+    // width=0, height=1.  Accept both that form and width=height=0, but never
+    // allow a nominally empty layout to hide a non-empty payload.
+    if (!msg.data.empty()) {
+      error = "a zero-width cloud must have an empty data buffer";
+      return false;
+    }
+    return true;
+  }
+  if (msg.height == 0) {
+    error = "a non-empty cloud must have nonzero height";
+    return false;
+  }
+  const std::uint64_t row_bytes =
+      static_cast<std::uint64_t>(msg.width) * msg.point_step;
+  if (msg.point_step == 0 || row_bytes > msg.row_step) {
+    error = "row_step is smaller than width * point_step";
+    return false;
+  }
+  if (msg.height > 1 &&
+      static_cast<std::uint64_t>(msg.height - 1) >
+          (std::numeric_limits<std::uint64_t>::max() - row_bytes) /
+              msg.row_step) {
+    error = "declared cloud byte extent overflows";
+    return false;
+  }
+  const std::uint64_t required_bytes =
+      static_cast<std::uint64_t>(msg.height - 1) * msg.row_step + row_bytes;
+  if (required_bytes > msg.data.size()) {
+    error = "data buffer is smaller than the declared cloud extent";
+    return false;
+  }
+  for (const char *name : required_fields) {
+    const sensor_msgs::msg::PointField *match = nullptr;
+    for (const auto &field : msg.fields) {
+      if (field.name == name) {
+        if (match != nullptr) {
+          error = std::string("duplicate field '") + name + "'";
+          return false;
+        }
+        match = &field;
+      }
+    }
+    if (match == nullptr) {
+      error = std::string("missing field '") + name + "'";
+      return false;
+    }
+    if (match->datatype != sensor_msgs::msg::PointField::FLOAT32 ||
+        match->count < 1 || match->offset + sizeof(float) > msg.point_step) {
+      error = std::string("field '") + name +
+              "' must be a FLOAT32 lying within point_step";
+      return false;
+    }
+  }
+  return true;
+}
+
 struct NavigationRow
 {
   float x = 0.0F;
@@ -326,7 +389,7 @@ public:
     declare_parameter<double>("stamp_tolerance", 0.06);
     declare_parameter<int>("input_queue_depth", 5);
     declare_parameter<bool>("input_reliable", false);
-    declare_parameter<bool>("allow_latest_tf_fallback", true);
+    declare_parameter<bool>("allow_latest_tf_fallback", false);
     declare_parameter<double>("tf_buffer_duration", 10.0);
     declare_parameter<bool>("reset_on_time_rewind", true);
     declare_parameter<double>("time_rewind_tolerance", 0.5);
@@ -365,9 +428,36 @@ public:
     get_parameter("tf_buffer_duration", m_tf_buffer_duration);
     get_parameter("reset_on_time_rewind", m_reset_on_time_rewind);
     get_parameter("time_rewind_tolerance", m_time_rewind_tolerance);
-    m_input_queue_depth = std::max(1, m_input_queue_depth);
-    m_tf_buffer_duration = std::max(0.1, m_tf_buffer_duration);
-    m_time_rewind_tolerance = std::max(0.0, m_time_rewind_tolerance);
+    auto require_finite_nonnegative = [](const char *name, const double value) {
+      if (!std::isfinite(value) || value < 0.0) {
+        throw std::invalid_argument(std::string(name) +
+                                    " must be finite and nonnegative");
+      }
+    };
+    auto require_finite_positive = [](const char *name, const double value) {
+      if (!std::isfinite(value) || value <= 0.0) {
+        throw std::invalid_argument(std::string(name) +
+                                    " must be finite and positive");
+      }
+    };
+    auto require_unit_interval = [](const char *name, const double value) {
+      if (!std::isfinite(value) || value < 0.0 || value > 1.0) {
+        throw std::invalid_argument(std::string(name) +
+                                    " must be within [0, 1]");
+      }
+    };
+    require_finite_positive("resolution", m_resolution);
+    require_finite_nonnegative("buffer_seconds", m_buffer_seconds);
+    require_finite_nonnegative("stamp_tolerance", m_stamp_tolerance);
+    require_finite_positive("tf_buffer_duration", m_tf_buffer_duration);
+    require_finite_nonnegative("time_rewind_tolerance",
+                               m_time_rewind_tolerance);
+    if (m_input_queue_depth <= 0) {
+      throw std::invalid_argument("input_queue_depth must be positive");
+    }
+    if (m_map_frame.empty() || m_robot_frame.empty()) {
+      throw std::invalid_argument("map_frame and robot_frame must be nonempty");
+    }
     get_parameter("render_min_period", m_render_min_period);
     get_parameter("pose_epsilon_xy", m_pose_eps_xy);
     get_parameter("pose_epsilon_yaw", m_pose_eps_yaw);
@@ -395,6 +485,36 @@ public:
     get_parameter("surfel_max_surface_variation",
                   m_surfel_max_surface_variation);
     get_parameter("surfel_max_projection", m_surfel_max_projection);
+    require_finite_nonnegative("render_min_period", m_render_min_period);
+    require_finite_nonnegative("pose_epsilon_xy", m_pose_eps_xy);
+    require_finite_nonnegative("pose_epsilon_yaw", m_pose_eps_yaw);
+    require_finite_nonnegative("pose_epsilon_z", m_pose_eps_z);
+    require_finite_positive("survey_resolution", m_survey_resolution);
+    require_finite_positive("survey_support_resolution",
+                            m_survey_support_resolution);
+    require_finite_positive("tile_resolution", m_tile_resolution);
+    require_finite_positive("surface_resolution", m_surface_resolution);
+    require_finite_nonnegative("surface_min_view_span_deg",
+                               m_surface_min_view_span_deg);
+    require_unit_interval("surface_min_return_intensity",
+                          m_surface_min_return_intensity);
+    require_unit_interval("surface_min_confidence", m_surface_min_confidence);
+    require_unit_interval("navigation_min_confidence",
+                          m_navigation_min_confidence);
+    require_unit_interval("navigation_min_intensity",
+                          m_navigation_min_intensity);
+    require_unit_interval("navigation_unresolved_confidence_scale",
+                          m_navigation_unresolved_confidence_scale);
+    require_finite_positive("surfel_radius_m", m_surfel_radius_m);
+    require_unit_interval("surfel_max_surface_variation",
+                          m_surfel_max_surface_variation);
+    require_finite_nonnegative("surfel_max_projection",
+                               m_surfel_max_projection);
+    if (m_two_dim_projection_threshold <= 0 || m_survey_min_support <= 0 ||
+        m_surface_min_observations <= 0 || m_surfel_min_neighbors <= 0) {
+      throw std::invalid_argument(
+          "projection/support/observation/neighbor counts must be positive");
+    }
     {
       std::string mode;
       get_parameter("global_occupancy_mode", mode);
@@ -417,13 +537,8 @@ public:
           mode + "'");
       }
     }
-    m_tile_resolution = std::max(1e-3, m_tile_resolution);
-    m_survey_resolution = std::max(1e-3, m_survey_resolution);
     m_survey_support_resolution =
-      std::max(m_survey_resolution, m_survey_support_resolution);
-    m_survey_min_support = std::max(1, m_survey_min_support);
-    m_surface_resolution = std::max(1e-3, m_surface_resolution);
-    m_surface_min_observations = std::max(1, m_surface_min_observations);
+        std::max(m_survey_resolution, m_survey_support_resolution);
     // Zero is the quality-first mode: sample every elevation ribbon densely
     // enough for surface_resolution at the measured range. A positive cap is
     // an explicit compute trade, but values 1/2 cannot retain both aperture
@@ -439,27 +554,15 @@ public:
         std::max(3, m_surface_max_samples_per_return);
     }
     m_surface_peak_radius_voxels = std::max(0, m_surface_peak_radius_voxels);
-    m_surface_min_return_intensity = std::clamp(
-      m_surface_min_return_intensity, 0.0, 1.0);
-    m_surface_min_confidence = std::clamp(
-      m_surface_min_confidence, 0.0, 1.0);
-    m_navigation_min_confidence = std::clamp(
-      m_navigation_min_confidence, 0.0, 1.0);
-    m_navigation_min_intensity = std::clamp(
-      m_navigation_min_intensity, 0.0, 1.0);
-    m_navigation_unresolved_confidence_scale = std::clamp(
-      m_navigation_unresolved_confidence_scale, 0.0, 1.0);
-    m_surfel_radius_m = std::max(1e-3, m_surfel_radius_m);
-    m_surfel_min_neighbors = std::max(1, m_surfel_min_neighbors);
-    m_surfel_max_surface_variation = std::clamp(
-      m_surfel_max_surface_variation, 1e-6, 1.0);
-    m_surfel_max_projection = std::max(0.0, m_surfel_max_projection);
     m_surface_accumulator = std::make_unique<MultiViewSurfaceAccumulator>(
       static_cast<float>(m_surface_resolution), m_surface_min_observations,
       static_cast<float>(std::max(0.0, m_surface_min_view_span_deg) * M_PI / 180.0),
       m_surface_max_samples_per_return, m_surface_peak_radius_voxels,
       static_cast<float>(m_surface_min_return_intensity));
     get_parameter("odom_frame", m_odom_frame);
+    if (m_odom_frame.empty()) {
+      throw std::invalid_argument("odom_frame must be nonempty");
+    }
     get_parameter("export_path", m_export_path);
     get_parameter("export_on_shutdown", m_export_on_shutdown);
     get_parameter("navigation_export_path", m_navigation_export_path);
@@ -482,10 +585,9 @@ public:
     cfg.map_directory_path  = "";
     cfg.fast_mode           = false;  // batch re-render: DDA is fine and simplest
     cfg.accumulation_period = 1.0;
-    if (!m_map->setConfig(cfg))
-      RCLCPP_FATAL(get_logger(),
-                   "assembler map config REJECTED — re-renders will produce "
-                   "empty maps until the parameters are fixed");
+    if (!m_map->setConfig(cfg)) {
+      throw std::invalid_argument("assembler map configuration was rejected");
+    }
     const auto ros_clock = get_clock();
     m_map->setTimeCallback([ros_clock]() -> uint64_t {
       return static_cast<uint64_t>(
@@ -515,9 +617,9 @@ public:
     get_parameter("hits_topic", hits_topic);
     get_parameter("clear_topic", clear_topic);
     get_parameter("traj_topic", traj_topic);
-    if (hits_topic.empty() || clear_topic.empty())
-    {
-      RCLCPP_ERROR(get_logger(), "hits_topic / clear_topic must be set");
+    if (hits_topic.empty() || clear_topic.empty() || traj_topic.empty()) {
+      throw std::invalid_argument(
+          "hits_topic, clear_topic, and traj_topic must all be set");
     }
 
     auto qos = rclcpp::QoS(
@@ -759,6 +861,7 @@ private:
     SurveyCloudPtrT survey;
     ReconstructionCloudPtrT tile;
     ReconstructionCloudPtrT reconstruction;
+    bool complete = true;
   };
 
   struct BufferedSurvey
@@ -812,20 +915,47 @@ private:
     sub << "run_" << std::put_time(&tm_buf, "%Y%m%d_%H%M%S")
         << "_seg" << std::setw(3) << std::setfill('0') << m_replay_segment;
 
-    const std::filesystem::path root = std::filesystem::path(dir) / sub.str();
+    const std::filesystem::path base(dir);
     std::error_code ec;
-    std::filesystem::create_directories(root, ec);
+    std::filesystem::create_directories(base, ec);
     if (ec)
     {
       RCLCPP_ERROR(get_logger(),
                    "Cannot create spill directory %s (%s); keeping evidence in "
                    "RAM instead.",
-                   root.string().c_str(), ec.message().c_str());
+                   base.string().c_str(), ec.message().c_str());
       return;
     }
-    m_spill_dir = root.string();
-    RCLCPP_INFO(get_logger(), "Spilling keyframe evidence to %s",
-                m_spill_dir.c_str());
+    // create_directory is an atomic claim: if two nodes start in the same
+    // second (or a prior run already owns the timestamp), select a suffix
+    // instead of reopening and overwriting that survey's keyframe files.
+    for (std::size_t suffix = 0; suffix < 10000; ++suffix) {
+      std::ostringstream unique_name;
+      unique_name << sub.str();
+      if (suffix > 0) {
+        unique_name << '_' << std::setw(4) << std::setfill('0') << suffix;
+      }
+      const std::filesystem::path candidate = base / unique_name.str();
+      ec.clear();
+      if (std::filesystem::create_directory(candidate, ec)) {
+        m_spill_dir = candidate.string();
+        RCLCPP_INFO(get_logger(), "Spilling keyframe evidence to %s",
+                    m_spill_dir.c_str());
+        return;
+      }
+      if (ec) {
+        RCLCPP_ERROR(
+            get_logger(),
+            "Cannot create spill directory %s (%s); keeping evidence in "
+            "RAM instead.",
+            candidate.string().c_str(), ec.message().c_str());
+        return;
+      }
+    }
+    RCLCPP_ERROR(
+        get_logger(),
+        "Cannot allocate a unique spill run below %s; keeping evidence in RAM",
+        base.string().c_str());
   }
 
   static std::string spillPath(
@@ -853,6 +983,7 @@ private:
     cloud->width    = static_cast<uint32_t>(cloud->size());
     cloud->height   = 1;
     cloud->is_dense = false;
+    const std::string temporary_path = path + ".part";
     try
     {
       pcl::PCDWriter writer;
@@ -861,18 +992,30 @@ private:
       // fields). PCL's binary-compressed encoding is lossless and is read
       // transparently by PCDReader, so it preserves the tile product while
       // substantially reducing long-survey disk bandwidth and capacity.
-      const int status = compressed
-        ? writer.writeBinaryCompressed(path, *cloud)
-        : writer.writeBinary(path, *cloud);
+      const int status =
+          compressed ? writer.writeBinaryCompressed(temporary_path, *cloud)
+                     : writer.writeBinary(temporary_path, *cloud);
       if (status == 0)
       {
-        return true;
+        std::error_code ec;
+        std::filesystem::rename(temporary_path, path, ec);
+        if (!ec) {
+          return true;
+        }
+        RCLCPP_ERROR(get_logger(), "spill commit %s failed: %s", path.c_str(),
+                     ec.message().c_str());
+        std::filesystem::remove(temporary_path, ec);
+        return false;
       }
+      std::error_code ec;
+      std::filesystem::remove(temporary_path, ec);
     }
     catch (const std::exception& e)
     {
       RCLCPP_ERROR(get_logger(), "spill write %s failed: %s", path.c_str(),
                    e.what());
+      std::error_code ec;
+      std::filesystem::remove(temporary_path, ec);
       return false;
     }
     RCLCPP_ERROR(get_logger(), "spill write %s failed", path.c_str());
@@ -880,27 +1023,31 @@ private:
   }
 
   template <typename CloudTT>
-  typename CloudTT::Ptr readSpill(const std::string& path)
-  {
+  typename CloudTT::Ptr readSpill(const std::string &path,
+                                  const std::size_t expected_size) {
     typename CloudTT::Ptr out(new CloudTT);
     try
     {
       pcl::PCDReader reader;
       if (reader.read(path, *out) == 0)
       {
-        return out;
+        if (out->size() == expected_size) {
+          return out;
+        }
+        RCLCPP_ERROR(get_logger(),
+                     "spill read %s returned %zu points; expected %zu",
+                     path.c_str(), out->size(), expected_size);
+        return nullptr;
       }
     }
     catch (const std::exception& e)
     {
       RCLCPP_ERROR(get_logger(), "spill read %s failed: %s", path.c_str(),
                    e.what());
-      out->clear();
-      return out;
+      return nullptr;
     }
     RCLCPP_ERROR(get_logger(), "spill read %s failed", path.c_str());
-    out->clear();
-    return out;
+    return nullptr;
   }
 
   void spillKeyframe(KeyframeEvidence& kf, const size_t idx)
@@ -994,27 +1141,34 @@ private:
     {
       if (kf.n_hits > 0)
       {
-        e.hits = readSpill<CloudT>(spillPath(kf.spill_dir, idx, "hits"));
+        e.hits =
+            readSpill<CloudT>(spillPath(kf.spill_dir, idx, "hits"), kf.n_hits);
+        e.complete = e.complete && static_cast<bool>(e.hits);
       }
       if (kf.n_clear > 0)
       {
-        e.clear = readSpill<CloudT>(spillPath(kf.spill_dir, idx, "clear"));
+        e.clear = readSpill<CloudT>(spillPath(kf.spill_dir, idx, "clear"),
+                                    kf.n_clear);
+        e.complete = e.complete && static_cast<bool>(e.clear);
       }
     }
     if (want_survey && kf.n_survey > 0)
     {
-      e.survey = readSpill<SurveyCloudT>(
-        spillPath(kf.spill_dir, idx, "survey"));
+      e.survey = readSpill<SurveyCloudT>(spillPath(kf.spill_dir, idx, "survey"),
+                                         kf.n_survey);
+      e.complete = e.complete && static_cast<bool>(e.survey);
     }
     if (want_reconstruction && kf.n_reconstruction > 0)
     {
       e.reconstruction = readSpill<ReconstructionCloudT>(
-        spillPath(kf.spill_dir, idx, "reconstruction"));
+          spillPath(kf.spill_dir, idx, "reconstruction"), kf.n_reconstruction);
+      e.complete = e.complete && static_cast<bool>(e.reconstruction);
     }
     if (want_tile && kf.n_tile > 0)
     {
       e.tile = readSpill<ReconstructionCloudT>(
-        spillPath(kf.spill_dir, idx, "tile"));
+          spillPath(kf.spill_dir, idx, "tile"), kf.n_tile);
+      e.complete = e.complete && static_cast<bool>(e.tile);
     }
     return e;
   }
@@ -1026,6 +1180,16 @@ private:
                    std::deque<BufferedCloud>& buffer,
                    const bool downsample)
   {
+    std::string layout_error;
+    if (!pointCloudLayoutValid(msg, {"x", "y", "z"}, layout_error)) {
+      RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 5000, "Dropping %s cloud: %s",
+          downsample ? "hits" : "clear", layout_error.c_str());
+      return;
+    }
+    if (msg.width == 0) {
+      return;
+    }
     const double stamp = rclcpp::Time(msg.header.stamp).seconds();
     double& last_stamp = downsample ? m_last_hits_stamp : m_last_clear_stamp;
     if (observeInputStamp(stamp, last_stamp, downsample ? "hits" : "clear"))
@@ -1036,9 +1200,7 @@ private:
       last_stamp = stamp;
     }
     Eigen::Isometry3d t_robot_sensor;
-    if (msg.width * msg.height == 0 ||
-        !lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor))
-    {
+    if (!lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor)) {
       return;
     }
     CloudPtrT raw(new CloudT);
@@ -1121,12 +1283,24 @@ private:
   // texture/elevation attributes ride through the coordinate transform.
   void bufferSurvey(const sensor_msgs::msg::PointCloud2& msg)
   {
+    std::string layout_error;
+    if (!pointCloudLayoutValid(msg,
+                               {"x", "y", "z", "intensity", "range",
+                                "incidence", "texture", "texture_squared",
+                                "elevation_lo_offset", "elevation_hi_offset",
+                                "elevation_resolved"},
+                               layout_error)) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                            "Dropping survey cloud: %s", layout_error.c_str());
+      return;
+    }
+    if (msg.width == 0) {
+      return;
+    }
     const double stamp = rclcpp::Time(msg.header.stamp).seconds();
     observeInputStamp(stamp, m_last_survey_stamp, "survey");
     Eigen::Isometry3d t_robot_sensor;
-    if (msg.width * msg.height == 0 ||
-        !lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor))
-    {
+    if (!lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor)) {
       return;
     }
     SurveyCloudPtrT raw(new SurveyCloudT);
@@ -1150,19 +1324,29 @@ private:
   // mosaic; surface reconstruction consumes the lobe-collapsed stream below.
   void bufferTile(const sensor_msgs::msg::PointCloud2& msg)
   {
+    std::string layout_error;
+    if (!pointCloudLayoutValid(msg,
+                               {"x", "y", "z", "intensity", "range", "azimuth",
+                                "vertical_uncertainty"},
+                               layout_error)) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                            "Dropping tile cloud: %s", layout_error.c_str());
+      return;
+    }
+    if (msg.width == 0) {
+      return;
+    }
     const double stamp = rclcpp::Time(msg.header.stamp).seconds();
     observeInputStamp(stamp, m_last_tile_stamp, "tile");
     Eigen::Isometry3d t_robot_sensor;
-    if (msg.width * msg.height == 0 ||
-        // Reconstruction geometry is allowed to fail closed.  A latest TF is
-        // adequate for some display-oriented products, but here it would
-        // silently attach the wrong encoder angle to an entire sonar ribbon
-        // and manufacture multi-view support.  The production TF comes from
-        // cameraHead.tilt.position (live or regenerated from bridge telemetry
-        // during replay); the Oculus AHRS is deliberately not consulted.
-        !lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor,
-                       /*target=*/"", /*allow_fallback=*/false))
-    {
+    // Reconstruction geometry is allowed to fail closed. A latest TF is
+    // adequate for some display-oriented products, but here it would
+    // silently attach the wrong encoder angle to an entire sonar ribbon and
+    // manufacture multi-view support. The production TF comes from
+    // cameraHead.tilt.position (live or regenerated from bridge telemetry
+    // during replay); the Oculus AHRS is deliberately not consulted.
+    if (!lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor,
+                       /*target=*/"", /*allow_fallback=*/false)) {
       return;
     }
 
@@ -1226,13 +1410,25 @@ private:
   // independent votes in the elevation reconstruction.
   void bufferReconstructionReturns(const sensor_msgs::msg::PointCloud2& msg)
   {
+    std::string layout_error;
+    if (!pointCloudLayoutValid(msg,
+                               {"x", "y", "z", "intensity", "range", "azimuth",
+                                "vertical_uncertainty", "range_sigma",
+                                "prominence", "echo_width"},
+                               layout_error)) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                            "Dropping reconstruction cloud: %s",
+                            layout_error.c_str());
+      return;
+    }
+    if (msg.width == 0) {
+      return;
+    }
     const double stamp = rclcpp::Time(msg.header.stamp).seconds();
     observeInputStamp(stamp, m_last_reconstruction_stamp, "reconstruction");
     Eigen::Isometry3d t_robot_sensor;
-    if (msg.width * msg.height == 0 ||
-        !lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor,
-                       /*target=*/"", /*allow_fallback=*/false))
-    {
+    if (!lookupAtStamp(msg.header.frame_id, msg.header.stamp, t_robot_sensor,
+                       /*target=*/"", /*allow_fallback=*/false)) {
       return;
     }
 
@@ -1366,6 +1562,7 @@ private:
     // epoch and will refuse to publish after the rewind; the first render of
     // the new segment performs a complete reset from its keyframe snapshot.
     m_force_full_render = true;
+    m_reset_products_pending = true;
     m_last_assoc_stamp = 0.0;
     m_last_tile_assoc_stamp = 0.0;
     m_last_reconstruction_assoc_stamp = 0.0;
@@ -1393,38 +1590,77 @@ private:
 
   void onTrajectory(const sensor_msgs::msg::PointCloud2& msg)
   {
-    // require all consumed fields: a PointCloud2ConstIterator throws
-    // std::runtime_error on a missing field, which would escape this
-    // subscription callback and terminate the node.
-    auto has_field = [&msg](const char* name) {
-      for (const auto& f : msg.fields)
-        if (f.name == name) return true;
-      return false;
-    };
-    if (!has_field("t") || !has_field("x") || !has_field("y") ||
-        !has_field("z") || !has_field("roll") || !has_field("pitch") ||
-        !has_field("yaw") || !has_field("i"))
-    {
-      RCLCPP_ERROR_ONCE(get_logger(),
-                        "trajectory cloud missing an x/y/z/roll/pitch/yaw/i/t "
-                        "field — slam node too old; assembler disabled");
+    std::string layout_error;
+    if (!pointCloudLayoutValid(
+            msg, {"x", "y", "z", "roll", "pitch", "yaw", "i", "t"},
+            layout_error)) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                            "Dropping malformed trajectory cloud: %s",
+                            layout_error.c_str());
+      return;
+    }
+    if (msg.width == 0) {
       return;
     }
 
     const double msg_stamp = rclcpp::Time(msg.header.stamp).seconds();
-    observeInputStamp(msg_stamp, m_last_traj_stamp, "trajectory");
-    sensor_msgs::PointCloud2ConstIterator<float> ix(msg, "x"), iy(msg, "y"), iz(msg, "z"),
-      iroll(msg, "roll"), ipitch(msg, "pitch"), iyaw(msg, "yaw"), ii(msg, "i"),
-      it(msg, "t");
-
+    struct TrajectoryEntry {
+      std::size_t index;
+      float x, y, z, roll, pitch, yaw, relative_stamp;
+    };
+    std::vector<TrajectoryEntry> entries;
+    entries.reserve(static_cast<std::size_t>(msg.width) * msg.height);
+    sensor_msgs::PointCloud2ConstIterator<float> ix(msg, "x"), iy(msg, "y"),
+        iz(msg, "z"), iroll(msg, "roll"), ipitch(msg, "pitch"),
+        iyaw(msg, "yaw"), ii(msg, "i"), it(msg, "t");
     for (; ix != ix.end(); ++ix, ++iy, ++iz, ++iroll, ++ipitch, ++iyaw, ++ii, ++it)
     {
-      const size_t idx = static_cast<size_t>(*ii);
+      const float raw[] = {*ix, *iy, *iz, *iroll, *ipitch, *iyaw, *ii, *it};
+      if (!std::all_of(std::begin(raw), std::end(raw), [](const float value) {
+            return std::isfinite(value);
+          })) {
+        RCLCPP_ERROR_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "Dropping trajectory cloud containing non-finite values");
+        return;
+      }
+      const double rounded_index = std::round(static_cast<double>(*ii));
+      if (*ii < 0.0F ||
+          std::fabs(static_cast<double>(*ii) - rounded_index) > 1e-4 ||
+          rounded_index >
+              static_cast<double>(std::numeric_limits<std::size_t>::max())) {
+        RCLCPP_ERROR_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "Dropping trajectory cloud with invalid keyframe index %.9g",
+            static_cast<double>(*ii));
+        return;
+      }
+      entries.push_back({static_cast<std::size_t>(rounded_index), *ix, *iy, *iz,
+                         *iroll, *ipitch, *iyaw, *it});
+    }
+
+    observeInputStamp(msg_stamp, m_last_traj_stamp, "trajectory");
+    std::size_t virtual_size = m_keyframes.size();
+    for (const auto &entry : entries) {
+      if (entry.index > virtual_size) {
+        RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                              "Dropping trajectory cloud with a keyframe gap "
+                              "at index %zu (expected at most %zu)",
+                              entry.index, virtual_size);
+        return;
+      }
+      if (entry.index == virtual_size) {
+        ++virtual_size;
+      }
+    }
+
+    for (const auto &entry : entries) {
+      const size_t idx = entry.index;
       Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
-      pose.translate(Eigen::Vector3d(*ix, *iy, *iz));
-      pose.rotate(Eigen::AngleAxisd(*iyaw, Eigen::Vector3d::UnitZ()) *
-                  Eigen::AngleAxisd(*ipitch, Eigen::Vector3d::UnitY()) *
-                  Eigen::AngleAxisd(*iroll, Eigen::Vector3d::UnitX()));
+      pose.translate(Eigen::Vector3d(entry.x, entry.y, entry.z));
+      pose.rotate(Eigen::AngleAxisd(entry.yaw, Eigen::Vector3d::UnitZ()) *
+                  Eigen::AngleAxisd(entry.pitch, Eigen::Vector3d::UnitY()) *
+                  Eigen::AngleAxisd(entry.roll, Eigen::Vector3d::UnitX()));
 
       if (idx < m_keyframes.size())
       {
@@ -1450,7 +1686,13 @@ private:
 
       // new keyframe: snapshot evidence from the buffers
       KeyframeEvidence kf;
-      kf.stamp = msg_stamp + static_cast<double>(*it);
+      kf.stamp = msg_stamp + static_cast<double>(entry.relative_stamp);
+      if (!std::isfinite(kf.stamp)) {
+        RCLCPP_ERROR_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "Dropping trajectory with an invalid keyframe stamp");
+        return;
+      }
       kf.pose  = pose;
       const BufferedCloud* hits  = findNearest(m_hits_buffer, kf.stamp);
       const BufferedCloud* clear = findNearest(m_clear_buffer, kf.stamp);
@@ -1483,6 +1725,7 @@ private:
                           /*allow_fallback=*/false))
         {
           SurveyCloudPtrT agg(new SurveyCloudT);
+          bool transforms_complete = true;
           for (const auto& entry : m_survey_buffer)
           {
             if (entry.stamp <= m_last_assoc_stamp ||
@@ -1495,15 +1738,15 @@ private:
             if (!lookupAtStamp(m_robot_frame, e_time, t_odom_e, m_odom_frame,
                                /*allow_fallback=*/false))
             {
-              continue;
+              transforms_complete = false;
+              break;
             }
             const Eigen::Isometry3d t_kf_e = t_odom_kf.inverse() * t_odom_e;
             SurveyCloudT moved;
             pcl::transformPointCloud(*entry.cloud, moved, t_kf_e.cast<float>());
             *agg += moved;
           }
-          if (!agg->empty())
-          {
+          if (transforms_complete && !agg->empty()) {
             kf.survey = voxelSurvey(agg, static_cast<float>(m_survey_resolution));
           }
           // Advance past the acceptance window's UPPER edge: advancing only
@@ -1512,8 +1755,16 @@ private:
           // two poses, inflating support. And advance only on a successful
           // odom lookup: on failure the batch stays buffered for the next
           // keyframe instead of being silently unassociated forever.
-          m_last_assoc_stamp = kf.stamp + m_stamp_tolerance;
-          discardAssociated(m_survey_buffer, m_last_assoc_stamp);
+          if (transforms_complete) {
+            m_last_assoc_stamp = kf.stamp + m_stamp_tolerance;
+            discardAssociated(m_survey_buffer, m_last_assoc_stamp);
+          } else {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                                 "survey association at keyframe %.3f was "
+                                 "incomplete; retaining the "
+                                 "entire window for the next keyframe",
+                                 kf.stamp);
+          }
         }
         else
         {
@@ -1535,6 +1786,7 @@ private:
                           /*allow_fallback=*/false))
         {
           ReconstructionCloudPtrT agg(new ReconstructionCloudT);
+          bool transforms_complete = true;
           for (const auto& entry : m_tile_buffer)
           {
             if (entry.stamp <= m_last_tile_assoc_stamp ||
@@ -1547,7 +1799,8 @@ private:
             if (!lookupAtStamp(m_robot_frame, e_time, t_odom_e, m_odom_frame,
                                /*allow_fallback=*/false))
             {
-              continue;
+              transforms_complete = false;
+              break;
             }
             const Eigen::Isometry3f t_kf_e =
               (t_odom_kf.inverse() * t_odom_e).cast<float>();
@@ -1555,12 +1808,19 @@ private:
               transformReconstructionCloud(entry.cloud, t_kf_e);
             *agg += *moved;
           }
-          if (!agg->empty())
-          {
+          if (transforms_complete && !agg->empty()) {
             kf.tile = agg;
           }
-          m_last_tile_assoc_stamp = kf.stamp + m_stamp_tolerance;
-          discardAssociated(m_tile_buffer, m_last_tile_assoc_stamp);
+          if (transforms_complete) {
+            m_last_tile_assoc_stamp = kf.stamp + m_stamp_tolerance;
+            discardAssociated(m_tile_buffer, m_last_tile_assoc_stamp);
+          } else {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                                 "tile association at keyframe %.3f was "
+                                 "incomplete; retaining the "
+                                 "entire window for the next keyframe",
+                                 kf.stamp);
+          }
         }
         else
         {
@@ -1583,6 +1843,7 @@ private:
                           /*allow_fallback=*/false))
         {
           ReconstructionCloudPtrT agg(new ReconstructionCloudT);
+          bool transforms_complete = true;
           for (const auto& entry : m_reconstruction_buffer)
           {
             if (entry.stamp <= m_last_reconstruction_assoc_stamp ||
@@ -1595,7 +1856,8 @@ private:
             if (!lookupAtStamp(m_robot_frame, e_time, t_odom_e, m_odom_frame,
                                /*allow_fallback=*/false))
             {
-              continue;
+              transforms_complete = false;
+              break;
             }
             const Eigen::Isometry3f t_kf_e =
               (t_odom_kf.inverse() * t_odom_e).cast<float>();
@@ -1603,11 +1865,19 @@ private:
               transformReconstructionCloud(entry.cloud, t_kf_e);
             *agg += *moved;
           }
-          if (!agg->empty()) kf.reconstruction = agg;
-          m_last_reconstruction_assoc_stamp =
-            kf.stamp + m_stamp_tolerance;
-          discardAssociated(
-            m_reconstruction_buffer, m_last_reconstruction_assoc_stamp);
+          if (transforms_complete && !agg->empty())
+            kf.reconstruction = agg;
+          if (transforms_complete) {
+            m_last_reconstruction_assoc_stamp = kf.stamp + m_stamp_tolerance;
+            discardAssociated(m_reconstruction_buffer,
+                              m_last_reconstruction_assoc_stamp);
+          } else {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 10000,
+                "reconstruction association at keyframe %.3f was incomplete; "
+                "retaining the entire window for the next keyframe",
+                kf.stamp);
+          }
         }
         else
         {
@@ -1645,12 +1915,14 @@ private:
     return (q(x) << 42) | (q(y) << 21) | q(z);
   }
 
-  void integrateKeyframe(const KeyframeEvidence& kf, const size_t idx)
-  {
+  bool integrateKeyframe(const KeyframeEvidence &kf, const size_t idx) {
     // Scoped: the loaded clouds are released when this returns, so a full
     // re-render holds one keyframe at a time rather than all of them.
     const LoadedEvidence e =
       loadEvidence(kf, idx, /*want_occupancy=*/true, /*want_survey=*/false);
+    if (!e.complete) {
+      return false;
+    }
     // Use each cloud's own sensor origin: raycastPointCloud does max-range
     // clipping relative to the origin, so hit endpoints must be judged against
     // the hits cloud's origin, not the clear cloud's (which used to overwrite it).
@@ -1659,24 +1931,33 @@ private:
       const Eigen::Vector3d origin = kf.pose * kf.hits_origin;
       CloudPtrT in_map(new CloudT);
       pcl::transformPointCloud(*e.hits, *in_map, kf.pose.cast<float>());
-      m_map->insertPointCloud(in_map, origin, "hits");
+      if (!m_map->insertPointCloud(in_map, origin, "hits",
+                                   /*finalize_map=*/false)) {
+        return false;
+      }
     }
     if (e.clear && !e.clear->empty())
     {
       const Eigen::Vector3d origin = kf.pose * kf.clear_origin;
       CloudPtrT in_map(new CloudT);
       pcl::transformPointCloud(*e.clear, *in_map, kf.pose.cast<float>());
-      m_map->insertPointCloud(in_map, origin, "clear");
+      if (!m_map->insertPointCloud(in_map, origin, "clear",
+                                   /*finalize_map=*/false)) {
+        return false;
+      }
     }
+    return true;
   }
 
-  void accumulateSurvey(const KeyframeEvidence& kf, const size_t idx)
-  {
+  bool accumulateSurvey(const KeyframeEvidence &kf, const size_t idx) {
     const LoadedEvidence e =
       loadEvidence(kf, idx, /*want_occupancy=*/false, /*want_survey=*/true);
+    if (!e.complete) {
+      return false;
+    }
     if (!e.survey || e.survey->empty())
     {
-      return;
+      return true;
     }
     SurveyCloudT in_map;
     pcl::transformPointCloud(*e.survey, in_map, kf.pose.cast<float>());
@@ -1725,6 +2006,7 @@ private:
     {
       ++m_survey_support[key];
     }
+    return true;
   }
 
   // Walk the accumulated survey voxels, applying the occupancy mask, and hand
@@ -1815,7 +2097,14 @@ private:
     // it unconditionally avoids racing an unlocked dirty-flag probe with the
     // ingestion executor lane; it returns immediately when already current.
     renderIfNeeded(/*publish_outputs=*/false);
-    syncSurveyAccumulator();
+    if (!m_last_render_complete) {
+      message = "occupancy render could not load complete keyframe evidence";
+      return false;
+    }
+    if (!syncSurveyAccumulator()) {
+      message = "could not load complete survey evidence";
+      return false;
+    }
 
     pcl::PointCloud<SurveyExportPoint> out;
     out.reserve(m_vox.size());
@@ -1847,21 +2136,11 @@ private:
       std::error_code ec;
       std::filesystem::create_directories(path.parent_path(), ec);
     }
-    // Write to a sibling temp and rename: an export interrupted midway would
-    // otherwise leave a truncated file in place of the previous good one, and
-    // rename within a directory is atomic.
-    const std::string tmp = m_export_path + ".part";
+    // writeSpill commits through a sibling .part file, so an interrupted
+    // export cannot replace the previous good product with a truncation.
     auto cloud = out.makeShared();
-    if (!writeSpill(cloud, tmp))
-    {
-      message = "failed to write " + tmp;
-      return false;
-    }
-    std::error_code ec;
-    std::filesystem::rename(tmp, path, ec);
-    if (ec)
-    {
-      message = "failed to move " + tmp + " into place: " + ec.message();
+    if (!writeSpill(cloud, m_export_path)) {
+      message = "failed to write " + m_export_path;
       return false;
     }
     message = "wrote " + std::to_string(out.size()) + " points to " + m_export_path;
@@ -2085,7 +2364,8 @@ private:
         std::lock_guard<std::mutex> lock(m_navigation_fit_mutex);
         coalesced = m_navigation_fits_coalesced;
         newer_pending = m_pending_navigation_fit.has_value();
-        stale = m_navigation_fit_stop || job.epoch != m_navigation_fit_epoch;
+        stale = m_navigation_fit_stop || job.epoch != m_navigation_fit_epoch ||
+                newer_pending;
       }
       ProductPublishMetrics publish_metrics;
       if (!stale)
@@ -2122,16 +2402,19 @@ private:
     m_navigation_fit_thread.join();
   }
 
-  void collectNavigationProducts(
-    std::vector<NavigationRow>& navigation,
-    std::vector<SurfelRow>& surfels)
-  {
+  bool collectNavigationProducts(std::vector<NavigationRow> &navigation,
+                                 std::vector<SurfelRow> &surfels) {
     // Force pending occupancy evidence/graph corrections through first: the
     // clean subset includes both the graph-corrected survey and the explicit
     // free-space contradiction mask.
     m_last_product_render = -std::numeric_limits<double>::infinity();
     renderIfNeeded(/*publish_outputs=*/false);
-    syncSurveyAccumulator();
+    if (!m_last_render_complete) {
+      return false;
+    }
+    if (!syncSurveyAccumulator()) {
+      return false;
+    }
     std::vector<SurveyRow> supported;
     supported.reserve(m_vox.size());
     forEachSurveyRow([this, &supported](const SurveyRow& row) {
@@ -2142,6 +2425,7 @@ private:
     });
     navigation = selectSurveyNavigationSurface(supported);
     surfels = buildNavigationSurfels(navigation);
+    return true;
   }
 
   template<typename PointT>
@@ -2161,18 +2445,9 @@ private:
       std::error_code ec;
       std::filesystem::create_directories(destination.parent_path(), ec);
     }
-    const std::string tmp = path + ".part";
     auto cloud = out.makeShared();
-    if (!writeSpill(cloud, tmp))
-    {
-      message = "failed to write " + tmp;
-      return false;
-    }
-    std::error_code ec;
-    std::filesystem::rename(tmp, destination, ec);
-    if (ec)
-    {
-      message = "failed to move " + tmp + " into place: " + ec.message();
+    if (!writeSpill(cloud, path)) {
+      message = "failed to write " + path;
       return false;
     }
     message = "wrote " + std::to_string(out.size()) + " " + product +
@@ -2197,7 +2472,10 @@ private:
 
     std::vector<NavigationRow> navigation;
     std::vector<SurfelRow> surfels;
-    collectNavigationProducts(navigation, surfels);
+    if (!collectNavigationProducts(navigation, surfels)) {
+      message = "could not load complete survey evidence";
+      return false;
+    }
     pcl::PointCloud<NavigationExportPoint> out;
     out.reserve(navigation.size());
     for (const auto& row : navigation)
@@ -2246,7 +2524,10 @@ private:
 
     std::vector<NavigationRow> navigation;
     std::vector<SurfelRow> surfels;
-    collectNavigationProducts(navigation, surfels);
+    if (!collectNavigationProducts(navigation, surfels)) {
+      message = "could not load complete survey evidence";
+      return false;
+    }
     pcl::PointCloud<SurfaceExportPoint> out;
     out.reserve(surfels.size());
     for (const auto& row : surfels)
@@ -2279,11 +2560,10 @@ private:
   // then fold any keyframes it has not seen. Shared by the render path and
   // the export path so neither can read a lagging accumulator — survey-only
   // keyframes used to wait for the next OCCUPANCY change to be folded in.
-  void syncSurveyAccumulator()
-  {
+  bool syncSurveyAccumulator() {
     if (!m_survey_pub)
     {
-      return;
+      return true;
     }
     if (m_survey_stale)
     {
@@ -2294,19 +2574,25 @@ private:
     }
     for (size_t i = m_survey_upto; i < m_render_keyframes.size(); ++i)
     {
-      accumulateSurvey(m_render_keyframes[i], i);
+      if (!accumulateSurvey(m_render_keyframes[i], i)) {
+        m_survey_stale = true;
+        return false;
+      }
     }
     m_survey_upto = m_render_keyframes.size();
+    return true;
   }
 
-  void accumulateTile(const KeyframeEvidence& kf, const size_t idx)
-  {
+  bool accumulateTile(const KeyframeEvidence &kf, const size_t idx) {
     const LoadedEvidence e = loadEvidence(
       kf, idx, /*want_occupancy=*/false, /*want_survey=*/false,
       /*want_reconstruction=*/false, /*want_tile=*/true);
+    if (!e.complete) {
+      return false;
+    }
     if (!e.tile || e.tile->empty())
     {
-      return;
+      return true;
     }
     const Eigen::Isometry3f pose = kf.pose.cast<float>();
     for (const auto& local : e.tile->points)
@@ -2323,27 +2609,30 @@ private:
       a.half_angle += p.elevation_half_angle;
       ++a.n;
     }
+    return true;
   }
 
-  void accumulateSurface(const KeyframeEvidence& kf, const size_t idx)
-  {
+  bool accumulateSurface(const KeyframeEvidence &kf, const size_t idx) {
     const LoadedEvidence e = loadEvidence(
       kf, idx, /*want_occupancy=*/false, /*want_survey=*/false,
       /*want_reconstruction=*/true);
-    if (!e.reconstruction || e.reconstruction->empty()) return;
+    if (!e.complete)
+      return false;
+    if (!e.reconstruction || e.reconstruction->empty())
+      return true;
     const Eigen::Isometry3f pose = kf.pose.cast<float>();
     for (const auto& local : e.reconstruction->points)
     {
       m_surface_accumulator->add(
         transformReconstructionPoint(local, pose));
     }
+    return true;
   }
 
-  void syncSurfaceAccumulator()
-  {
+  bool syncSurfaceAccumulator() {
     if (!m_surface_pub)
     {
-      return;
+      return true;
     }
     if (m_surface_stale)
     {
@@ -2353,16 +2642,19 @@ private:
     }
     for (size_t i = m_surface_upto; i < m_render_keyframes.size(); ++i)
     {
-      accumulateSurface(m_render_keyframes[i], i);
+      if (!accumulateSurface(m_render_keyframes[i], i)) {
+        m_surface_stale = true;
+        return false;
+      }
     }
     m_surface_upto = m_render_keyframes.size();
+    return true;
   }
 
-  void syncTileAccumulator()
-  {
+  bool syncTileAccumulator() {
     if (!m_tile_pub)
     {
-      return;
+      return true;
     }
     if (m_tile_stale)
     {
@@ -2373,9 +2665,13 @@ private:
     }
     for (size_t i = m_tile_upto; i < m_render_keyframes.size(); ++i)
     {
-      accumulateTile(m_render_keyframes[i], i);
+      if (!accumulateTile(m_render_keyframes[i], i)) {
+        m_tile_stale = true;
+        return false;
+      }
     }
     m_tile_upto = m_render_keyframes.size();
+    return true;
   }
 
   void releaseTileAccumulator()
@@ -2730,6 +3026,110 @@ private:
       [](const auto&) {}, stamp);
   }
 
+  void publishResetProducts(const rclcpp::Time &stamp) {
+    CloudT empty_cloud;
+    sensor_msgs::msg::PointCloud2 cloud_msg;
+    pcl::toROSMsg(empty_cloud, cloud_msg);
+    cloud_msg.header.frame_id = m_map_frame;
+    cloud_msg.header.stamp = stamp;
+    m_cloud_pub->publish(cloud_msg);
+
+    nav_msgs::msg::OccupancyGrid grid_msg;
+    if (m_last_published_grid.has_value()) {
+      grid_msg = *m_last_published_grid;
+      std::fill(grid_msg.data.begin(), grid_msg.data.end(), -1);
+    } else {
+      grid_msg.info.resolution = static_cast<float>(m_resolution);
+      grid_msg.info.origin.orientation.w = 1.0;
+    }
+    grid_msg.header.frame_id = m_map_frame;
+    grid_msg.header.stamp = stamp;
+    m_grid_pub->publish(grid_msg);
+    m_last_published_grid = grid_msg;
+
+    constexpr std::array<const char *, 13> survey_names = {
+        "x",
+        "y",
+        "z",
+        "intensity",
+        "range",
+        "incidence",
+        "support",
+        "pose_sigma",
+        "texture",
+        "texture_variance",
+        "elevation_lo_offset",
+        "elevation_hi_offset",
+        "elevation_resolved_fraction"};
+    constexpr std::array<const char *, 7> tile_names = {
+        "x", "y", "z", "intensity", "range", "support", "aperture_half_deg"};
+    constexpr std::array<const char *, 11> surface_names = {"x",
+                                                            "y",
+                                                            "z",
+                                                            "intensity",
+                                                            "support",
+                                                            "view_span_deg",
+                                                            "confidence",
+                                                            "range_sigma",
+                                                            "echo_width",
+                                                            "echo_prominence",
+                                                            "peak_prominence"};
+    constexpr std::array<const char *, 20> navigation_names = {
+        "x",
+        "y",
+        "z",
+        "intensity",
+        "range",
+        "incidence",
+        "support",
+        "confidence",
+        "pose_sigma",
+        "texture",
+        "texture_variance",
+        "elevation_lo_offset",
+        "elevation_hi_offset",
+        "elevation_resolved_fraction",
+        "normal_x",
+        "normal_y",
+        "normal_z",
+        "curvature",
+        "residual",
+        "normal_valid"};
+    constexpr std::array<const char *, 16> surfel_names = {"x",
+                                                           "y",
+                                                           "z",
+                                                           "intensity",
+                                                           "support",
+                                                           "view_span_deg",
+                                                           "confidence",
+                                                           "normal_x",
+                                                           "normal_y",
+                                                           "normal_z",
+                                                           "curvature",
+                                                           "residual",
+                                                           "range_sigma",
+                                                           "echo_width",
+                                                           "echo_prominence",
+                                                           "peak_prominence"};
+    const auto empty_rows = [](const auto &) {};
+    if (m_survey_pub) {
+      publishFloatRows(m_survey_pub, survey_names, 0, empty_rows, stamp);
+      publishFloatRows(m_supported_survey_pub, survey_names, 0, empty_rows,
+                       stamp);
+      const rclcpp::Time timeless(0, 0, stamp.get_clock_type());
+      publishFloatRows(m_navigation_pub, navigation_names, 0, empty_rows,
+                       timeless);
+      publishFloatRows(m_navigation_surfel_pub, surfel_names, 0, empty_rows,
+                       timeless);
+    }
+    if (m_tile_pub) {
+      publishFloatRows(m_tile_pub, tile_names, 0, empty_rows, stamp);
+    }
+    if (m_surface_pub) {
+      publishFloatRows(m_surface_pub, surface_names, 0, empty_rows, stamp);
+    }
+  }
+
   void renderIfNeeded(const bool publish_outputs = true)
   {
     const auto render_started = SteadyClock::now();
@@ -2792,13 +3192,15 @@ private:
     double reconstruction_lag = 0.0;
     bool full_render = false;
     bool append_render = false;
+    bool reset_products = false;
     {
       std::lock_guard<std::mutex> lock(m_ingest_mutex);
+      const bool reset_pending = m_reset_products_pending;
       const bool due =
-        now - m_last_product_render >= m_render_min_period;
+          reset_pending || now - m_last_product_render >= m_render_min_period;
       const bool have_keyframes = !m_keyframes.empty();
-      if ((m_force_full_render || m_dirty) && due && have_keyframes)
-      {
+      if ((m_force_full_render || m_dirty || reset_pending) && due &&
+          (have_keyframes || reset_pending)) {
         full_render = true;
         changed = true;
         evidence_rendered = true;
@@ -2806,19 +3208,18 @@ private:
         m_force_full_render = false;
         m_dirty = false;
         m_have_new = false;
-      }
-      else if (m_have_new && due)
-      {
+        reset_products = reset_pending;
+        if (publish_outputs) {
+          m_reset_products_pending = false;
+        }
+      } else if (m_have_new && due) {
         append_render = true;
         changed = true;
         evidence_rendered = true;
         render_kind = "append";
         m_have_new = false;
-      }
-      else if (consumer_started && have_keyframes &&
-               !m_force_full_render && !m_dirty && !m_have_new &&
-               !m_render_keyframes.empty())
-      {
+      } else if (consumer_started && have_keyframes && !m_force_full_render &&
+                 !m_dirty && !m_have_new && !m_render_keyframes.empty()) {
         // Republish the last complete internally consistent generation. If
         // ingestion has newer unrendered work, wait for its normal render
         // instead of mixing new keyframes with the previous occupancy state.
@@ -2849,6 +3250,7 @@ private:
 
     auto stage_started = SteadyClock::now();
 
+    bool integration_complete = true;
     if (full_render)
     {
       // the graph moved: re-render everything at the current poses
@@ -2861,12 +3263,14 @@ private:
       {
         if (m_render_keyframes[i].has_evidence)
         {
-          integrateKeyframe(m_render_keyframes[i], i);
+          if (!integrateKeyframe(m_render_keyframes[i], i)) {
+            integration_complete = false;
+            break;
+          }
         }
       }
       m_occupancy_upto = m_render_keyframes.size();
       m_render_epoch = render_epoch;
-      ++m_full_renders;
     }
     else if (append_render)
     {
@@ -2885,11 +3289,36 @@ private:
       {
         if (m_render_keyframes[i].has_evidence)
         {
-          integrateKeyframe(m_render_keyframes[i], i);
+          if (!integrateKeyframe(m_render_keyframes[i], i)) {
+            integration_complete = false;
+            break;
+          }
         }
       }
       m_occupancy_upto = m_render_keyframes.size();
       m_render_epoch = render_epoch;
+    }
+
+    if (!integration_complete) {
+      m_last_render_complete = false;
+      RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 10000,
+          "render aborted because keyframe evidence could not be loaded; "
+          "the next render will rebuild from scratch");
+      std::lock_guard<std::mutex> lock(m_ingest_mutex);
+      if (render_epoch == m_replay_epoch) {
+        m_force_full_render = true;
+      }
+      return;
+    }
+    if (full_render || append_render) {
+      // All keyframe-local hit/clear batches are now present. Prune topology
+      // and rebuild optional intersectors once per global render rather than
+      // twice per keyframe.
+      m_map->finalizeUpdates();
+      if (full_render) {
+        ++m_full_renders;
+      }
     }
 
     // An input-time rewind can occur while this independent executor lane is
@@ -2899,9 +3328,11 @@ private:
       std::lock_guard<std::mutex> lock(m_ingest_mutex);
       if (render_epoch != m_replay_epoch)
       {
+        m_last_render_complete = false;
         return;
       }
     }
+    m_last_render_complete = true;
     const double integration_ms = elapsedWallMs(stage_started);
     if (evidence_rendered)
     {
@@ -2911,14 +3342,34 @@ private:
     {
       return;
     }
+    if (reset_products) {
+      publishResetProducts(get_clock()->now());
+      if (m_render_keyframes.empty()) {
+        return;
+      }
+    }
 
     stage_started = SteadyClock::now();
     std::vector<ReconstructionRow> reconstructed;
     const bool reconstruction_needed = demand.surface ||
       m_global_occupancy_mode != GlobalOccupancyMode::Hits;
-    if (reconstruction_needed)
-    {
-      syncSurfaceAccumulator();
+    const bool products_complete =
+        (!reconstruction_needed || syncSurfaceAccumulator()) &&
+        (!demand.tile || syncTileAccumulator()) &&
+        (!demand.surveyProducts() || syncSurveyAccumulator());
+    if (!products_complete) {
+      m_last_render_complete = false;
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 10000,
+                            "render aborted because derived-product evidence "
+                            "could not be loaded; "
+                            "the next render will rebuild from scratch");
+      std::lock_guard<std::mutex> lock(m_ingest_mutex);
+      if (render_epoch == m_replay_epoch) {
+        m_force_full_render = true;
+      }
+      return;
+    }
+    if (reconstruction_needed) {
       reconstructed = m_surface_accumulator->rows();
     }
     const double surface_build_ms = elapsedWallMs(stage_started);
@@ -2967,6 +3418,7 @@ private:
       m_cloud_pub->publish(cloud_msg);
     }
     m_grid_pub->publish(grid_msg);
+    m_last_published_grid = grid_msg;
     const double occupancy_output_ms = elapsedWallMs(stage_started);
 
     // Graph-anchored dense SURVEY render: keyframe-local rich survey clouds at
@@ -3168,7 +3620,7 @@ private:
   double m_stamp_tolerance  = 0.06;
   int m_input_queue_depth   = 5;
   bool m_input_reliable = false;
-  bool m_allow_latest_tf_fallback = true;
+  bool m_allow_latest_tf_fallback = false;
   double m_tf_buffer_duration = 10.0;
   bool m_reset_on_time_rewind = true;
   double m_time_rewind_tolerance = 0.5;
@@ -3221,6 +3673,7 @@ private:
   bool m_dirty    = false;
   bool m_have_new = false;
   bool m_force_full_render = false;
+  bool m_reset_products_pending = false;
   std::uint64_t m_replay_epoch = 0;
 
   // Render-group-owned state. Immutable evidence handles in this snapshot
@@ -3231,6 +3684,8 @@ private:
   size_t m_full_renders = 0;
   std::uint64_t m_render_epoch = 0;
   double m_last_product_render = 0.0;
+  bool m_last_render_complete = true;
+  std::optional<nav_msgs::msg::OccupancyGrid> m_last_published_grid;
 
   // Evidence spill / export. Empty spill dir = disabled (clouds stay
   // resident); m_spill_failures counts keyframes that had to stay in RAM

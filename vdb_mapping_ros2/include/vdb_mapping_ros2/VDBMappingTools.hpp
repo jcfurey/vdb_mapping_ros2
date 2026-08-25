@@ -142,14 +142,17 @@ public:
     // info.origin only jumps in chunk-sized steps as the active bbox grows.
     // Without this, downstream consumers (nav2 static_layer, AMCL) would see
     // the origin shift every visualization tick and rebuild their costmaps.
-    auto floor_chunk = [occupancy_chunk](int v) {
-      int r = v % occupancy_chunk;
-      return v - (r < 0 ? r + occupancy_chunk : r);
+    const int chunk = std::max(1, occupancy_chunk);
+    auto floor_chunk = [chunk](int v) {
+      int r = v % chunk;
+      return v - (r < 0 ? r + chunk : r);
     };
-    auto ceil_chunk = [occupancy_chunk](int v) {
-      int r = v % occupancy_chunk;
-      if (r > 0) return v + occupancy_chunk - r;
-      if (r < 0) return v - r;
+    auto ceil_chunk = [chunk](int v) {
+      int r = v % chunk;
+      if (r > 0)
+        return v + chunk - r;
+      if (r < 0)
+        return v - r;
       return v;
     };
 
@@ -343,17 +346,19 @@ public:
   static void smoothOccGrid(nav_msgs::msg::OccupancyGrid& occupancy_grid_msg,
                             std::vector<int>& occ_voxel_projection_grid)
   {
-    auto get_index = [&](int i, int j) -> int {
-      // Clamp
-      i = std::max(0, std::min((int)occupancy_grid_msg.info.height - 1, i));
-      j = std::max(0, std::min((int)occupancy_grid_msg.info.width - 1, j));
-      return i * occupancy_grid_msg.info.width + j;
-    };
+    const int height = static_cast<int>(occupancy_grid_msg.info.height);
+    const int width = static_cast<int>(occupancy_grid_msg.info.width);
+    if (height <= 0 || width <= 0 ||
+        occ_voxel_projection_grid.size() <
+            static_cast<std::size_t>(height) * width ||
+        occupancy_grid_msg.data.size() <
+            static_cast<std::size_t>(height) * width) {
+      return;
+    }
+    auto get_index = [width](int i, int j) -> int { return i * width + j; };
 
-    for (size_t i = 0; i < occupancy_grid_msg.info.height; ++i)
-    {
-      for (size_t j = 0; j < occupancy_grid_msg.info.width; ++j)
-      {
+    for (int i = 0; i < height; ++i) {
+      for (int j = 0; j < width; ++j) {
         int current_index = get_index(i, j);
         if (occ_voxel_projection_grid[current_index] == -1)
         {
@@ -364,6 +369,10 @@ public:
             {
               if (di == 0 && dj == 0)
               {
+                continue;
+              }
+              if (i + di < 0 || i + di >= height || j + dj < 0 ||
+                  j + dj >= width) {
                 continue;
               }
               int value = occ_voxel_projection_grid[get_index(i + di, j + dj)];
@@ -405,6 +414,10 @@ public:
             {
               if (di == 0 && dj == 0)
               {
+                continue;
+              }
+              if (i + di < 0 || i + di >= height || j + dj < 0 ||
+                  j + dj >= width) {
                 continue;
               }
               if (occ_voxel_projection_grid[get_index(i + di, j + dj)] == 100)

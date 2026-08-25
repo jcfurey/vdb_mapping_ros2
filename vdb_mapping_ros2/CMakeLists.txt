@@ -14,6 +14,13 @@ endif()
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
 
+# The wrapper uses common/transforms, the assembler uses voxel filters, and
+# spill/export persistence uses PCD I/O.
+# Keep the requested dependency surface explicit instead of inheriting every
+# optional PCL component (the distro's I/O target may still have transitive
+# VTK/Qt dependencies).
+find_package(PCL REQUIRED COMPONENTS common filters io)
+
 # vdb_mapping is an exported imported target rather than a plain ament dep
 find_package(vdb_mapping REQUIRED)
 

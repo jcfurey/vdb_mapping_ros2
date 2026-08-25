@@ -190,20 +190,34 @@ inline int elevationRibbonSampleCount(
   const float range, const float half_angle, const float resolution,
   const int max_samples)
 {
-  if (!(range > 0.0F) || !(half_angle > 0.0F) || !(resolution > 0.0F))
-  {
+  if (!std::isfinite(range) || !std::isfinite(half_angle) ||
+      !std::isfinite(resolution) || !(range > 0.0F) || !(half_angle > 0.0F) ||
+      !(resolution > 0.0F)) {
     return 1;
   }
-  int count = static_cast<int>(
-    std::ceil(2.0F * range * half_angle / resolution)) + 1;
+  // Bound before converting to int. Corrupt metadata or an accidentally tiny
+  // resolution previously made the float-to-int conversion undefined and,
+  // in uncapped quality mode, could schedule billions of samples per return.
+  constexpr int hard_max_samples = 100001;
+  int effective_max = max_samples > 0
+                          ? std::min(hard_max_samples, std::max(3, max_samples))
+                          : hard_max_samples;
+  if ((effective_max & 1) == 0) {
+    --effective_max;
+  }
+  const double raw_count = std::ceil(2.0 * static_cast<double>(range) *
+                                     static_cast<double>(half_angle) /
+                                     static_cast<double>(resolution)) +
+                           1.0;
+  int count =
+      raw_count >= effective_max ? effective_max : static_cast<int>(raw_count);
   count = std::max(3, count);
   if ((count & 1) == 0)
   {
     ++count;
   }
-  if (max_samples > 0 && count > max_samples)
-  {
-    count = std::max(3, max_samples);
+  if (count > effective_max) {
+    count = effective_max;
     if ((count & 1) == 0)
     {
       --count;
@@ -221,8 +235,9 @@ inline void forEachElevationRibbonSample(
   const Eigen::Vector3f centre_vector = pointPosition(p) - origin;
   Eigen::Vector3f axis = pointElevationAxis(p);
   if (!centre_vector.allFinite() || !axis.allFinite() ||
-      !(p.range > 0.0F) || !(p.elevation_half_angle >= 0.0F))
-  {
+      !std::isfinite(p.range) || !std::isfinite(p.elevation_half_angle) ||
+      !std::isfinite(resolution) || !(p.range > 0.0F) ||
+      !(p.elevation_half_angle >= 0.0F) || !(resolution > 0.0F)) {
     return;
   }
   const float axis_norm = axis.norm();

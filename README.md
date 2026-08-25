@@ -72,6 +72,8 @@ The remote mapping module is mainly designed to provide external access to the m
 
 The exchanged data are OpenVDB grids which are compressed and serialized as a bitstream before sending them out over the network. Two mechanics are available:
 
+Peers must use the same map resolution. Incoming sections are rejected when their voxel transform, declared bounding box, payload extent, or resolution does not match the configured safety contract (`max_section_voxels` and `max_serialized_grid_bytes`).
+
 #### Sections
 Sections are not bound to the sensor data rate but are generated with a defined rate around a configurable frame. The binary occupancy state of a section around that frame is copied out of the map and transformed into an update grid that can be applied to a remote instance. Although this creates additional overhead it is highly useful in scenarios with transmission delay and package loss, since each section contains a complete chunk of the map while still being small with respect to the bandwidth.
 
@@ -88,17 +90,27 @@ VDB Mapping is highly configurable using ROS parameters. Below is a complete lis
 
 | Parameter Name                      | Type    | Default | Information |
 | ----------------------------------- | ------- | ------- | ----------- |
-| map_frame                           | string  | ''      | Coordinate frame of the map |
-| robot_frame                         | string  | ''      | Coordinate frame of the robot |
+| map_frame                           | string  | ''      | Coordinate frame of the map (required) |
+| robot_frame                         | string  | ''      | Coordinate frame of the robot (required) |
 | resolution                          | double  | 0.05    | Map resolution in meters |
 | max_range                           | double  | 10.0    | Global maximum raycasting range (can also be set for each sensor source individually) |
 | prob_hit                            | double  | 0.7     | Probability update if a beam hits a voxel |
 | prob_miss                           | double  | 0.4     | Probability update if a beam misses a voxel |
-| prob_thres_min                      | double  | 0.12    | Lower occupancy threshold of a voxel |
-| prob_thres_max                      | double  | 0.97    | Upper occupancy threshold of a voxel |
+| prob_thres_min                      | double  | 0.49    | Voxels at or below this probability are treated as free |
+| prob_thres_max                      | double  | 0.51    | Voxels at or above this probability are treated as occupied |
+| prob_clamp_min                      | double  | 0.01    | Lower probability clamp; must be below `prob_thres_min` |
+| prob_clamp_max                      | double  | 0.99    | Upper probability clamp; must be above `prob_thres_max` |
 | fast_mode                           | bool    | false   | Enables faster raycasting at the cost of modeling free and unknown space individually |
-| map_directory_path                  | string  | ''      | Storage location for saved maps. Must end with a trailing slash; the timestamped file name is appended directly |
+| map_directory_path                  | string  | ''      | Storage directory for timestamped map and PCD saves; a path separator is added when needed |
+| max_serialized_grid_bytes           | int     | 536870912 | Maximum uncompressed or compressed serialized-grid payload accepted or produced (512 MiB) |
+| max_section_voxels                  | int     | 50000000 | Maximum voxel volume accepted for a requested or periodically published map section |
 | tf_lookup_timeout                   | double  | 0.1     | How long TF lookups wait for available transforms (seconds) |
+| tf_buffer_duration                  | double  | 10.0    | TF history retained by the node (seconds, minimum 0.1) |
+| deterministic_input                 | bool    | false   | Use reliable input and replay-oriented ordering behavior for deterministic processing |
+| reset_on_time_rewind                | bool    | true    | Reset the map when a sensor stream moves backward in time beyond the configured tolerance |
+| time_rewind_tolerance               | double  | 0.5     | Allowed backward timestamp movement before resetting (seconds) |
+| input_queue_depth                   | int     | 5       | Subscription queue depth for sensor inputs |
+| force_reliable_input                | bool    | false   | Force reliable QoS for every sensor source |
 | max_raytrace_length                 | double  | 1000.0  | Upper bound on the per-ray max_ray_length accepted by the raytrace services (meters) |
 | two_dim_projection_threshold        | int     | 5       | Number of occupied voxels in a column above which the projected 2D occupancy grid cell becomes lethal |
 | smooth_remote_sections              | bool    | false   | Smooth incoming remote sections before applying them |
@@ -132,6 +144,10 @@ Each entry of `sources` opens a namespace with the following parameters:
 | max_range           | double | 0       | Per-sensor max raycasting range. Optional; 0 uses the global max_range |
 | max_rate            | double | 0       | Maximum accumulation rate for this source. Optional; 0 means unlimited. The core library holds a single pending cloud per source, so a newer cloud replaces a not-yet-processed one |
 | reliable            | bool   | false   | Use a reliable QoS subscription instead of best-effort |
+| ray_clearing        | bool   | true    | Apply free-space updates along rays from this source |
+| endpoint_hits       | bool   | true    | Apply occupied updates at ray endpoints from this source |
+| prob_hit            | double | -1.0    | Per-source hit probability override; a negative value uses the map-wide value |
+| prob_miss           | double | -1.0    | Per-source miss probability override; a negative value uses the map-wide value |
 
 #### Section Publishing (local side)
 
@@ -163,6 +179,8 @@ Each entry of `remote_sources` opens a namespace with the following parameters:
 | map_server.clear_map        | bool   | false   | Clear the map before loading |
 
 ### Advertised ROS Topics
+
+The three complete-map visualization topics use reliable, transient-local QoS so late-joining Nav2/RViz consumers receive the current snapshot. Reset and load operations also publish a durable replacement immediately.
 
 | Topic Name               | Type                                 | Information |
 | ------------------------ | ------------------------------------ | ----------- |

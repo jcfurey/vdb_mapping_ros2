@@ -10,6 +10,8 @@
     prob_thres_min: 0.12
     prob_thres_max: 0.8
     map_directory_path: ""
+    max_serialized_grid_bytes: 536870912
+    max_section_voxels: 50000000
 
     # Visualizations
     publish_pointcloud: true

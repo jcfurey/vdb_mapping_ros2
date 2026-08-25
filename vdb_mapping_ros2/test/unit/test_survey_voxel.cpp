@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 
 #include <vdb_mapping_ros2/survey_voxel.hpp>
 
@@ -89,7 +90,21 @@ TEST(SurveyVoxel, DegenerateLeafPassesThrough)
   pcl::PointCloud<SurveyPoint>::Ptr in(new pcl::PointCloud<SurveyPoint>);
   in->push_back(make(1, 2, 3, 0.5F, 5.0F, 0.5F, 0.1F, 0.01F, -0.1F, 0.1F, 1.0F));
   EXPECT_EQ(vdb_mapping_ros2::voxelReduceSurvey(in, 0.0F), in);
+  EXPECT_EQ(vdb_mapping_ros2::voxelReduceSurvey(
+                in, std::numeric_limits<float>::quiet_NaN()),
+            in);
   EXPECT_EQ(vdb_mapping_ros2::voxelReduceSurvey(nullptr, 0.5F), nullptr);
+}
+
+TEST(SurveyVoxel, NonFiniteRequiredFieldsAreDropped) {
+  pcl::PointCloud<SurveyPoint>::Ptr in(new pcl::PointCloud<SurveyPoint>);
+  in->push_back(make(0, 0, 0, std::numeric_limits<float>::quiet_NaN(), 5.0F,
+                     0.5F, 0.1F, 0.01F, -0.1F, 0.1F, 1.0F));
+  in->push_back(make(1, 0, 0, 0.5F, std::numeric_limits<float>::infinity(),
+                     0.5F, 0.1F, 0.01F, -0.1F, 0.1F, 1.0F));
+  const auto out = vdb_mapping_ros2::voxelReduceSurvey(in, 0.5F);
+  ASSERT_TRUE(out);
+  EXPECT_TRUE(out->empty());
 }
 
 int main(int argc, char** argv)
