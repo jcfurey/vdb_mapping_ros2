@@ -14,12 +14,10 @@ endif()
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
 
-# The wrapper uses common/transforms, the assembler uses voxel filters, and
-# spill/export persistence uses PCD I/O.
-# Keep the requested dependency surface explicit instead of inheriting every
-# optional PCL component (the distro's I/O target may still have transitive
-# VTK/Qt dependencies).
-find_package(PCL REQUIRED COMPONENTS common filters io)
+# The generic wrapper directly uses only common point-cloud transforms. PCD I/O
+# remains part of the core vdb_mapping public surface; filter and export-heavy
+# sonar assembly lives in the separate sonar_map_assembler package.
+find_package(PCL REQUIRED COMPONENTS common)
 
 # vdb_mapping is an exported imported target rather than a plain ament dep
 find_package(vdb_mapping REQUIRED)
@@ -48,15 +46,6 @@ target_link_libraries(vdb_mapping_ros_node
   ${PROJECT_NAME}
 )
 
-# Graph-anchored map assembler: renders the map from per-keyframe evidence
-# at SLAM-optimized poses (see src/vdb_map_assembler_node.cpp)
-ament_auto_add_executable(vdb_map_assembler_node
-  src/vdb_map_assembler_node.cpp
-)
-target_link_libraries(vdb_map_assembler_node
-  ${PROJECT_NAME}
-)
-
 install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME})
@@ -67,23 +56,7 @@ install(DIRECTORY
 
 
 if(BUILD_TESTING)
-  # Survey voxel reduction: every field must survive (pcl::VoxelGrid zeroed
-  # the custom ones), sentinels must neither dilute nor fabricate.
   find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_survey_voxel test/unit/test_survey_voxel.cpp)
-  if(TARGET test_survey_voxel)
-    target_include_directories(test_survey_voxel PRIVATE include)
-    target_link_libraries(test_survey_voxel ${PCL_LIBRARIES})
-    ament_target_dependencies(test_survey_voxel pcl_conversions)
-  endif()
-
-  ament_add_gtest(test_sonar_reconstruction test/unit/test_sonar_reconstruction.cpp)
-  if(TARGET test_sonar_reconstruction)
-    target_include_directories(test_sonar_reconstruction PRIVATE include)
-    target_link_libraries(test_sonar_reconstruction ${PCL_LIBRARIES})
-    ament_target_dependencies(test_sonar_reconstruction pcl_conversions)
-  endif()
-
   ament_add_gtest(test_mapping_tools test/unit/test_mapping_tools.cpp)
   if(TARGET test_mapping_tools)
     target_include_directories(test_mapping_tools PRIVATE include)
@@ -96,11 +69,6 @@ if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake REQUIRED)
   add_launch_test(test/smoke.test.py TIMEOUT 150)
   set_tests_properties(test_smoke.test.py PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=152")
-  # End-to-end assembler test: one keyframe of synthetic evidence through the
-  # real node; pins survey metadata survival, odom-delta re-anchoring, and
-  # the z-only pose-correction re-render.
-  add_launch_test(test/assembler.test.py TIMEOUT 200)
-  set_tests_properties(test_assembler.test.py PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=153")
   # Remote section sync: mapper A -> sections -> remote B, including the
   # clear-after-reset transition through pruned tiles.
   add_launch_test(test/section_sync.test.py TIMEOUT 250)
@@ -111,7 +79,6 @@ if(BUILD_TESTING)
   install(PROGRAMS
     test/smoke_test.py
     test/raytrace_test.py
-    test/assembler_test.py
     test/section_sync_test.py
     DESTINATION lib/${PROJECT_NAME})
 endif()

@@ -5,9 +5,8 @@
   <version>0.0.1</version>
   <description>The vdb_mapping_ros2 package is a ROS2 wrapper for the vdb_mapping packages used for fast volumetric mapping</description>
   <maintainer email="grosse@fzi.de">Marvin Große Besselmann</maintainer>
-  <author>Marvin Große Besselmann</author>
-
   <license>Apache-2.0</license>
+  <author>Marvin Große Besselmann</author>
 
   <buildtool_depend>ament_cmake_auto</buildtool_depend>
 

@@ -10,6 +10,11 @@ Currently supported features:
 
 The VDB Mapping ROS2 Package is a ROS2 wrapper around [VDB Mapping](https://github.com/fzi-forschungszentrum-informatik/vdb_mapping)
 
+The graph-anchored sonar survey and navigation assembler is intentionally not
+part of this generic adapter. It lives in the separate
+[`sonar_map_assembler`](https://public.git.erdc.dren.mil/JCFurey/sonar_map_assembler)
+package.
+
 ## Getting Started
 
 ### Requirements

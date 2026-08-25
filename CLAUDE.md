@@ -19,11 +19,9 @@ vdb_mapping_ros2/                     # Repository root
 │   ├── include/vdb_mapping_ros2/
 │   │   ├── VDBMappingROS2.hpp        # Main node class declarations
 │   │   ├── VDBMappingTools.hpp       # Static helpers for visualization output
-│   │   └── survey_voxel.hpp          # SurveyPoint type + all-fields voxel reduction
 │   ├── src/
 │   │   ├── VDBMappingROS2.cpp              # Main node implementation + composable registration
-│   │   ├── vdb_mapping_ros_node.cpp        # Standalone node entry point
-│   │   └── vdb_map_assembler_node.cpp      # Keyframe-graph survey/occupancy assembler
+│   │   └── vdb_mapping_ros_node.cpp        # Standalone node entry point
 │   ├── launch/
 │   │   ├── vdb_mapping_ros2.py             # Main mapping (multi-threaded)
 │   │   ├── vdb_map_server_ros2.py          # Map server (single-threaded)
@@ -34,9 +32,8 @@ vdb_mapping_ros2/                     # Repository root
 │   │   └── vdb_remote_params.yaml          # Remote instance parameters
 │   └── test/
 │       ├── smoke.test.py / raytrace.test.py  # launch_testing end-to-end tests (+ sibling *_test.py modules)
-│       ├── assembler.test.py               # metadata survival, odom-delta anchoring, z re-render, spill round-trip
 │       ├── section_sync.test.py            # end-to-end remote section sync
-│       └── unit/                           # gtests for voxel reduction, reconstruction, mapping tools
+│       └── unit/                           # gtests for generic mapping tools
 └── vdb_mapping_interfaces/           # Interface definitions package
     ├── CMakeLists.txt
     ├── package.xml
@@ -70,9 +67,10 @@ vdb_mapping_ros2/                     # Repository root
 
 - **`RemoteSource`** / **`SensorSource`** (structs in `VDBMappingROS2.hpp`) - Configuration structs for remote mapping sources and local sensor inputs.
 
-- **`vdb_map_assembler_node`** (`vdb_map_assembler_node.cpp`) - Standalone executable assembling SLAM keyframe clouds into latched survey/occupancy products. Re-renders when a keyframe's graph correction exceeds `pose_epsilon_xy`/`pose_epsilon_yaw`/`pose_epsilon_z` (the z epsilon exists because pure-depth corrections previously never marked the graph dirty). Keyframe clouds are write-once, so they spill to binary PCD under `spill_dir` and stream back at render time (RAM stays flat over survey duration); `~/export_survey` and `export_on_shutdown` write the consolidated survey PCD via a `.part` rename.
-
-- **`SurveyPoint` + voxel reduction** (`survey_voxel.hpp`) - Survey stream point type (PointXYZI-compatible prefix, then range/incidence/texture moments/relative elevation bounds) and its all-fields voxel reduction with sentinel rules (incidence ≥ 0 only, finite-only texture/elevation, elevation offsets re-relativized against the reduced centroid). **Never run this type through `pcl::VoxelGrid`**: its centroid machinery is a closed accumulator set and silently zeroes every custom field while the zeros pass downstream validity guards.
+The graph-anchored sonar assembler, its survey/reconstruction algorithms, and
+their tests live in the separate `sonar_map_assembler` repository. Do not add
+Nautilus-specific trajectory, sonar schema, spill, or export policy back to
+this generic adapter.
 
 ### Node Execution Model
 
@@ -137,8 +135,8 @@ Pipeline is inherited from an external `continuous_integration/ci_scripts` proje
 
 A local test suite exists under `vdb_mapping_ros2/test/` (run with `colcon test --packages-select vdb_mapping_ros2`):
 
-- **launch_testing end-to-end tests** — each `*.test.py` launch harness pairs with a `*_test.py` module: `smoke` (node comes up and maps), `raytrace` (service semantics), `assembler` (survey metadata survives assembly, odom-delta keyframe anchoring, z-triggered re-render, evidence-spill round-trip) and `section_sync` (remote section sync end to end).
-- **Unit gtests** — `test_survey_voxel.cpp` covers all-field survey reduction and sentinel rules, `test_sonar_reconstruction.cpp` covers bounded ribbon sampling and surface reconstruction, and `test_mapping_tools.cpp` covers occupancy projection/smoothing edge semantics.
+- **launch_testing end-to-end tests** — each `*.test.py` launch harness pairs with a `*_test.py` module: `smoke` (node comes up and maps), `raytrace` (service semantics), and `section_sync` (remote section sync end to end).
+- **Unit gtests** — `test_mapping_tools.cpp` covers occupancy projection and smoothing edge semantics.
 
 ## Code Conventions
 
