@@ -152,6 +152,8 @@ public:
   void fullSectionTimerCallback();
 
 private:
+  bool transformEditCloud(const sensor_msgs::msg::PointCloud2 &msg,
+                          VDBMapT::PointCloudT &cloud) const;
   void setUpVDBMap();
   void setUpLocalSources();
   void setUpRemoteSources();

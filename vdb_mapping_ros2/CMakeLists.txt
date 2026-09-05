@@ -63,6 +63,12 @@ if(BUILD_TESTING)
     target_link_libraries(test_mapping_tools ${PROJECT_NAME})
   endif()
 
+  ament_add_gtest(test_mapping_inputs test/unit/test_mapping_inputs.cpp TIMEOUT 90)
+  if(TARGET test_mapping_inputs)
+    target_link_libraries(test_mapping_inputs ${PROJECT_NAME})
+    set_tests_properties(test_mapping_inputs PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=156")
+  endif()
+
   # End-to-end launch tests: start a vdb_mapping_ros_node, feed it a synthetic
   # wall cloud and validate the published occupancy grid / marker and the
   # raytrace + get_map_section services against the known geometry.

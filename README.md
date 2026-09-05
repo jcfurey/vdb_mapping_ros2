@@ -142,6 +142,18 @@ VDB Mapping is highly configurable using ROS parameters. Below is a complete lis
 #### Sensor Sources
 Each entry of `sources` opens a namespace with the following parameters:
 
+Inputs use scalar `FLOAT32` fields named `x`, `y`, and `z` in the host's byte
+order. Extra fields, point padding, and organized clouds with row padding are
+supported; only XYZ contributes to occupancy. Empty sensor clouds are ignored,
+and malformed layouts or invalid timestamps are rejected. NaN, infinity, and
+coordinates outside OpenVDB's integer lattice are skipped by the core.
+
+The cloud header identifies the coordinates' frame and measurement time. The
+separately configured sensor origin is transformed at that same time and is
+used for **range filtering as well as ray clearing**, including for hit-only
+sources. Set `sensor_origin_frame` when a producer publishes points in a frame
+other than the physical sensor frame.
+
 | Parameter Name      | Type   | Default | Information |
 | ------------------- | ------ | ------- | ----------- |
 | topic               | string | ''      | Topic name of the PointCloud2 sensor msg (required) |
@@ -154,7 +166,17 @@ Each entry of `sources` opens a namespace with the following parameters:
 | prob_hit            | double | -1.0    | Per-source hit probability override; a negative value uses the map-wide value |
 | prob_miss           | double | -1.0    | Per-source miss probability override; a negative value uses the map-wide value |
 
+With `accumulate_updates: true`, each source keeps only its newest pending
+cloud. Reset or a replacing map load discards both pending clouds and
+accumulated updates. Synchronous
+input (`deterministic_input: true` or `accumulate_updates: false`) processes each
+delivered cloud immediately; transport queue limits and the order in which
+different source topics arrive still apply.
+
 #### Section Publishing (local side)
+
+Full sections include stored probabilities for occupied and observed-free
+voxels, plus hit evidence that has not yet reached the occupancy threshold.
 
 | Parameter Name                   | Type   | Default     | Information |
 | -------------------------------- | ------ | ----------- | ----------- |
@@ -223,6 +245,12 @@ The three complete-map visualization topics use reliable, transient-local QoS so
 | ~/add_artificial_areas           | vdb_mapping_interfaces/AddArtificialAreas         | Marks polygonal areas as artificially occupied |
 | ~/remove_artificial_areas        | std_srvs/Trigger                                  | Removes all artificial areas and restores map integrity |
 | ~/toggle_remote_source           | vdb_mapping_interfaces/ToggleRemoteSource         | Activates or deactivates a remote source at runtime |
+
+`add_points_to_grid` and `remove_points_from_grid` require a nonempty cloud
+`header.frame_id`. Both transform XYZ into `map_frame` at the header timestamp
+(zero requests the latest TF); missing transforms or invalid clouds return
+`success: false` without editing the map. These services set voxel states
+directly and do not raycast or apply sensor range limits.
 
 ## Citation
 

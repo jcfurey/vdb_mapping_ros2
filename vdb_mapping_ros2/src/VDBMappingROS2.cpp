@@ -83,6 +83,19 @@ void trySetLogCallback(MapT&, const rclcpp::Logger&, long)
 // otherwise a description of the defect.
 const char* cloudMsgError(const sensor_msgs::msg::PointCloud2& msg)
 {
+  if (msg.width == 0 || msg.height == 0) {
+    return "cloud dimensions must be nonzero";
+  }
+  if (msg.header.stamp.sec < 0 || msg.header.stamp.nanosec >= 1000000000U) {
+    return "cloud timestamp must be nonnegative with nanosec below 1000000000";
+  }
+  // PCL copies coordinates verbatim; it does not byte-swap the payload.
+  const std::uint16_t endian_probe = 1;
+  const bool host_bigendian =
+      *reinterpret_cast<const unsigned char *>(&endian_probe) == 0;
+  if (msg.is_bigendian != host_bigendian) {
+    return "cloud byte order must match the host";
+  }
   if (msg.point_step == 0) {
     return "point_step must be nonzero";
   }
@@ -119,10 +132,10 @@ const char* cloudMsgError(const sensor_msgs::msg::PointCloud2& msg)
       return "duplicate x/y/z field";
     }
     if (field.datatype != sensor_msgs::msg::PointField::FLOAT32 ||
-        field.count < 1 ||
+        field.count != 1 ||
         static_cast<std::uint64_t>(field.offset) + sizeof(float) >
             msg.point_step) {
-      return "x/y/z field is not a FLOAT32 lying within point_step";
+      return "x/y/z field is not a scalar FLOAT32 lying within point_step";
     }
     *seen = true;
   }
@@ -380,28 +393,6 @@ void VDBMappingROS2::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPt
     return;
   }
 
-  const int64_t stamp_ns = rclcpp::Time(cloud_msg->header.stamp).nanoseconds();
-  const int64_t rewind_tolerance_ns =
-    static_cast<int64_t>(std::llround(m_time_rewind_tolerance * 1.0e9));
-  const auto previous_stamp = m_last_input_stamp_ns.find(sensor_source.source_id);
-  const int64_t previous_stamp_ns =
-    previous_stamp == m_last_input_stamp_ns.end() ? 0 : previous_stamp->second;
-  if (m_reset_on_time_rewind &&
-      stamp_ns > 0 &&
-      previous_stamp_ns > 0 &&
-      stamp_ns + rewind_tolerance_ns < previous_stamp_ns)
-  {
-    RCLCPP_WARN(this->get_logger(),
-                "Input source %s moved backwards by %.3f s; resetting VDB replay session",
-                sensor_source.source_id.c_str(),
-                static_cast<double>(previous_stamp_ns - stamp_ns) * 1.0e-9);
-    m_vdb_map->resetMap();
-    m_last_input_stamp_ns.clear();
-    publishMap(true);
-  }
-  auto& source_stamp_ns = m_last_input_stamp_ns[sensor_source.source_id];
-  source_stamp_ns = std::max(source_stamp_ns, stamp_ns);
-
   VDBMapT::PointCloudT::Ptr cloud(new VDBMapT::PointCloudT);
   pcl::fromROSMsg(*cloud_msg, *cloud);
   geometry_msgs::msg::TransformStamped cloud_origin_tf;
@@ -455,6 +446,32 @@ void VDBMappingROS2::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPt
     cloud->header.frame_id = m_map_frame;
   }
   const Eigen::Vector3d sensor_origin = tf2::transformToEigen(cloud_origin_tf).translation();
+
+  // Only accepted, transformable input advances the replay watermark. A
+  // dropped cloud with a future stamp must not make the next valid cloud
+  // look like a rewind and erase the map. Compare the difference in seconds
+  // to avoid overflowing when converting a large configured tolerance to ns.
+  const int64_t stamp_ns = rclcpp::Time(cloud_msg->header.stamp).nanoseconds();
+  const auto previous_stamp =
+      m_last_input_stamp_ns.find(sensor_source.source_id);
+  const int64_t previous_stamp_ns =
+      previous_stamp == m_last_input_stamp_ns.end() ? 0
+                                                    : previous_stamp->second;
+  if (m_reset_on_time_rewind && stamp_ns > 0 && previous_stamp_ns > stamp_ns &&
+      static_cast<double>(previous_stamp_ns - stamp_ns) * 1.0e-9 >
+          m_time_rewind_tolerance) {
+    RCLCPP_WARN(this->get_logger(),
+                "Input source %s moved backwards by %.3f s; resetting VDB "
+                "replay session",
+                sensor_source.source_id.c_str(),
+                static_cast<double>(previous_stamp_ns - stamp_ns) * 1.0e-9);
+    m_vdb_map->resetMap();
+    m_last_input_stamp_ns.clear();
+    publishMap(true);
+  }
+  auto &source_stamp_ns = m_last_input_stamp_ns[sensor_source.source_id];
+  source_stamp_ns = std::max(source_stamp_ns, stamp_ns);
+
   if (m_deterministic_input || !m_accumulate_updates) {
     // The live accumulator deliberately keeps only the newest pending sample
     // to minimize latency. That is the wrong contract for recorded data:
@@ -809,7 +826,9 @@ bool VDBMappingROS2::getMapFullSectionCallback(
   }
   // Full sections carry the probabilistic GridT (not the binary UpdateGridT
   // returned by get_map_section), matching what mapFullSectionCallback /
-  // applyMapSectionGrid expect on the receiving side.
+  // applyMapSectionGrid expect on the receiving side. Include inactive
+  // probabilities too: otherwise observed-free space and subthreshold hits
+  // are silently lost in transport.
   try {
     res->section.map =
         m_vdb_map->gridToByteArray<VDBMapT::GridT>(m_vdb_map->getMapSectionGrid(
@@ -819,7 +838,7 @@ bool VDBMappingROS2::getMapFullSectionCallback(
             Eigen::Matrix<double, 3, 1>(req->bounding_box.max_corner.x,
                                         req->bounding_box.max_corner.y,
                                         req->bounding_box.max_corner.z),
-            tf2::transformToEigen(source_to_map_tf).matrix()));
+            tf2::transformToEigen(source_to_map_tf).matrix(), true));
   } catch (const std::exception &ex) {
     RCLCPP_ERROR(this->get_logger(), "GetMapFullSection: extraction failed: %s",
                  ex.what());
@@ -989,15 +1008,9 @@ bool VDBMappingROS2::addPointsToGridCallback(
   const std::shared_ptr<vdb_mapping_interfaces::srv::AddPointsToGrid::Request> req,
   const std::shared_ptr<vdb_mapping_interfaces::srv::AddPointsToGrid::Response> res)
 {
-  if (const char* error = cloudMsgError(req->points))
-  {
-    RCLCPP_ERROR(this->get_logger(), "AddPointsToGrid: rejecting request: %s", error);
-    res->success = false;
-    return true;
-  }
   VDBMapT::PointCloudT::Ptr cloud(new VDBMapT::PointCloudT);
-  pcl::fromROSMsg(req->points, *cloud);
-  res->success = m_vdb_map->addPointsToGrid(cloud);
+  res->success = transformEditCloud(req->points, *cloud) &&
+                 m_vdb_map->addPointsToGrid(cloud);
   return true;
 }
 
@@ -1005,15 +1018,39 @@ bool VDBMappingROS2::removePointsFromGridCallback(
   const std::shared_ptr<vdb_mapping_interfaces::srv::RemovePointsFromGrid::Request> req,
   const std::shared_ptr<vdb_mapping_interfaces::srv::RemovePointsFromGrid::Response> res)
 {
-  if (const char* error = cloudMsgError(req->points))
-  {
-    RCLCPP_ERROR(this->get_logger(), "RemovePointsFromGrid: rejecting request: %s", error);
-    res->success = false;
-    return true;
-  }
   VDBMapT::PointCloudT::Ptr cloud(new VDBMapT::PointCloudT);
-  pcl::fromROSMsg(req->points, *cloud);
-  res->success = m_vdb_map->removePointsFromGrid(cloud);
+  res->success = transformEditCloud(req->points, *cloud) &&
+                 m_vdb_map->removePointsFromGrid(cloud);
+  return true;
+}
+
+bool VDBMappingROS2::transformEditCloud(
+    const sensor_msgs::msg::PointCloud2 &msg,
+    VDBMapT::PointCloudT &cloud) const {
+  if (const char *error = cloudMsgError(msg)) {
+    RCLCPP_ERROR(this->get_logger(), "Grid edit: rejecting cloud: %s", error);
+    return false;
+  }
+  if (msg.header.frame_id.empty()) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "Grid edit: cloud frame_id must not be empty");
+    return false;
+  }
+  pcl::fromROSMsg(msg, cloud);
+  if (msg.header.frame_id != m_map_frame) {
+    try {
+      const auto transform = m_tf_buffer->lookupTransform(
+          m_map_frame, msg.header.frame_id, msg.header.stamp,
+          rclcpp::Duration::from_seconds(m_tf_lookup_timeout));
+      pcl::transformPointCloud(cloud, cloud,
+                               tf2::transformToEigen(transform).matrix());
+    } catch (const tf2::TransformException &ex) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "Grid edit: could not transform %s to %s: %s",
+                   msg.header.frame_id.c_str(), m_map_frame.c_str(), ex.what());
+      return false;
+    }
+  }
   return true;
 }
 
@@ -1317,7 +1354,7 @@ void VDBMappingROS2::fullSectionTimerCallback()
   try {
     VDBMapT::GridT::Ptr section = m_vdb_map->getMapSectionGrid(
         m_section_min_coord, m_section_max_coord,
-        tf2::transformToEigen(map_to_robot_tf).matrix());
+        tf2::transformToEigen(map_to_robot_tf).matrix(), true);
     msg.map = m_vdb_map->gridToByteArray<VDBMapT::GridT>(section);
   } catch (const std::exception &ex) {
     RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
